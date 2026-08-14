@@ -1,0 +1,1637 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Fiber 与 effect — DeepSeek Harness from Scratch</title>
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/site.js"></script>
+<style>
+/* 本章自己的两个可视化控件：effect 栈 与 fiber 树 */
+.fxstack { margin-top: 14px; border: 1px solid var(--rule); border-radius: 8px;
+  overflow: hidden; font-family: var(--mono); font-size: 12px; }
+.fxrow { display: grid; grid-template-columns: 34px 34px 34px 1fr; gap: 12px;
+  padding: 5px 13px; border-top: 1px solid var(--rule); align-items: center; }
+.fxrow:first-child { border-top: 0; }
+.fxrow.cap { background: var(--paper-3); color: var(--ink-3);
+  font-size: 10px; letter-spacing: .1em; text-transform: uppercase; }
+.fxrow .n { text-align: right; color: var(--ink-3); }
+.fxrow .n.hot { color: var(--warn); font-weight: 600; }
+.fxrow .n.late { color: var(--danger); font-weight: 600; }
+.fxrow .lb { color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fxrow.child .lb { padding-left: 14px; }
+.fxrow.gone .lb { color: var(--ink-3); text-decoration: line-through; }
+.ftree { margin-top: 14px; font-family: var(--mono); font-size: 12px; line-height: 1.5;
+  background: var(--code-bg); border: 1px solid var(--rule); border-radius: 8px;
+  padding: 11px 13px; overflow-x: auto; }
+.ftree:empty { display: none; }
+.ftree .row { display: flex; align-items: center; gap: 9px; padding: 2px 0; white-space: pre; }
+.ftree .nm { color: var(--ink); }
+.ftree .ep { color: var(--ink-3); }
+.pill.mute { opacity: .48; text-decoration: line-through; }
+.legend { font-family: var(--mono); font-size: 11px; color: var(--ink-3); margin-top: 10px; }
+.legend .pill { margin-right: 6px; }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+<main>
+
+<header class="masthead">
+  <div class="kicker">第 03 章</div>
+  <h1>Fiber 与 effect</h1>
+  <p class="standfirst">
+    第 2 章的 context 能注册服务，却没法干净地反注册一棵插件子树。它的
+    <code>disposers</code> 是一个手写的扁数组：谁拥有谁看不出来，插件加载到一半失败也没人回滚。
+    本章把那个 record 换成一台生命周期状态机，顺手把"注册"重新定义成"副作用"。
+  </p>
+  <div class="meta"><span>本章造出 Fiber / ctx.effect()</span><span>4 个 demo</span><span>约 22 分钟</span></div>
+</header>
+
+<h2><span class="num">§3.1</span>插件不是一次函数调用</h2>
+
+<p>
+第 2 章的 <code>ctx.plugin({ name, inject, apply })</code> 干的事是：等依赖齐了，同步调一次
+<code>apply(ctx)</code>，把 fiber 记录标成 <code>'active'</code>。错在最后半句。
+</p>
+
+<p>
+<code>apply</code> 返回之后，它留下的东西还活着：<code>provide</code> 进去的服务、挂上去的事件监听器、
+开着的 timer、mount 出来的子插件、写进注册表的工具和 prompt section。函数出栈了，这些没有。
+运行时于是需要一个对象来代表"这个插件的<em>这一次</em>加载"，Cordis 管它叫 <strong>fiber</strong>。
+同一份插件代码在两个 context 下各 mount 一次，就是两个 fiber。
+</p>
+
+<p>
+fiber 的生命周期有六个状态，名字直接来自真实实现。ch02 的 record 只用到其中四个，
+因为同步加载不需要"正在加载"和"正在卸载"这两个中间态。
+</p>
+
+<div class="diagram">        依赖齐了             插件体跑完
+ PENDING ─────────► LOADING ─────────► ACTIVE
+    ▲                  │                 │
+    │                  │ 抛异常           │ 依赖消失 / 被 dispose
+    │                  ▼                 ▼
+    │            ┌───────────────────────────┐
+    │            │         UNLOADING         │  反序回收整个 owner list
+    │            └───────────────────────────┘
+    │                  │       │       │
+    └──────────────────┘       │       └──────────► DISPOSED
+      epoch 仍是 INACTIVE       │                    uid 已清空，终态
+                               └──────────► FAILED
+                                             error 还留在 fiber 上
+
+其余的边全部由 epoch 驱动（§3.4）：UNLOADING ─► LOADING、FAILED ─► LOADING、任何状态 ─► UNLOADING</div>
+
+<table>
+<thead><tr><th>state</th><th>含义</th><th>谁在读它</th></tr></thead>
+<tbody>
+<tr><td><code>PENDING</code></td><td>在等注入的服务出现；插件体一次都没跑</td><td>启动审计：列出还缺哪些服务</td></tr>
+<tr><td><code>LOADING</code></td><td>插件体正在执行（可能是 async）</td><td>加载器：等它收敛</td></tr>
+<tr><td><code>ACTIVE</code></td><td>加载完成，它 provide 的服务对外可见</td><td>所有依赖它的 fiber</td></tr>
+<tr><td><code>FAILED</code></td><td>config 校验或插件体抛了；错误被保留下来</td><td>启动审计：带原始 stack 重抛</td></tr>
+<tr><td><code>UNLOADING</code></td><td>disposer 正在跑</td><td>拒绝新注册的守卫</td></tr>
+<tr><td><code>DISPOSED</code></td><td>fiber 被移除，<code>uid</code> 已清空，不能重启</td><td>`assertActive()`</td></tr>
+</tbody>
+</table>
+
+<h3>状态是推导出来的</h3>
+
+<p>
+六个状态里只有 <code>LOADING</code> 和 <code>UNLOADING</code> 是显式赋值的，另外四个从三个字段推出来：
+<code>uid</code> 清空了没有、有没有留着 <code>error</code>、<code>epoch</code> 是不是 <code>INACTIVE</code>。
+所有转换都走同一个 <code>_updateState()</code>，它顺手广播 <code>internal/status</code>，
+并在跨越 ACTIVE 边界时通知依赖方。
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh v0.3 · 状态推导与转换广播（页面上跑的就是这段）</span></div>
+  <pre><code id="src-getstate" data-lang="js"></code></pre>
+</div>
+
+<div class="note src">
+  <span class="tag">真实实现里的一个坑</span>
+  真实的 <code>FiberState</code> 是 <code>const enum</code>，枚举值顺序是
+  <code>PENDING=0, LOADING=1, ACTIVE=2, FAILED=3, DISPOSED=4, UNLOADING=5</code>，
+  注意 <code>DISPOSED</code> 排在 <code>UNLOADING</code> 前面。<code>const enum</code>
+  编译后没有运行时对象可以 import，于是这组数值在仓库里被手抄了三份：
+  <code class="srcpath">packages/boot/app-boot/src/index.ts</code>、
+  <code class="srcpath">packages/client/web/src/loader-status.ts</code>、
+  <code class="srcpath">packages/host/plugin-inventory/src/index.ts</code>。
+  app-boot 那份顶上留着 "Value mirrors used because Cordis's const enum has no runtime object to import"。
+</div>
+
+<h2><span class="num">§3.2</span>注册即副作用</h2>
+
+<p>dsh 仓库的 <code class="srcpath">AGENTS.md</code> 把这件事写成了一条硬规则，原文一个字都不用改：</p>
+
+<blockquote>
+<strong>Registrations are effects</strong>: every contribution goes through <code>ctx.effect()</code> /
+<code>ctx.on()</code>; a registry's <code>register()</code> returns the disposer.
+</blockquote>
+
+<p>
+反面更好理解。一个不可逆的注册会让 unload 变成谎言：插件卸载了，它塞进 <code>tools</code>
+表里的工具还在，模型下一次请求照样看得见、照样会调，而执行体所属的插件已经不存在了。
+所以每一个"贡献"都得可回收，工具、prompt section、事件监听器、LLM provider、adapter、子插件，
+一个都不例外。
+</p>
+
+<div class="note vs">
+  <span class="tag">换成别的 harness</span>
+  "注册必须交回一个 disposer"这条规则，在另外几个 harness 的文档里我没找到对应物。Claude Code 里一个 MCP server
+  是一个进程，你起它、你停它；停掉之后它的工具从工具表里消失，而它在那个进程之外碰过的东西不会跟着回来。
+  Pi 的 TypeScript extension 往内核里注册工具、命令和 hook，这个方向是单向的，回收发生在进程退出的时候。
+  对一个跑完一个任务就退出的 CLI 来说，这完全够用。dsh 把它收紧成一条不许绕开的规则：每个 contribution
+  都从 <code>ctx.effect()</code> 出去，插件卸载时按反序退回来。第 9 章里模型现场写一个插件、挂进正在跑的进程、
+  发现写坏了再回滚到上一个版本，能成立的全部理由就是这条规则。<code>cordis_run</code> 的
+  <code>mode:"run"</code> 敢拿来做 rollback，前提是上一个包留下的注册确实退干净了。
+</div>
+
+<div class="note vs">
+  <span class="tag">omp 是这条规则最硬的对照组</span>
+  omp 的扩展跑在宿主进程里，写的是 TypeScript，会话跑着的时候还能改工具表。上面那段话最该拿它检验。
+  一个 omp 扩展是默认导出 <code>(pi: ExtensionAPI) =&gt; void | Promise&lt;void&gt;</code> 的模块，工具从
+  <code>pi.registerTool(...)</code> 进去；<code>pi.setActiveTools(names)</code> 在运行中换掉当前会话的活动工具集，
+  <code>AgentSession</code> 那一侧对应 <code>setActiveToolsByName(names)</code>，换完系统提示会跟着重建。
+  「工具表能运行时增删」因此不归 dsh 独有。分歧在别处。<code>ExtensionAPI</code>
+  的一整排注册方法（<code>on</code>、<code>registerTool</code>、<code>registerCommand</code>、<code>registerShortcut</code>、
+  <code>registerFlag</code>、<code>registerMessageRenderer</code>、<code>registerProvider</code>）在文档里都不交回撤销句柄；
+  扩展加载是一次带 <code>?mtime</code> cache-buster 的动态 <code>import()</code>，文档没有给它配一条卸载路径。
+  带撤销语义的只有托管定时器：<code>ctx.setInterval</code> 返回一个能传给 <code>ctx.clearTimer</code> 的 handle，
+  并在 <code>session_shutdown</code> 时自动清掉。至于逐条注册的 disposer，以及"贡献单元卸下来的时候自动反绕整棵子树"，
+  omp 文档里未查到。这一格写的是未查到：<code class="srcpath">extensions.md</code> 和
+  <code class="srcpath">extension-loading.md</code> 没提这件事，实现里有没有我没去数。
+  留给 dsh 的那半边因此窄了一圈，剩下的是作者和寿命：运行时改工具表的不止一家；让模型自己写出那个
+  contribution、再把它连着注册一起退干净，目前只有第 9 章那条路。
+</div>
+
+<table class="vsgrid">
+<thead><tr>
+  <th></th><th class="dshcol">dsh</th><th>omp 扩展</th><th>MCP server</th><th>进程内 import 型扩展</th>
+</tr></thead>
+<tbody>
+<tr>
+  <td>加载单位</td>
+  <td class="dshcol">一个 fiber，同一份代码可以有好几个</td>
+  <td>一次动态 <code>import()</code>，每个会话各绑一个 <code>ExtensionAPI</code></td>
+  <td>一个子进程</td>
+  <td>一次模块求值</td>
+</tr>
+<tr>
+  <td>运行中改活动工具集</td>
+  <td class="dshcol"><span class="y">有</span> 挂一棵插件子树或者卸掉它</td>
+  <td><span class="y">有</span> <code>pi.setActiveTools()</code>，只影响本会话</td>
+  <td><span class="p">部分</span> 整个 server 一起来去</td>
+  <td><span class="n">无</span></td>
+</tr>
+<tr>
+  <td>单条注册可撤销</td>
+  <td class="dshcol"><span class="y">有</span> 每次 <code>register()</code> 交回 disposer</td>
+  <td><span class="n">未查到</span> <code>registerTool</code> 在文档里没有返回值</td>
+  <td><span class="p">部分</span> 随进程一起消失</td>
+  <td><span class="n">无</span></td>
+</tr>
+<tr>
+  <td>卸载贡献单元时自动反绕</td>
+  <td class="dshcol"><span class="y">有</span> 子 fiber 就是父 fiber 的一个 effect</td>
+  <td><span class="n">未查到</span> 文档里没有扩展卸载这条路径</td>
+  <td><span class="n">无</span></td>
+  <td><span class="n">无</span></td>
+</tr>
+<tr>
+  <td>可回收的时机</td>
+  <td class="dshcol">运行中任意时刻</td>
+  <td>活动集合随时切；单条注册的回收点未查到</td>
+  <td>停掉那个进程的时候</td>
+  <td>进程退出</td>
+</tr>
+</tbody>
+</table>
+
+<p><code>ctx.effect(body, label)</code> 的契约有四条，每一条都是被真实 bug 逼出来的：</p>
+
+<ul>
+  <li>body 立刻执行，它产出的 disposer 被收集起来。合法形状只有三种：返回一个函数、
+      返回一个 <code>yield</code> 出 disposer 的 generator、什么都不返回。别的形状直接 <code>TypeError</code>。</li>
+  <li>卸载时反序执行这些 disposer，并且串行 await，后一个要等前一个结束。</li>
+  <li>返回的 disposer 单次生效，重复调用返回同一个结果，不会跑两遍。</li>
+  <li>body 中途抛异常，已经收集到的 disposer 立刻回滚，异常继续往外抛。半初始化的插件不许留下痕迹。</li>
+</ul>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh v0.3 · effect 原语</span></div>
+  <pre><code id="src-effect" data-lang="js"></code></pre>
+</div>
+
+<p>
+注意 <code>fiber.disposables.push(wrapper)</code> 排在 <code>driveEffect()</code> <em>之前</em>。
+如果 body 自己触发了 owner 的卸载（body 里 <code>await</code> 到一个失败的启动、上层决定 restart，
+都会走到这一步），那次卸载必须看得见这个还没跑完的 effect，否则它收集的 disposer 就逃出了本次卸载的快照。
+</p>
+
+<h3>反序保证到什么粒度</h3>
+
+<p>
+这里几乎所有人第一次都会搞错。反序只在<em>一个</em> effect 内部是严格的；同一个 fiber
+上的多个兄弟 effect，卸载是"反序发起、并发完成"。
+</p>
+
+<table>
+<thead><tr><th>范围</th><th>发起顺序</th><th>完成顺序</th></tr></thead>
+<tbody>
+<tr><td>一个 effect 内部的多个 disposer</td><td>反序</td><td>反序（前一个 await 完才轮到后一个）</td></tr>
+<tr><td>同一个 fiber 上的多个兄弟 effect</td><td>反序</td><td>不保证</td></tr>
+</tbody>
+</table>
+
+<p>
+源码里看得很清楚：fiber 卸载是
+<code>await Promise.all(this._disposables.clear().map(async dispose =&gt; …))</code>，
+而 <code>DisposableList.clear()</code> 返回的是 <code>values.reverse()</code>。
+反转给了你发起顺序，<code>Promise.all</code> 拿走了完成顺序。所以官方 primer 那句话是有牙的：
+</p>
+
+<blockquote>
+If teardown order matters, keep the related work in one effect so disposal unwinds in the intended sequence.
+</blockquote>
+
+<p>
+下面这个 demo 把同样五个注册挂两遍，一遍是五个兄弟 effect，一遍塞进一个 composite generator effect。
+第五个注册（后台 watcher）故意用了异步 disposer，真实 dsh 里
+<code class="srcpath">packages/skill/skill-filesystem</code> 就是这么写的
+（<code>yield async () =&gt; { await provider.dispose() }</code>）。先押一个答案再跑：
+</p>
+
+<div id="p-teardown"></div>
+
+<div class="demo" id="d-effect">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 3.1</span>effect 反序回收</div>
+    <div class="spacer"></div>
+    <button class="btn primary" data-act="run">一个 composite effect</button>
+    <button class="btn" data-act="sibling">五个兄弟 effect</button>
+    <button class="btn" data-act="leak">忘记返回 disposer</button>
+    <button class="btn" data-act="reset">清空</button>
+  </div>
+  <div class="demo-body">
+    <div class="out" id="out-effect"></div>
+    <div class="fxstack" id="fx-effect"></div>
+  </div>
+</div>
+
+<div class="note">
+  <span class="tag">读数字</span>
+  <code>注册</code> 列是注册顺序，<code>发起</code> 列是 disposer 被调用的顺序，<code>完成</code> 列是它跑完的顺序。
+  两种挂法的发起列都是 5→1；但兄弟挂法的完成列里，异步的 <code>watcher.stop()</code> 第一个发起、最后一个完成，
+  中间四个从它身上跨了过去。composite 挂法两列完全对称，代价也在输出里：严格反序意味着卸载期间早注册的资源
+  还活着，所以 composite 那次 <code>ctx.setInterval()</code> 会在等 watcher 停下来的 140ms 里多跳一次心跳。有序不免费。
+</div>
+
+<div class="note warn">
+  <span class="tag">第三个按钮：忘记返回 disposer</span>
+  它挂的插件里，工具注册走的是 <code>ctx.tools.register()</code>，监听器却直接 push 到了一个外部 emitter 上，
+  effect body 什么都没 return。<code>driveEffect</code> 认这个形状（"什么都不返回"本来就是三种合法形状之一），
+  所以没有任何报错。卸载之后工具确实还回去了，那个回调还在响。更难受的是 <code>fiber.getEffects()</code> 也空了：
+  运行时看不出哪里漏了，label 随 wrapper 一起没了。真实 dsh 里这类 bug 的长相通常是 <code>process.on()</code>、
+  全局 <code>setInterval</code>，或者某个第三方 SDK 的 <code>client.subscribe()</code>。
+</div>
+
+<h3>这套记账贵不贵</h3>
+
+<p>
+dsh 开源当天的 HN 主线程（item 49285244，2026-08-13）里，<code>OutOfHere</code> 用一句话概括了对这个模型的技术怀疑：
+</p>
+
+<blockquote>Using memory to track inverses does not scale.</blockquote>
+
+<p>
+这句话得拆成两半看，一半站不住，一半站得住。记账本身很便宜：每条活着的注册占一个 closure、一个 <code>Map</code>
+表项、一个 <code>WeakMap</code> 表项，<code>DisposableList</code> 的文档注释写的是 "Ordered collection of
+disposable values with O(1) deletion by value"，<code>push()</code> 返回的 remover 就是一句
+<code>map.delete(sn)</code>。开销跟活着的注册条数成正比，跟进程跑了多久无关。
+</p>
+
+<p>
+站得住的是另一半。disposer 是强引用，它捕获了"撤销这件事需要的一切"，所以只要那条注册还挂在 owner list 上，
+被它捕获的对象图就活着。dsh 给每个会话挂一棵自己的插件子树（第 7 章），并发会话数直接乘上去；
+任何一个忘了卸载的 fiber，会把它整棵子树的 disposer 一起钉在内存里。再加上刚才那个按钮演示的事：
+这套模型的正确性上限是最不小心的那个插件，运行时没有办法知道 body 里本该 return 什么。
+省内存的替代方案就是 MCP 那条路，把扩展关进子进程、要回收就杀掉，代价是进程内热插拔没了。
+omp 在这项记账上一分钱不花，因为它不记：账单挪到了 §3.5 那一格，一个游离回调里的抛出能把整个会话带走。
+<code>OutOfHere</code> 给的理由不对，担心的方向对。
+</p>
+
+<h2><span class="num">§3.3</span>父子 fiber 与级联卸载</h2>
+
+<p>
+ch02 的实现里，"卸载一个注册"和"卸载一棵插件子树"是两套代码：前者遍历 <code>disposers</code> 数组，
+后者要自己找到所有子 fiber 再递归。Cordis 用一个观察把两套合成一套：
+</p>
+
+<div class="note good">
+  <span class="tag">关键设计</span>
+  <strong>子 fiber 在父 fiber 眼里就是一个 effect。</strong>
+  于是"卸载父插件"根本不需要知道自己有子插件，它只是在反序回收自己的 owner list，
+  而其中某几项恰好是"卸载一棵子树"。
+</div>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh v0.3 · 子 fiber 的注册就是父 fiber 上的一个 effect</span></div>
+  <pre><code id="src-child" data-lang="js"></code></pre>
+</div>
+
+<p>
+真实实现在 <code class="srcpath">vendor/cordis/src/fiber.ts</code> 第 265 行的构造函数里，形状一模一样。
+多出来的是三件事：<code>emitPluginDisposed()</code> 通知一圈、最后一个 fiber 走了就把插件从 registry
+里删掉、以及 <code>while (this.inertia) await this.inertia</code> 上面的一大段注释。那段注释解释了为什么
+这里不 catch：<code>inertia</code> 本身不该 reject，真 reject 了就只剩 logger 自己坏掉这一种可能，
+而"再调一次 logger"正是刚刚失败的动作，所以让它炸上去，"process-level crash is the honest outcome"。
+</p>
+
+<h3>精确的那个 disposer</h3>
+
+<p>
+既然子 fiber 就是父 fiber 上的一个 effect，<code>fiber.dispose</code> 这个函数对象的<em>身份</em>
+就成了可用的资源：把它 <code>yield</code> 进一个 composite effect，"卸载这棵子树"就被钉在那个
+yield 的反序位置上。包一层 wrapper 会丢掉这个位置，退回 fiber 层面的并发兄弟，也就是上面那张表的第二行。
+</p>
+
+<p>
+这是 dsh 所有 registry 的 <code>register()</code> 都直接 return Cordis effect disposer 的原因。
+仓库里有一条测试专门钉住它：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">packages/core/tools/tests/tools.spec.ts:2024 · 精确 disposer 的回归测试（节选）</span></div>
+<pre><code data-lang="js">it('register() returns the EXACT effect disposer', async () =&gt; {
+  const fiber = await ctx.plugin(Object.assign((inner: Context) =&gt; {
+    inner.effect(function* () {
+      yield () =&gt; { order.push('disposed-last') }
+      yield inner.tools.register({ ...echoTool, name: 'nested' })
+      order.push('registered')
+      yield async () =&gt; {
+        await new Promise(resolve =&gt; setTimeout(resolve, 0))
+        order.push(inner.tools.get('nested') ? 'first: still registered' : 'first: already gone')
+      }
+    })
+  }, { inject: ['tools'] }))
+  await fiber.dispose()
+  expect(order).toEqual(['registered', 'first: still registered', 'disposed-last'])
+})</code></pre>
+</div>
+
+<p>
+第三个 yield 的异步探针在自己那一步里看到工具还注册着，因为工具的反注册排在它后面（反序里它更早）。
+如果 <code>register()</code> 返回的是个 wrapper，反注册就脱离了这个顺序，探针会看到 <code>already gone</code>。
+</p>
+
+<p>
+<code>dsh-scope</code> 的全部实现也是这一招：<code>createScope()</code> mount 一个空插件当背板 fiber，
+把 <code>fiber.ctx.extend({ [kScope]: key })</code> 交出去，再把那个精确的 <code>fiber.dispose</code>
+作为 <code>rawDispose</code> 暴露出来（见 <code class="srcpath">packages/core/scope/src/index.ts:137</code>）。
+一个 agent 的所有注册就挂在这么一个能整体回收的 fiber 上。
+</p>
+
+<p>
+下面这个 demo 造一棵三层树（<code>app → session → {toolset, watcher}</code>），
+每个 fiber 的 disposer 都是异步的、耗时不同，<code>app</code> 上还开了一个"端口"资源。
+两种挂法：<code>app</code> 把端口和子树当兄弟挂，或者塞进一个 composite effect 并 <code>yield</code>
+子 fiber 的精确 disposer。
+</p>
+
+<div class="demo" id="d-cascade">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 3.2</span>级联卸载</div>
+    <div class="spacer"></div>
+    <button class="btn primary" data-act="run">兄弟挂法</button>
+    <button class="btn" data-act="ordered">composite 挂法（yield 精确 disposer）</button>
+    <button class="btn" data-act="reset">清空</button>
+  </div>
+  <div class="demo-body">
+    <div class="out" id="out-cascade"></div>
+    <div class="ftree" id="ft-cascade"></div>
+    <div class="legend">
+      <span class="pill">PENDING</span><span class="pill warn">LOADING / UNLOADING</span>
+      <span class="pill ok">ACTIVE</span><span class="pill bad">FAILED</span><span class="pill mute">DISPOSED</span>
+    </div>
+  </div>
+</div>
+
+<p>
+两次都做到了同一件事：<code>await app.dispose()</code> 只在整棵子树全部收敛之后才 resolve，
+四个后代最终都是 <code>DISPOSED</code>。差别在 <code>app.port</code> 的关闭时机。
+兄弟挂法里它在子树还在拆的时候就关掉了，composite 挂法里它等到子树彻底静下来。
+如果那个"端口"是子插件正在往里写东西的连接，第一种挂法就是一个真实的 bug。
+</p>
+
+<h2><span class="num">§3.4</span>依赖驱动的重载</h2>
+
+<p>
+epoch 第 2 章已经建好了：把每个被注入服务的<em>实现所属 fiber 的 uid</em> 拼成一个字符串，
+缺任何一个就整体退化成哨兵值（真实实现里叫 <code>INACTIVE</code>）。uid 由 registry 单调递增发放
+（<code>get counter() { return ++this._counter }</code>），所以 provider 热替换也逃不过去：
+<code>model</code> 服务从 A 实现换成 B 实现，名字没变，"依赖都在吗"的答案前后都是 yes，
+可 uid 换了，epoch 就换了，这次替换于是被识别成"必须重载"。
+</p>
+
+<p>
+本章要补的是另一半：epoch 变了之后到底发生什么。ch02 的重载是同步的，比一下字符串，
+直接重跑 <code>apply</code>。真实世界里这一步是异步的（插件体可以 <code>await</code>，
+disposer 也可以 <code>await</code>），于是三个新问题冒出来：
+</p>
+
+<ul>
+  <li>转换在飞的时候 epoch 又变了怎么办？不能再起一次转换，否则两次卸载会交叉。</li>
+  <li>加载已经排上队，但在插件体执行<em>之前</em>就被作废了怎么办？不能白跑一遍插件体。</li>
+  <li>卸载跑完，发现 epoch 又变回可用了怎么办？要接着加载，而不是停在 PENDING。</li>
+</ul>
+
+<p>
+三个答案压缩成一个字段（<code>inertia</code>，在飞的那次转换）和一条规则：
+<strong>同一时刻最多一次转换在飞</strong>。epoch 于是从一个被比较的值变成一个被守卫的目标。
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh v0.3 · epoch 计算与转换驱动</span></div>
+  <pre><code id="src-epoch" data-lang="js"></code></pre>
+</div>
+
+<p>
+<code>_setEpoch</code> 里那句 <code>if (this.inertia) return;</code> 是这套机制扛得住并发的关键：
+已经有一次转换在飞的时候，新 epoch 只被记下来，不启动第二次转换。在飞的那次会在自己的尾部
+重新比对 epoch，再决定是收工还是接着翻。两个转换函数因此互相尾调用，形成一个稳定的乒乓：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh v0.3 · _reload / _unload 互为尾巴</span></div>
+  <pre><code id="src-reload" data-lang="js"></code></pre>
+</div>
+
+<p>
+<code>_reload</code> 开头那个 <code>await Promise.resolve()</code> 是个 checkpoint。
+在它之前排队的 disposer 可能已经让这次加载作废了，所以过了 checkpoint 要重新比对 epoch，
+比对失败就一次都不执行插件体。真实源码在这里留了注释："Do not run plugin code for a stale epoch"。
+</p>
+
+<div class="demo" id="d-epoch">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 3.3</span>provider 热替换与 epoch</div>
+    <div class="spacer"></div>
+    <button class="btn primary" data-act="run">替换 model 实现</button>
+    <button class="btn" data-act="race">同一 tick 内撤掉 provider</button>
+    <button class="btn" data-act="reset">清空</button>
+  </div>
+  <div class="demo-body">
+    <div class="out" id="out-epoch"></div>
+    <div class="ftree" id="ft-epoch"></div>
+  </div>
+</div>
+
+<p>
+第一个按钮：<code>agent</code> 先在没有 <code>model</code> 的情况下 mount，停在 PENDING；provider A
+上线，它 LOADING 一次，epoch 变成 <code>":2"</code>；A 下线，它退回 PENDING，并且把注册的工具还了回去。
+最后半句是 §3.2 的功劳，跟 epoch 无关：重载路径现在从 effect 里走，所以"卸载"真的会撤销注册。
+provider B 上线，插件体第二次执行，epoch 变成 <code>":3"</code>，工具带着新实现的名字重新出现。
+第二个按钮演示 checkpoint：在依赖方 mount 的同一个 tick 里撤掉 provider，插件体的执行次数是 <code>0</code>。
+</p>
+
+<h2><span class="num">§3.5</span>失败被容纳</h2>
+
+<p>
+一个插件在启动时抛异常，正确的结果是三件事同时发生：
+</p>
+
+<ul>
+  <li>它自己进 <code>FAILED</code>，错误留在 fiber 上，<code>fiber.await()</code> 会带原始 stack 重抛；</li>
+  <li>它已经完成的那部分注册全部回滚，抛异常之前 <code>provide</code> 出去的服务、注册过的工具，
+      一件都不许留下；</li>
+  <li>依赖它的 fiber 退回 <code>PENDING</code>（它们自己没错，只是缺依赖），
+      不相关的兄弟插件照常运行。</li>
+</ul>
+
+<p>
+第二条是 <code>_reload</code> 的 catch 分支自动做到的，不需要额外代码：catch 里把 epoch 设成
+<code>INACTIVE</code>，尾部的比对发现 epoch 变了，于是接着走 <code>_unload()</code>，
+把插件体半途收集到的 disposer 排空。
+</p>
+
+<p>
+第三条的区分在真实 dsh 里有产品含义。启动审计
+<code class="srcpath">packages/boot/app-boot/src/index.ts</code> 的
+<code>assertEntriesActivated()</code> 对两种状态给的诊断完全不同：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">packages/boot/app-boot/src/index.ts:692 · FAILED 与 PENDING 的诊断不是一回事</span></div>
+<pre><code data-lang="js">if (state === FIBER_FAILED) {
+  try { await fiber.await() }                   // 把 fiber 上留着的那个错误取回来
+  catch (error) {
+    rejectionReasons.push(error)
+    failures.push(`${entry.options.name}: ${formatActivationError(error)}`)   // 带原始 stack
+  }
+  continue
+}
+if (state === FIBER_PENDING) {
+  const missing = Object.keys(fiber.inject).filter(s =&gt; fiber.ctx.get(s) === undefined)
+  failures.push(`${entry.options.name}: pending (waiting for ${missing.join(', ') || 'unknown'})`)
+}</code></pre>
+</div>
+
+<div class="note vs">
+  <span class="tag">换成别的 harness</span>
+  用 <code>import</code> 加载扩展的 harness，在"加载好了"和"整个进程带着一个 stack trace 倒下"之间
+  没有中间格子。dsh 有 <code>FAILED</code>，还有"依赖它的 fiber 退回 <code>PENDING</code>"这一步，
+  是因为它的插件表来自一棵能热改的 YAML 配置树（第 7 章），坏掉一个条目不能牵连另外几十个。
+  启动审计对两种状态给的诊断也不同：FAILED 带原始 stack，PENDING 列出还缺哪些服务。
+  这台状态机是被"配置驱动的插件表"逼出来的，工具表在编译期就定死的 harness 从来不需要它。
+</div>
+
+<div class="note vs">
+  <span class="tag">omp 自己的文档承认了这个格子的缺失</span>
+  上面那句话在 omp 上不用我推，<code class="srcpath">extensions.md</code> 直接写着
+  "Extensions run <strong>in-process with no isolation</strong>"。它接着把失败路径说得很具体：一个裸
+  <code>setInterval</code> / <code>setTimeout</code> 或者游离 promise 的回调里抛出去的东西，落在
+  handler dispatch 的 try/catch 之外，浮成进程级 <code>uncaughtException</code>，全局 postmortem handler
+  按 fatal 处理，于是 "the whole session is torn down"，不只是出事的那个扩展。同一篇文档给的对策是让扩展改用
+  <code>ctx.setInterval</code>，把回调放回和 handler dispatch 一样的隔离里，同步抛出和 rejected promise
+  在那里会被记到扩展错误通道，会话继续跑；坚持用裸的那一对，隔离就归你自己包。
+  这一格正是 FAILED 加事务回滚要接的球：同样一个抛出，dsh 那边的结果是它自己进 FAILED、半途收集到的
+  disposer 排空、依赖方退回 PENDING，兄弟插件不知道刚才发生过什么。这是 fiber 模型在这一章里赢得最干净的一次。
+</div>
+
+<p>
+下面这棵树里，<code>storage</code> 会在 <code>provide('db')</code> 之后抛异常。
+注意 <code>repo</code> 从头到尾没见过 <code>db</code>：<code>provide</code> 发生在 <code>storage</code>
+还是 LOADING 的时候，而未激活的提供者不算存在。
+</p>
+
+<div class="demo" id="d-fail">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 3.4</span>失败容纳</div>
+    <div class="spacer"></div>
+    <button class="btn primary" data-act="run">挂载（storage 会抛）</button>
+    <button class="btn" data-act="retry">修好并 restart()</button>
+    <button class="btn" data-act="reset">清空</button>
+  </div>
+  <div class="demo-body">
+    <div class="out" id="out-fail"></div>
+    <div class="ftree" id="ft-fail"></div>
+  </div>
+</div>
+
+<div class="note warn">
+  <span class="tag">诚实地说清楚：这不是沙箱</span>
+  这一章造出来的容纳全部是生命周期意义上的：一个插件的注册可以被完整回收，
+  它的 teardown 通知失败会被逐个 observer 隔离（真实实现是
+  <code class="srcpath">vendor/cordis/src/fiber.ts</code> 的 <code>emitPluginDisposed()</code>，
+  函数头写着 "Notify plugin teardown without allowing one observer to break ownership cleanup"）。
+  但普通插件没有任何安全沙箱：它和整个 harness 跑在同一个进程、同一个 realm 里，
+  可以 <code>while(true)</code> 占死事件循环、可以改全局对象、可以拿到别人的 <code>ctx</code>。
+  <code>dsh-scope</code> 的 README 写着：
+  "Scopes route trusted same-process plugins; they are not sandboxes or authority boundaries."
+  真正的隔离边界在子进程和权限系统那边，不在 fiber 上。
+</div>
+
+<h2><span class="num">§3.6</span>本章的产物</h2>
+
+<p>
+五节拼起来，ch02 那个有点笨的 record 就成了一个真正的 <code>Fiber</code>：六状态机、effect 所有权、
+父子级联、epoch 驱动的重载、失败容纳。第 4 章的事件、第 5 章的会话日志、第 6 章的工具流水线，
+注册与回收全部走这一套。
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh v0.3 · class Fiber（上面每一段代码都是它的方法）</span></div>
+  <pre><code id="src-fiber" data-lang="js"></code></pre>
+</div>
+
+<p>
+配套的 runtime 很薄：一张服务表、一个 uid 计数器、一个"通知依赖方"的 <code>notify()</code>，
+外加几个玩具 registry（<code>tools</code> / <code>systemPrompt</code> / <code>on</code> /
+<code>setInterval</code>）。它们的 <code>register()</code> 全部 return effect disposer，因为这是规则。
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh v0.3 · runtime 与"注册即副作用"的 registry</span></div>
+  <pre><code id="src-runtime" data-lang="js"></code></pre>
+</div>
+
+<div class="note warn">
+  <span class="tag">状态机管不到的那部分</span>
+  同一个 HN 线程里还有两条冲着"一切皆插件"来的怀疑。<code>invaliduser</code>：
+  "I have developped over the year a plugin fatigue. Every product relying on community plugins works fine
+  the 6 first months, then it's a nightmare of incompatible, deprecated plugins, with no consistency and no
+  governance."<code>bdcravens</code> 说得更结构化：厂商为了启动生态自己写一大堆插件，用户因为它们"官方"
+  而更信它们，"so they essentially created a mono-vendor ecosystem with extra steps"。
+  本章的机制能答的只有一小块：FAILED 容纳让一个坏插件不牵连别人，epoch 让实现替换有确定的语义。
+  它答不了治理。<code>bdcravens</code> 那条在 dsh 上是可以数的：
+  <code class="srcpath">packages/</code> 下面有 219 个 first-party 包，发布当天第三方插件是零。
+  六个月后会怎样我不知道。<code>origin/master</code> 到现在一个 commit 都没动过，
+  所以连"半年后"这个实验都还没开始。
+</div>
+
+<div class="note good">
+  <span class="tag">下一章预告</span>
+  <code>ctx.on()</code> 现在只是"把回调 push 进一个数组"，<code>ctx.emit()</code> 只是"按注册顺序全调一遍"。
+  这撑不住真实需求：<code>agent/pre-step</code> 要让插件能改写甚至否决被认领的消息，
+  工具执行要并发扇出并等全部完成，策略检查要第一个说不的人赢。
+  第 4 章把 emit 拆成五种 dispatch 模式，重点是 waterfall：不调 <code>next()</code> 就短路整条链。
+</div>
+
+<h2><span class="num">§3.7</span>回到真实的 dsh</h2>
+
+<p>
+本章的正本是 <code class="srcpath">vendor/cordis/src/fiber.ts</code>（754 行）和
+<code class="srcpath">vendor/cordis/src/registry.ts</code>。<code>effect()</code> 的真实签名有两个重载，
+因为同步 effect 的 disposer 是普通函数，异步 effect 的 disposer 还能被 <code>await</code>：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">vendor/cordis/src/fiber.ts · 真实签名（节选）</span></div>
+<pre><code data-lang="js">effect(execute: () =&gt; SyncEffect, label?: string): Disposable&lt;Promise&lt;void&gt;&gt;
+effect(execute: () =&gt; Effect, label?: string): AsyncDisposable&lt;Promise&lt;void&gt;&gt;
+type SyncEffect&lt;T&gt;  = Disposable&lt;T&gt; | Iterable&lt;Disposable&lt;T&gt;, void, void&gt;
+type AsyncEffect&lt;T&gt; = Promise&lt;Disposable&lt;T&gt;&gt; | AsyncIterable&lt;Disposable&lt;T&gt;, void, void&gt;
+getEffects(): EffectMeta[]          // 诊断用的 effect 标签树
+await(): Promise&lt;this&gt;              // 等生命周期收敛并重抛启动错误
+restart(): Promise&lt;void&gt;            // 卸载并立刻用当前 config 重新加载
+update(config: any, noSave?: boolean): any   // 校验并应用新 config 再 restart</code></pre>
+</div>
+
+<p>我们刻意省掉的东西，按"省掉之后你会撞上什么"排序：</p>
+
+<ul>
+  <li>异步 effect body 与 async iterable。真实的 <code>_execute</code> 还要在每次
+      <code>await iter.next()</code> 之后重新比对 <code>runner.epoch</code>，中途被作废就停止收集。
+      我们的 <code>driveEffect</code> 只认同步形状。</li>
+  <li><code>effectInertia</code> 这个 WeakMap。公开的 disposer 要保持"单次生效"的上游语义，
+      而结构性 owner 和外层 effect 必须能加入别人已经开始的那次回收。</li>
+  <li><code>provide()</code> 的 disposer 会等依赖方收敛。<code class="srcpath">reflect.ts</code>
+      删掉实现、<code>notify()</code> 一圈之后，还要
+      <code>await Promise.allSettled(fibers.map(fiber =&gt; fiber.await()))</code>，最后才删自己 store
+      里的那一份，注释是 "ensure self access before dependencies cleanup"。</li>
+  <li>服务隔离与 intercept。<code>inject</code> 不只是名字列表，还能带 intercept config；
+      <code>ctx.isolate()</code> 能让子树看到同名但不同实现的服务，epoch 里的 uid 就是它的可观测面。
+      这个设计我觉得是对的，但每次读 isolate 那段还是得想三遍。</li>
+  <li><code>internal/plugin</code> 的发布时序。真实构造函数在 <code>dispose</code> 赋值完成<em>之后</em>
+      才 emit，因为同步 observer 可能立刻把这个 fiber（或它的父亲）dispose 掉。</li>
+</ul>
+
+<p>
+还有一件要说清楚的事：这份 vendor 不是原样的上游。
+<code class="srcpath">vendor/README.md</code> 有一份逐条穷举的 "Local modifications" 日志，
+第 6 条整条在讲 <code>fiber.ts</code> 的生命周期加固，堵的是"卸载过程中又有人来注册或卸载"这类重入洞。
+本章的 mini 版本按那一条的结论写的：wrapper 先上 owner list、同步失败回滚、<code>UNLOADING</code>
+期间拒绝创建 effect、过 checkpoint 重新比对 epoch。所以 demo 里的顺序和真实实现一致。
+这些结论的来源是别人踩过的 bug，不是谁推导出来的。
+</p>
+
+<div class="note src">
+  <span class="tag">自己去读</span>
+  <code class="srcpath">vendor/cordis/src/fiber.ts</code> · <code>FiberState</code>、<code>effect()</code>、
+  <code>_refresh</code>/<code>_setEpoch</code>/<code>_reload</code>/<code>_unload</code>，本章全部内容的正本<br>
+  <code class="srcpath">vendor/cordis/src/utils.ts</code> · <code>DisposableList</code>，注意 <code>clear()</code> 的 <code>reverse()</code><br>
+  <code class="srcpath">vendor/cordis/src/reflect.ts</code> · <code>_getImpl()</code> 的 ACTIVE 检查、provide 的异步 disposer<br>
+  <code class="srcpath">vendor/README.md</code> 第 6 条 · fiber 生命周期加固的完整日志<br>
+  <code class="srcpath">packages/core/scope/src/index.ts</code> · 用一个空插件 fiber 做 scope 的全部实现<br>
+  <code class="srcpath">packages/core/tools/tests/tools.spec.ts</code> · 精确 disposer 与 composite 顺序的回归测试<br>
+  <code class="srcpath">packages/extensions/tool-cordis/tests/cordis-lifecycle.spec.ts</code> · 重入卸载的直接回归
+</div>
+
+</main>
+<aside id="dsh-toc"></aside>
+</div>
+
+<script>
+// ---- mini-dsh v0.3 · fiber 核心。本页所有 demo 跑的都是这一份代码， 页面上的每段 listing 也是从这些函数对象上打印出来的。
+var INACTIVE = '__INACTIVE__';
+
+/** Cordis 用带 code 的错误区分框架错误；这里只保留最常撞到的那一个。 */
+function inactiveEffect() {
+  var err = new Error('cannot create effect on inactive context');
+  err.code = 'INACTIVE_EFFECT';
+  return err;
+}
+
+/**
+ * 把 effect body 的返回值规范化成"若干个 disposer"。
+ * 合法形状只有三种：一个函数、一个 yield 出 disposer 的 generator、什么都不返回。
+ */
+function driveEffect(execute, collect) {
+  var effect = execute();
+  if (typeof effect === 'function') return collect(effect);
+  if (effect === null || effect === undefined) return;
+  if (typeof effect[Symbol.iterator] === 'function') {
+    var iter = effect[Symbol.iterator]();
+    while (true) {
+      var result = iter.next();
+      collect(result.value);        // done 的那一次也要 collect：return 值同样算
+      if (result.done) return;
+    }
+  }
+  throw new TypeError('Invalid effect');
+}
+
+/**
+ * effect 原语：body 立刻执行，产出的 disposer 被收集，卸载时反序、串行地执行。
+ * 返回的 wrapper 就是 disposer，单次生效。
+ */
+function createEffect(fiber, execute, label) {
+  fiber.assertActive();
+  // 卸载中不允许再注册：新 disposer 会逃出本次卸载的快照。
+  if (fiber.state === 'UNLOADING') throw inactiveEffect();
+
+  var disposables = [];
+  var meta = { label: label || 'anonymous', children: [] };
+  var disposing = false;
+  var task;
+
+  function dispose() {
+    if (disposing) return task;               // 单次生效，重复调用返回同一个结果
+    disposing = true;
+    var chain;
+    var list = disposables.splice(0).reverse();
+    for (var i = 0; i < list.length; i++) {
+      var undo = list[i];
+      // 串行：前一个 disposer 收敛之后才轮到下一个
+      if (chain) chain = chain.then(step(undo));
+      else {
+        var result = undo();
+        if (result && typeof result.then === 'function') chain = result;
+      }
+    }
+    return (task = chain);
+  }
+  function step(undo) { return function () { return undo(); }; }
+
+  function collect(undo) {
+    if (typeof undo !== 'function') {
+      if (undo !== null && undo !== undefined) throw new TypeError('Invalid effect');
+      return;
+    }
+    disposables.push(undo);
+    // 嵌套 effect：所有权从 fiber 转移到本 effect，于是它落在本 effect 的反序
+    // 位置上，而不是变成 fiber 层面的并发兄弟。
+    fiber.detach(undo);
+    if (undo.effectMeta) meta.children.push(undo.effectMeta);
+  }
+
+  var wrapper = function () {
+    if (!wrapper.live) return task;
+    wrapper.live = false;
+    fiber.detach(wrapper);
+    return dispose();
+  };
+  wrapper.live = true;
+  wrapper.effectMeta = meta;
+
+  // 先上 owner list，再跑 body：body 内部触发的卸载必须能看见这个 effect。
+  fiber.disposables.push(wrapper);
+  try {
+    driveEffect(execute, collect);
+  } catch (reason) {
+    wrapper.live = false;
+    fiber.detach(wrapper);
+    dispose();                                // 半初始化不许留痕：立刻回滚
+    throw reason;
+  }
+  return wrapper;
+}
+
+/**
+ * 子 fiber 在父 fiber 眼里就是一个 effect。
+ * 于是"卸载一个注册"和"卸载一棵子树"走的是同一条代码路径。
+ */
+function attachChild(fiber, parent) {
+  return parent.effect(function () {
+    return async function () {
+      fiber.uid = null;                       // 先失效：之后任何注册都会被拒
+      fiber._setEpoch(INACTIVE);
+      // PENDING 的 fiber 也可能已经拥有 effect（它的 epoch 本来就是 INACTIVE，
+      // _setEpoch 没有转换可驱动），所以显式排空一次。
+      if (!fiber.inertia) {
+        fiber._updateState(function () {
+          fiber.inertia = fiber._unload();
+          return 'UNLOADING';
+        });
+      }
+      while (fiber.inertia) await fiber.inertia;   // 子树收敛之后才算卸载完成
+    };
+  }, 'ctx.plugin(' + fiber.name + ')');
+}
+
+class Fiber {
+  constructor(runtime, parent, plugin, config) {
+    this.runtime = runtime;
+    this.parent = parent;
+    this.plugin = plugin || {};
+    this.name = this.plugin.name || 'anonymous';
+    this.config = config;
+    this.inject = {};
+    (this.plugin.inject || []).forEach((name) => { this.inject[name] = null; });
+
+    this.state = 'PENDING';
+    this.epoch = INACTIVE;
+    this.error = null;
+    this.inertia = undefined;      // 在飞的那次转换
+    this.store = undefined;        // 加载期间的实现快照
+    this.loads = 0;                // 插件体执行了几次（demo 用来观测重载）
+    this._store = Object.create(null);
+    this.disposables = [];         // owner list
+    this.ctx = runtime.makeCtx(this);
+    runtime.all.push(this);
+
+    if (!parent) {                 // 根 fiber：没有插件体，永远 ACTIVE
+      this.uid = 0;
+      this.state = 'ACTIVE';
+      this.epoch = '';
+      this.store = Object.create(null);
+      this.dispose = () => this.restart();
+      return;
+    }
+    this.uid = runtime.nextUid();
+    this.dispose = attachChild(this, parent);
+    Object.keys(this.inject).forEach(name => this._checkImpl(name));
+    this._refresh();
+  }
+
+  assertActive() { if (this.uid === null) throw inactiveEffect(); }
+
+  effect(execute, label) { return createEffect(this, execute, label); }
+
+  detach(undo) {
+    var i = this.disposables.indexOf(undo);
+    if (i >= 0) this.disposables.splice(i, 1);
+    return i >= 0;
+  }
+
+  /** 诊断：当前活着的 effect 标签树。真实实现里 tool-cordis 把它渲染给模型看。 */
+  getEffects() {
+    return this.disposables.map(undo => undo.effectMeta).filter(Boolean);
+  }
+
+  /** 六个状态里只有 LOADING / UNLOADING 是显式声明的，其余四个是推导出来的。 */
+  _getState() {
+    if (this.uid === null) return 'DISPOSED';
+    if (this.error) return 'FAILED';
+    if (this.epoch !== INACTIVE) return 'ACTIVE';
+    return 'PENDING';
+  }
+
+  _updateState(callback) {
+    var old = this.state;
+    this.state = callback() || this._getState();
+    if (old === this.state) return;
+    this.runtime.emit('internal/status', this, old);
+    // 只有跨越 ACTIVE 边界才影响别人：那意味着服务出现或消失了。
+    if (old !== 'ACTIVE' && this.state !== 'ACTIVE') return;
+    for (var name in this.runtime.impls) {
+      if (this.runtime.impls[name].fiber !== this) continue;
+      this.runtime.notify(name);
+    }
+  }
+
+  _checkImpl(name) {
+    var impl = this.runtime.getImpl(name);
+    if (!impl) { delete this._store[name]; return; }
+    this._store[name] = impl;
+  }
+
+  /** epoch = 每个被注入服务的"实现所属 fiber 的 uid"拼成的串；缺一个就是 INACTIVE。 */
+  _refresh() {
+    var epoch = '';
+    for (var name in this.inject) {
+      var impl = this._store[name];
+      if (!impl) { epoch = INACTIVE; break; }
+      epoch += ':' + impl.fiber.uid;
+    }
+    this._setEpoch(epoch);
+  }
+
+  _setEpoch(epoch) {
+    var old = this.epoch;
+    if (epoch === old) return;
+    this.epoch = epoch;
+    if (this.inertia) return;      // 有转换在飞：它会在自己的尾部重新比对 epoch
+    this._updateState(() => {
+      if (epoch !== INACTIVE && old === INACTIVE) {
+        this.inertia = this._reload();
+        return 'LOADING';
+      }
+      this.inertia = this._unload();
+      return 'UNLOADING';
+    });
+  }
+
+  async _reload() {
+    this.store = Object.assign(Object.create(null), this._store);
+    var oldEpoch = this.epoch;
+    try {
+      await Promise.resolve();
+      // checkpoint：这之前排队的 disposer 可能已经让本次加载作废，
+      // 那就一次都不执行插件体。
+      if (this.epoch === oldEpoch) {
+        this.loads++;
+        driveEffect(
+          () => this.plugin.apply && this.plugin.apply(this.ctx, this.config),
+          (undo) => { this.disposables.push(undo); },
+        );
+        this.error = null;
+      }
+    } catch (reason) {
+      this.runtime.emit('logger/error', this, reason);
+      this.error = reason;
+      this.epoch = INACTIVE;       // -> 尾部比对失败 -> 排空半途收集的 disposer
+    }
+    this._updateState(() => {
+      if (this.epoch === oldEpoch) { this.inertia = undefined; return; }
+      this.inertia = this._unload();
+      return 'UNLOADING';
+    });
+  }
+
+  async _unload() {
+    // 反序发起，但 Promise.all 并发完成：完成顺序只在单个 effect 内部有保证。
+    var list = this.disposables.splice(0).reverse();
+    await Promise.all(list.map(async (undo) => {
+      try {
+        await Promise.resolve();
+        await undo();
+      } catch (reason) {
+        this.runtime.emit('logger/error', this, reason);   // 一个失败不影响其他
+      }
+    }));
+    this.store = undefined;
+    this._updateState(() => {
+      if (this.epoch === INACTIVE) { this.inertia = undefined; return; }
+      this.inertia = this._reload();
+      return 'LOADING';
+    });
+  }
+
+  /** 等生命周期收敛；启动错误在这里重抛。 */
+  async await() {
+    while (this.inertia) await this.inertia;
+    if (this.error) throw this.error;
+    return this;
+  }
+
+  /** 卸载并立刻用当前 config 重新加载。FAILED 的 fiber 也能靠它复活。 */
+  async restart() {
+    this.assertActive();
+    this._setEpoch(INACTIVE);
+    this._refresh();
+    await this.await();
+  }
+}
+
+// ---- runtime：一张服务表、一个 uid 计数器、几个玩具 registry。 每个 register() 都 return effect disposer，因为这是规则。
+
+/** 让每次回收在诊断通道上留痕，方便 demo 观测发起/完成顺序。 */
+function reversible(rt, label, undo) {
+  return function () {
+    rt.emit('internal/teardown', label, 'start');
+    var result = undo();
+    if (result && typeof result.then === 'function') {
+      return result.then(function () { rt.emit('internal/teardown', label, 'done'); });
+    }
+    rt.emit('internal/teardown', label, 'done');
+  };
+}
+
+function createRuntime(observer) {
+  var rt = {
+    impls: Object.create(null),        // name -> { name, value, fiber }
+    hooks: Object.create(null),        // 事件表（第 4 章会把它换掉）
+    tools: new Map(),
+    sections: [],
+    all: [],                           // 所有 fiber，含已 DISPOSED 的
+    counter: 0,
+    nextUid: function () { return ++rt.counter; },
+
+    emit: function (name) {
+      var args = Array.prototype.slice.call(arguments, 1);
+      if (observer) observer.apply(null, [name].concat(args));
+      var hooks = (rt.hooks[name] || []).slice();
+      for (var i = 0; i < hooks.length; i++) hooks[i].apply(null, args);
+    },
+
+    /** 未激活的提供者不算存在：LOADING 中 provide 的服务对外还不可见。 */
+    getImpl: function (name) {
+      var impl = rt.impls[name];
+      if (!impl || impl.fiber.state !== 'ACTIVE') return undefined;
+      return impl;
+    },
+
+    /** 某个服务的可见性变了：所有注入它的 fiber 重算 epoch。 */
+    notify: function (name) {
+      rt.all.slice().forEach(function (fiber) {
+        if (fiber.uid === null || !(name in fiber.inject)) return;
+        fiber._checkImpl(name);
+        fiber._refresh();
+      });
+    },
+
+    /** 等整棵树静下来：没有任何 fiber 还有在飞的转换。 */
+    settle: async function () {
+      for (var i = 0; i < 400; i++) {
+        var busy = rt.all.filter(function (f) { return !!f.inertia; });
+        if (!busy.length) return;
+        await Promise.all(busy.map(function (f) { return f.inertia; }));
+      }
+      throw new Error('settle: 未收敛');
+    },
+
+    makeCtx: function (fiber) {
+      // 所有 registry 共用的形状：装上 -> 返回卸载它的 disposer。
+      function register(label, install) {
+        return fiber.effect(function () {
+          return reversible(rt, label, install());
+        }, label);
+      }
+      return {
+        fiber: fiber,
+        get: function (name) { var impl = rt.getImpl(name); return impl && impl.value; },
+        plugin: function (plugin, config) { return new Fiber(rt, fiber, plugin, config); },
+        effect: function (body, label) { return fiber.effect(body, label); },
+        emit: rt.emit,
+
+        provide: function (name, value) {
+          return register('ctx.provide("' + name + '")', function () {
+            if (rt.impls[name]) throw new Error('服务 "' + name + '" 已由 ' + rt.impls[name].fiber.name + ' 提供');
+            rt.impls[name] = { name: name, value: value, fiber: fiber };
+            return function () { delete rt.impls[name]; rt.notify(name); };
+          });
+        },
+
+        on: function (event, listener) {
+          return register('ctx.on("' + event + '")', function () {
+            var hooks = rt.hooks[event] || (rt.hooks[event] = []);
+            hooks.push(listener);
+            return function () {
+              var i = hooks.indexOf(listener);
+              if (i >= 0) hooks.splice(i, 1);
+            };
+          });
+        },
+
+        setInterval: function (fn, ms) {
+          return register('ctx.setInterval()', function () {
+            var timer = setInterval(fn, ms);
+            return function () { clearInterval(timer); };
+          });
+        },
+
+        tools: {
+          register: function (def) {
+            return register('tools.register("' + def.name + '")', function () {
+              if (rt.tools.has(def.name)) throw new Error('工具名冲突: ' + def.name);
+              rt.tools.set(def.name, def);
+              return function () { rt.tools.delete(def.name); };
+            });
+          }
+        },
+
+        systemPrompt: {
+          section: function (sec) {
+            return register('systemPrompt.section("' + sec.key + '")', function () {
+              rt.sections.push(sec);
+              return function () {
+                var i = rt.sections.indexOf(sec);
+                if (i >= 0) rt.sections.splice(i, 1);
+              };
+            });
+          }
+        }
+      };
+    }
+  };
+  rt.root = new Fiber(rt, null, { name: 'root' }, null);
+  return rt;
+}
+
+// ---- 页面上的 listing 全部从上面的函数对象打印出来
+DSH.showSource('src-getstate', [Fiber.prototype._getState, Fiber.prototype._updateState]);
+DSH.showSource('src-effect', [createEffect, driveEffect]);
+DSH.showSource('src-child', [attachChild]);
+DSH.showSource('src-epoch', [Fiber.prototype._refresh, Fiber.prototype._setEpoch]);
+DSH.showSource('src-reload', [Fiber.prototype._reload, Fiber.prototype._unload]);
+DSH.showSource('src-fiber', [Fiber]);
+DSH.showSource('src-runtime', [reversible, createRuntime]);
+
+// ---- 两个可视化控件
+var STATE_PILL = {
+  PENDING: '', LOADING: 'warn', ACTIVE: 'ok',
+  FAILED: 'bad', UNLOADING: 'warn', DISPOSED: 'mute'
+};
+
+/** 渲染 fiber 树：从 parent 指针重建，已 DISPOSED 的行保留在原位。 */
+function renderTree(el, rt) {
+  el.innerHTML = '';
+  var kids = new Map();
+  rt.all.forEach(function (f) {
+    var list = kids.get(f.parent);
+    if (!list) kids.set(f.parent, list = []);
+    list.push(f);
+  });
+  (function walk(parent, depth) {
+    (kids.get(parent) || []).forEach(function (f) {
+      var row = DSH.el('div', { class: 'row' });
+      var prefix = depth ? '   '.repeat(depth - 1) + '└─ ' : '';
+      row.appendChild(DSH.el('span', { class: 'nm', text: prefix + f.name }));
+      row.appendChild(DSH.el('span', { class: 'pill ' + STATE_PILL[f.state], text: f.state }));
+      var tail = [];
+      if (Object.keys(f.inject).length) tail.push('inject=' + Object.keys(f.inject).join(','));
+      tail.push('epoch=' + (f.epoch === INACTIVE ? 'INACTIVE' : '"' + f.epoch + '"'));
+      if (f.loads) tail.push('loads=' + f.loads);
+      if (f.error) tail.push('error=' + f.error.message);
+      row.appendChild(DSH.el('span', { class: 'ep', text: tail.join('  ') }));
+      el.appendChild(row);
+      walk(f, depth + 1);
+    });
+  })(null, 0);
+}
+
+/** effect 栈：注册顺序 / 发起顺序 / 完成顺序 三列对照。 */
+function makeStack(el) {
+  var rows = new Map();
+  var started = 0, finished = 0;
+  function head() {
+    el.innerHTML = '';
+    var cap = DSH.el('div', { class: 'fxrow cap' });
+    ['注册', '发起', '完成', 'effect'].forEach(function (t) {
+      cap.appendChild(DSH.el('span', { class: 'lb', text: t }));
+    });
+    el.appendChild(cap);
+  }
+  return {
+    reset: function () { rows.clear(); started = 0; finished = 0; head(); },
+    /** 按注册顺序铺一行；child=true 表示它是某个 composite effect 的子项。 */
+    push: function (label, child) {
+      var row = DSH.el('div', { class: 'fxrow' + (child ? ' child' : '') });
+      row.appendChild(DSH.el('span', { class: 'n', text: String(rows.size + 1) }));
+      var a = DSH.el('span', { class: 'n', text: '·' });
+      var b = DSH.el('span', { class: 'n', text: '·' });
+      row.appendChild(a);
+      row.appendChild(b);
+      row.appendChild(DSH.el('span', { class: 'lb', text: label }));
+      el.appendChild(row);
+      rows.set(label, { row: row, a: a, b: b, order: rows.size + 1 });
+    },
+    mark: function (label, phase) {
+      var r = rows.get(label);
+      if (!r) return;
+      if (phase === 'start') { r.a.textContent = String(++started); r.a.className = 'n hot'; }
+      else {
+        finished++;
+        r.b.textContent = String(finished);
+        // 完成序号和发起序号不一致 = 它被后来发起的 disposer 跨过去了
+        r.b.className = 'n' + (String(finished) === r.a.textContent ? '' : ' late');
+        r.row.classList.add('gone');
+      }
+    }
+  };
+}
+
+// ---- Demo 3.1 · effect 反序回收
+(function () {
+  var stack = makeStack(document.getElementById('fx-effect'));
+  var live = null;
+
+  var LABELS = [
+    'tools.register("grep")',
+    'systemPrompt.section("grep-usage")',
+    'ctx.on("tool/result")',
+    'ctx.setInterval()',
+    'watcher.stop()'
+  ];
+
+  /** 一个插件，五件注册。composite=true 时全部塞进一个 generator effect。 */
+  function toolbox(composite, onBeat) {
+    return {
+      name: 'toolbox',
+      apply: function (ctx) {
+        var items = [
+          function () { return ctx.tools.register({ name: 'grep', run: function () { return 'hit'; } }); },
+          function () { return ctx.systemPrompt.section({ key: 'grep-usage', text: '先 grep 定位再 read' }); },
+          function () { return ctx.on('tool/result', function () {}); },
+          function () { return ctx.setInterval(onBeat, 90); },
+          function () {
+            // 插件自己的异步 cleanup：真实 dsh 里 skill-filesystem 就是这么写的
+            return ctx.effect(function () {
+              return async function () {
+                ctx.emit('internal/teardown', 'watcher.stop()', 'start');
+                await DSH.wait(140);
+                ctx.emit('internal/teardown', 'watcher.stop()', 'done');
+              };
+            }, 'watcher.start()');
+          }
+        ];
+        if (!composite) { items.forEach(function (make) { make(); }); return; }
+        ctx.effect(function* () {
+          for (var i = 0; i < items.length; i++) yield items[i]();
+        }, 'toolbox.install()');
+      }
+    };
+  }
+
+  async function scenario(o, composite) {
+    o.clear();
+    stack.reset();
+    if (live && live.fiber.uid !== null) await live.fiber.dispose();
+
+    var beats = 0;
+    var rt = createRuntime(function (name, a, b) {
+      if (name === 'internal/teardown') { o.log('  disposer ' + b + '  ' + a); stack.mark(a, b); }
+      else if (name === 'logger/error') o.bad('  logger/error  ' + b.message);
+    });
+    var fiber = rt.root.ctx.plugin(toolbox(composite, function () { beats++; }));
+    live = { rt: rt, fiber: fiber };
+
+    o.head(composite ? '挂法 A：一个 composite effect，五个 yield' : '挂法 B：五个兄弟 effect');
+    await rt.settle();
+
+    LABELS.forEach(function (l) { stack.push(l, composite); });
+    o.acc('fiber.state = ' + fiber.state);
+    o.log('  tools=' + rt.tools.size + '  sections=' + rt.sections.length +
+          '  listeners=' + (rt.hooks['tool/result'] || []).length);
+    o.log('  fiber.getEffects() -> ' + JSON.stringify(fiber.getEffects().map(function (m) {
+      return m.label + (m.children.length ? '[' + m.children.length + ']' : '');
+    })));
+
+    await DSH.wait(300);
+    var before = beats;
+    o.dim('  心跳跑了 ' + before + ' 次，现在卸载。');
+    o.rule();
+
+    await fiber.dispose();
+    await DSH.wait(220);
+
+    o.rule();
+    o.acc('fiber.state = ' + fiber.state);
+    var reclaimed = rt.tools.size === 0 && rt.sections.length === 0 &&
+                    (rt.hooks['tool/result'] || []).length === 0;
+    o[reclaimed ? 'ok' : 'bad']('  tools=' + rt.tools.size + '  sections=' + rt.sections.length +
+      '  listeners=' + (rt.hooks['tool/result'] || []).length);
+    o[reclaimed ? 'ok' : 'bad'](reclaimed
+      ? '  四类注册全部回收，getEffects() 已空。'
+      : '  有注册没被回收，unload 变成谎言就是这个样子。');
+    o.dim('  心跳 ' + before + ' -> ' + beats + (beats > before
+      ? '：timer 在卸载期间又跳了 ' + (beats - before) +
+        ' 次。严格反序要等 watcher.stop() 那 140ms 收敛，代价就是它。'
+      : '：timer 的 disposer 没等 watcher，立刻就停了。'));
+  }
+
+  /** 有 bug 的插件：监听器直接 push 到外部 emitter，effect body 不 return disposer。 */
+  function leaky(bus, onChange) {
+    return {
+      name: 'leaky-toolbox',
+      apply: function (ctx) {
+        ctx.tools.register({ name: 'grep', run: function () { return 'hit'; } });
+        ctx.effect(function () {
+          bus.push(onChange);
+          // 本该 return function () { bus.splice(bus.indexOf(onChange), 1); }
+        }, 'bus.on("fs/change")');
+      }
+    };
+  }
+
+  async function leakScenario(o) {
+    o.clear();
+    stack.reset();
+    if (live && live.fiber.uid !== null) await live.fiber.dispose();
+
+    var bus = [], fired = 0;
+    var rt = createRuntime(function (name, a, b) {
+      if (name === 'internal/teardown') o.log('  disposer ' + b + '  ' + a);
+      else if (name === 'logger/error') o.bad('  logger/error  ' + b.message);
+    });
+    var labels = function () { return JSON.stringify(fiber.getEffects().map(function (m) { return m.label; })); };
+    var fiber = rt.root.ctx.plugin(leaky(bus, function () { fired++; }));
+    live = { rt: rt, fiber: fiber };
+
+    o.head('挂法 C：effect body 忘了 return disposer');
+    await rt.settle();
+    o.acc('fiber.state = ' + fiber.state);
+    o.log('  tools=' + rt.tools.size + '  bus.listeners=' + bus.length + '  getEffects() -> ' + labels());
+    bus.forEach(function (fn) { fn(); });
+    o.dim('  触发一次 fs/change，回调跑了 ' + fired + ' 次。到这里一切正常。');
+    o.rule();
+
+    await fiber.dispose();
+    await rt.settle();
+    var seen = fired;
+    bus.forEach(function (fn) { fn(); });
+    o.acc('fiber.state = ' + fiber.state);
+    o.ok('  tools=' + rt.tools.size + '：走 ctx.tools.register() 的那条确实还回去了。');
+    o.bad('  bus.listeners=' + bus.length + '，再触发一次 fs/change，回调又跑了 ' +
+          (fired - seen) + ' 次。插件已经 DISPOSED，它的回调还在响。');
+    o.dim('  getEffects() -> ' + labels() + '，运行时看不出哪里漏了：label 随 wrapper 一起没了。');
+  }
+
+  DSH.predict('p-teardown', {
+    q: '五个兄弟 effect 卸载时，disposer 按 5→4→3→2→1 发起，其中第 5 个（watcher）的 disposer 要等 140ms。它们的完成顺序是？',
+    options: [
+      { label: '5 4 3 2 1，跟发起顺序一样', why: '发起顺序确实是反序，但完成顺序不受它管。' },
+      { label: '4 3 2 1 5，慢的那个被跨过去', ok: true,
+        why: 'fiber 卸载是 Promise.all，reverse() 只作用在发起那一步。' },
+      { label: '1 2 3 4 5，跟注册顺序一样', why: '正序既不是发起顺序，也不是完成顺序。' }
+    ],
+    explain: '点「五个兄弟 effect」看「发起」和「完成」两列的差别；再点「一个 composite effect」，两列会对齐。'
+  });
+
+  DSH.demo('d-effect', {
+    init: function () { stack.reset(); },
+    reset: function (o) { o.clear(); stack.reset(); },
+    run: function (o) { return scenario(o, true); },
+    sibling: function (o) { return scenario(o, false); },
+    leak: function (o) { return leakScenario(o); }
+  });
+})();
+
+// ---- Demo 3.2 · 级联卸载
+(function () {
+  var tree = document.getElementById('ft-cascade');
+  var live = null;
+
+  function slowLeaf(name, ms, trace) {
+    return {
+      name: name,
+      apply: function (ctx) {
+        ctx.effect(function () {
+          return async function () {
+            trace('  '.repeat(3) + name + '.stop()  开始');
+            await DSH.wait(ms);
+            trace('  '.repeat(3) + name + '.stop()  完成');
+          };
+        }, name + '.stop()');
+      }
+    };
+  }
+
+  async function scenario(o, ordered) {
+    o.clear();
+    if (live && live.app.uid !== null) await live.app.dispose();
+
+    var rt = createRuntime(function (name) {
+      if (name === 'internal/status') renderTree(tree, rt);
+      if (name === 'logger/error') o.bad('  logger/error  ' + arguments[2].message);
+    });
+    function trace(line) { o.log(line); }
+
+    var session = {
+      name: 'session',
+      apply: function (ctx) {
+        ctx.plugin(slowLeaf('toolset', 220, trace));
+        ctx.plugin(slowLeaf('watcher', 80, trace));
+        ctx.effect(function () {
+          return async function () { trace('    session.flush()  完成'); };
+        }, 'session.flush()');
+      }
+    };
+
+    var app = rt.root.ctx.plugin({
+      name: 'app',
+      apply: function (ctx) {
+        function openPort() {
+          return ctx.effect(function () {
+            trace('  app.port()  打开');
+            return function () { trace('  app.port()  关闭'); };
+          }, 'app.port()');
+        }
+        if (!ordered) {
+          openPort();
+          ctx.plugin(session);        // 兄弟：两个独立 effect
+          return;
+        }
+        // 一个 composite effect：yield 子 fiber 的精确 disposer，把子树钉在反序位置
+        ctx.effect(function* () {
+          yield openPort();
+          yield ctx.plugin(session).dispose;
+        }, 'app.composition()');
+      }
+    });
+    live = { rt: rt, app: app };
+
+    o.head(ordered ? '挂法 A：composite effect，yield 子 fiber 的精确 disposer'
+                   : '挂法 B：端口和子树是两个兄弟 effect');
+    await rt.settle();
+    renderTree(tree, rt);
+    o.acc('已挂载：root → app → session → { toolset, watcher }');
+    o.rule();
+    o.dim('await app.dispose()');
+
+    var t0 = Date.now();
+    await app.dispose();
+    await rt.settle();
+    renderTree(tree, rt);
+
+    o.rule();
+    o.acc('dispose() resolve，用了 ' + (Date.now() - t0) + 'ms');
+    var kids = rt.all.filter(function (f) { return f.parent; });
+    var allGone = kids.every(function (f) { return f.state === 'DISPOSED'; });
+    o[allGone ? 'ok' : 'bad']('  ' + kids.map(function (f) { return f.name + ':' + f.state; }).join('  '));
+    o[ordered ? 'ok' : 'warn'](ordered
+      ? '  app.port() 在子树彻底静下来之后才关闭。'
+      : '  注意 app.port() 的关闭时机：它没等子树拆完。');
+  }
+
+  DSH.demo('d-cascade', {
+    reset: function (o) { o.clear(); tree.innerHTML = ''; },
+    run: function (o) { return scenario(o, false); },
+    ordered: function (o) { return scenario(o, true); }
+  });
+})();
+
+// ---- Demo 3.3 · provider 热替换与 epoch
+(function () {
+  var tree = document.getElementById('ft-epoch');
+
+  function makeRuntime(o) {
+    return createRuntime(function (name, a, b) {
+      if (name === 'internal/status') o.dim('    status  ' + a.name + '  ' + b + ' -> ' + a.state);
+      if (name === 'logger/error') o.bad('  logger/error  ' + b.message);
+    });
+  }
+
+  var agent = {
+    name: 'agent',
+    inject: ['model'],
+    apply: function (ctx) {
+      // 每次重载都重新拿一次实现引用，并重新注册工具
+      var model = ctx.get('model');
+      ctx.emit('demo/log', '  apply(): model=' + model + '  epoch="' + ctx.fiber.epoch + '"');
+      ctx.tools.register({ name: 'ask_' + model.replace(/[^a-z0-9]/g, ''), run: function () {} });
+    }
+  };
+
+  function provider(name, model) {
+    return { name: name, apply: function (ctx) { ctx.provide('model', model); } };
+  }
+
+  DSH.demo('d-epoch', {
+    reset: function (o) { o.clear(); tree.innerHTML = ''; },
+
+    run: async function (o) {
+      var rt = makeRuntime(o);
+      rt.root.ctx.on('demo/log', function (line) { o.acc(line); });
+
+      o.head('1) agent 先 mount，此时没有任何 model 实现');
+      var a = rt.root.ctx.plugin(agent);
+      await rt.settle();
+      renderTree(tree, rt);
+      o.log('  agent: state=' + a.state + '  epoch=' + a.epoch + '  loads=' + a.loads +
+            '  tools=[' + Array.from(rt.tools.keys()).join(',') + ']');
+
+      o.head('2) provider A 上线');
+      var pa = rt.root.ctx.plugin(provider('model-a', 'deepseek-v3'));
+      await rt.settle();
+      renderTree(tree, rt);
+      o.log('  agent: state=' + a.state + '  epoch="' + a.epoch + '"  loads=' + a.loads +
+            '  tools=[' + Array.from(rt.tools.keys()).join(',') + ']');
+
+      o.head('3) provider A 下线');
+      var uidA = pa.uid;                     // dispose 之后 uid 会被清成 null
+      await pa.dispose();
+      await rt.settle();
+      renderTree(tree, rt);
+      o.log('  agent: state=' + a.state + '  epoch=' + a.epoch +
+            '  tools=[' + Array.from(rt.tools.keys()).join(',') + ']');
+      o.dim('  依赖消失 -> 退回 PENDING（不是 FAILED：它自己没错），注册的工具跟着还回去了。');
+
+      o.head('4) provider B 上线，实现换了，服务名没换');
+      var pb = rt.root.ctx.plugin(provider('model-b', 'deepseek-r2'));
+      await rt.settle();
+      renderTree(tree, rt);
+      o.log('  agent: state=' + a.state + '  epoch="' + a.epoch + '"  loads=' + a.loads +
+            '  tools=[' + Array.from(rt.tools.keys()).join(',') + ']');
+      o.rule();
+      o.ok('epoch 从 ":' + uidA + '" 变成 ":' + pb.uid + '"，插件体执行了 ' + a.loads +
+           ' 次。名字相同不算相同：epoch 认的是实现所属 fiber 的 uid。');
+    },
+
+    race: async function (o) {
+      o.clear();
+      var rt = makeRuntime(o);
+      o.head('provider 已在，dependent 现在 mount');
+      var p = rt.root.ctx.plugin(provider('provider', 'deepseek-v3'));
+      await rt.settle();
+
+      var applied = 0;
+      var dep = rt.root.ctx.plugin({
+        name: 'dependent', inject: ['model'],
+        apply: function () { applied++; }
+      });
+      o.log('  mount 之后（同一个 tick 内）：state=' + dep.state + '  epoch="' + dep.epoch + '"');
+      o.dim('  _reload() 已经排上了，但它开头有一个 await Promise.resolve() checkpoint。');
+
+      var pending = p.dispose();     // 同一个 tick 内撤掉提供者
+      o.warn('  同一个 tick 内：p.dispose()');
+      await rt.settle();
+      await pending;
+      renderTree(tree, rt);
+
+      o.rule();
+      o.log('  dependent: state=' + dep.state + '  epoch=' + dep.epoch + '  loads=' + dep.loads);
+      o[applied === 0 ? 'ok' : 'bad']('  插件体执行次数 = ' + applied +
+        (applied === 0 ? '：过 checkpoint 时 epoch 已经变了，一次都没跑。' : '：不该发生'));
+    }
+  });
+})();
+
+// ---- Demo 3.4 · 失败容纳
+(function () {
+  var tree = document.getElementById('ft-fail');
+  var live = null;
+
+  function snapshot(o, rt) {
+    o.log('  tools=[' + Array.from(rt.tools.keys()).join(',') + ']' +
+          '   services=[' + Object.keys(rt.impls).join(',') + ']');
+  }
+
+  DSH.demo('d-fail', {
+    reset: function (o) { o.clear(); tree.innerHTML = ''; live = null; },
+
+    run: async function (o) {
+      var errors = [];
+      var path = [];
+      var rt = createRuntime(function (name, a, b) {
+        if (name === 'internal/status') {
+          renderTree(tree, rt);
+          if (a.name === 'storage') path.push(b + ' -> ' + a.state);
+        }
+        if (name === 'logger/error') errors.push(a.name + ': ' + b.message);
+      });
+      var broken = { yes: true };
+
+      rt.root.ctx.plugin({ name: 'logger', apply: function (ctx) { ctx.provide('log', function () {}); } });
+      rt.root.ctx.plugin({ name: 'ui', inject: ['log'],
+        apply: function (ctx) { ctx.tools.register({ name: 'ui_show' }); } });
+
+      var storage = rt.root.ctx.plugin({
+        name: 'storage',
+        apply: function (ctx) {
+          ctx.tools.register({ name: 'db_query' });      // 先注册一个工具
+          ctx.provide('db', { rows: [] });               // 再 provide 服务
+          if (broken.yes) throw new Error('sqlite: unable to open database file');
+        }
+      });
+      var repo = rt.root.ctx.plugin({ name: 'repo', inject: ['db'],
+        apply: function (ctx) { ctx.tools.register({ name: 'repo_get' }); } });
+
+      live = { rt: rt, storage: storage, repo: repo, broken: broken };
+      await rt.settle();
+      renderTree(tree, rt);
+
+      o.head('storage 在 provide("db") 之后抛异常');
+      errors.forEach(function (e) { o.bad('  logger/error  ' + e); });
+      o.dim('  storage 的状态轨迹：' + path.join('  |  ') +
+            '   注意它是穿过 UNLOADING 才到 FAILED 的。');
+      o.rule();
+      o.acc('结果：');
+      rt.all.filter(function (f) { return f.parent; }).forEach(function (f) {
+        var cls = f.state === 'ACTIVE' ? 'ok' : (f.state === 'FAILED' ? 'bad' : 'warn');
+        o[cls]('  ' + f.name + ' -> ' + f.state +
+          (f.state === 'PENDING' ? '   (waiting for services: ' +
+            Object.keys(f.inject).filter(function (s) { return !f.ctx.get(s); }).join(',') + ')' : '') +
+          (f.error ? '   error=' + f.error.message : ''));
+      });
+      snapshot(o, rt);
+      o.dim('  storage 半途注册的 db_query 和 db 服务都被排空了：' +
+            'catch 分支把 epoch 设成 INACTIVE，尾部比对失败 -> _unload()。');
+      o.log('  storage.getEffects() -> ' + JSON.stringify(storage.getEffects()));
+      o.rule();
+      o.ok('logger 和 ui 完全没受影响：fiber 就是容纳单位。');
+      try {
+        await storage.await();
+      } catch (err) {
+        o.dim('  await storage.await() 重抛了原始错误: ' + err.message);
+      }
+    },
+
+    retry: async function (o) {
+      if (!live) { o.clear(); o.warn('先点"挂载"按钮跑一次。'); return; }
+      o.clear();
+      var rt = live.rt;
+      live.broken.yes = false;
+      o.head('修好底层问题，然后 storage.restart()');
+      await live.storage.restart();
+      await rt.settle();
+      renderTree(tree, rt);
+      rt.all.filter(function (f) { return f.parent; }).forEach(function (f) {
+        o[f.state === 'ACTIVE' ? 'ok' : 'warn']('  ' + f.name + ' -> ' + f.state +
+          '   epoch=' + (f.epoch === INACTIVE ? 'INACTIVE' : '"' + f.epoch + '"'));
+      });
+      snapshot(o, rt);
+      o.rule();
+      o.ok('storage ACTIVE，db 重新可见，repo 自己从 PENDING 走到 ACTIVE。' +
+           '没有人去"通知"它，是 epoch 变了。');
+    }
+  });
+})();
+</script>
+
+</body>
+</html>

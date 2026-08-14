@@ -1,0 +1,1960 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · 自我改造：让 agent 修改自己的运行时 — DeepSeek Harness from Scratch</title>
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/site.js"></script>
+<style>
+/* 本章自己的两处小样式：按钮多、探针表格窄。site.css 不提供，就地补。 */
+#d-forge .demo-head, #d-facade .demo-head, #d-inspect .demo-head { flex-wrap: wrap; row-gap: 8px; }
+table.probe td:first-child { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
+table.probe td:nth-child(2) { white-space: nowrap; }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+<main>
+
+<header class="masthead">
+  <div class="kicker">第 09 章</div>
+  <h1>自我改造：让 agent 修改自己的运行时</h1>
+  <p class="standfirst">
+    前八章造的东西，这一章会同时用上：服务注册表、fiber 的反序回收、瀑布事件、会话日志、工具流水线。
+    模型现场写一段插件，挂进正在运行的进程，然后在同一个 turn 里调用它自己刚注册的工具。
+    这件事能不能做，取决于工具表是一张可写的注册表，还是一个启动时读一次的常量。
+    dsh 选了可写，代价记在 §9.6。
+  </p>
+  <div class="meta"><span>本章造出 cordis_define / cordis_run / cordis_stop</span><span>3 个 demo · 1 个预测题</span><span>约 30 分钟</span></div>
+</header>
+
+<h2><span class="num">§9.1</span>为什么这件事在别的 harness 里做不到</h2>
+
+<p>
+"让模型给自己加一个工具"听起来像一个 feature，落到实现上是一道结构题。它同时要求四样东西，
+而这四样恰好是第 2 到第 6 章各自的产物：
+</p>
+
+<table>
+<thead><tr><th>需要什么</th><th>来自哪一章</th><th>缺了会怎样</th></tr></thead>
+<tbody>
+<tr><td>运行时可写的服务注册表</td><td>第 2 章 <code>Context / Service</code></td><td>新插件无处发布自己的能力，只能改源码重启</td></tr>
+<tr><td>卸载时反序回收副作用的 fiber</td><td>第 3 章 <code>Fiber / ctx.effect()</code></td><td>停不掉。长会话里堆满孤儿监听器和幽灵工具</td></tr>
+<tr><td>能被外部代码挂钩的事件</td><td>第 4 章 <code>ctx.on() / waterfall</code></td><td>动态插件只能加工具，改不了已有行为</td></tr>
+<tr><td>接受运行时注册的工具表</td><td>第 6 章 <code>ctx.tools / capability seam</code></td><td>最致命的一条。工具表若是启动时冻结的数组，这一章的一切都不存在</td></tr>
+</tbody>
+</table>
+
+<p>
+最后一条值得展开，也值得先削掉一点。工具集写成模块顶层的 <code>const TOOLS = [...]</code>、
+启动时读一次拼进 system prompt 就再也不变，这样的 harness 确实存在。在那种结构里，
+"运行中新增一个工具"没有落点：没有 owner，没有作用域，没人负责在它消失时把它摘掉，
+schema 变了也没人知道该重发请求。
+</p>
+
+<p>
+这条界线并不把 dsh 单独圈出来。omp 的扩展用 <code>pi.registerTool(...)</code> 注册工具，
+运行中可以 <code>pi.setActiveTools(names)</code> 换掉当前会话的活动集，
+MCP 那一侧还能 <code>/mcp reload</code> 做一次断开加重新发现的热重绑。工具表可写，它做到了。
+</p>
+
+<p>
+剩下的差别在作者和来源。omp 那条路上的工具来自一段人写的代码，装进发现目录，进程起来时被 import 执行；
+它进入工具表的时刻晚，出生的时刻早。本章要挂的东西没有这段前史，
+<code>cordis_define</code> 收下的是模型在这次会话里写出来的函数体，
+<code>cordis_run</code> 求值它，挂成 <code>cordis-dynamic</code> 组下的一个子 fiber。
+</p>
+
+<p>
+焊住这件事的是注册的返回值。dsh 的 <code>ctx.tools.register()</code> 不往数组里 push，
+它返回一个 <strong>disposer</strong>，而这个 disposer 本身就是调用方 fiber 上的一个 effect：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">packages/core/tools/src/index.ts · ToolRuntime.register 的最后一句</span></div>
+<pre><code data-lang="js">return this.layers.effect(
+  this.ctx,
+  layer =&gt; layer.tools.insert(name, definition),
+  { label: 'tools.register()' },
+)</code></pre>
+</div>
+
+<p>
+注册和生命周期就此焊在一起。谁注册的，谁的 fiber 死了就自动注销。
+<code>cordis-host-runner</code> 的 <code>lifecycle.ts</code> 因此可以在模块注释里写得这么轻松，
+停止一个动态包不需要任何专门的清理代码：
+</p>
+
+<blockquote>
+Stopping needs no helper — a host half unwinds through an ordinary awaited <code>fiber.dispose()</code>,
+because everything the plugin registered is an effect on its fiber.
+</blockquote>
+
+<div class="note vs">
+  <span class="tag">换成别的 harness</span>
+  工具表冻在编译期的 harness，没有地方安放一个下午三点才被造出来的工具。
+  第一条替代路是 MCP：Claude Code、Codex 和 dsh 都支持它，一个外部进程可以把自己的工具挂进模型看得见的目录。
+  dsh 自己的 <code class="srcpath">packages/mcp/mcp-client</code> 就是这么干的，
+  按 <code>cordis.yml</code> 里的一条配置连上一台 server，把它的工具注册成 <code>mcp__&lt;server&gt;__&lt;name&gt;</code>。
+  第二条是 omp 的扩展：一个默认导出 <code>(pi: ExtensionAPI) =&gt; void</code> 的 TS 模块，跑在 harness 自己的进程里，
+  用 <code>pi.registerTool(...)</code> 加工具，也能挂事件、slash 命令、快捷键和消息渲染器。
+  它的工具表同样是活的，写那段代码的人是你。
+  三条路的时间点不一样。MCP server 是你事先写好、事先配好的另一个程序；
+  omp 扩展是你事先写好、放进 <code>.omp/extensions</code> 这类发现目录的一个模块；
+  cordis 动态包是模型在这次会话里写的一段函数体，挂进当前进程，带着一个 disposer。
+  前两条换来的东西也是真的。MCP 有独立进程、可以用任何语言写、同一台 server 能被几个 harness 复用，
+  隔离性比 §9.6 那个沙箱结实得多；omp 扩展在挂载之前被一个人读过一遍、装过一次，
+  它更安全的理由和它更不动态的理由是同一个。
+</div>
+
+<div class="note warn">
+  <span class="tag">先把这话的分量说清</span>
+  这套机制不是 dsh 发明的。开源当天 HN 那条帖子里，lxdlam 读完 Cordis 的论文给出的结论是
+  「found it may be useful, but not that useful... it adds hot-reload and dynamic enable/dispose
+  capabilities to a plugin system, like the one in Pi agents, though they push the boundaries
+  further, to the UI components」（HN item 49285244，2026-08-13）。
+  这话没说错。热重载和 dispose 在插件系统里是旧东西，Pi 的 TypeScript extension 也能加工具、命令和 hook。
+  dsh 推进的是范围：写这段代码的是模型而不是你，落点包括浏览器里的 UI slot，
+  代码跑在 harness 自己的进程里。最后这一句要付什么代价，§9.6 会算清。
+</div>
+
+<div class="diagram">                第 2 章            第 3 章            第 4 章            第 6 章
+              Service 注册表      Fiber / effect     ctx.on 瀑布      ctx.tools.register
+                   │                  │                  │                  │
+                   └──────────────────┴────────┬─────────┴──────────────────┘
+                                               ▼
+                                   cordis_define → cordis_run
+                                               ▼
+                              模型写的 plugin 成为一个活的子 fiber
+                                               ▼
+                               它注册的工具立刻出现在下一次请求里</div>
+
+<h2><span class="num">§9.2</span>七个工具，两两成对的动词</h2>
+
+<p>
+先说一件容易踩坑的事：这套工具的名字在仓库里有四个版本，只有一个是真的。
+读文档会读到三种说法，而运行时真正发生的只有
+<code class="srcpath">packages/extensions/tool-cordis/src/index.ts</code> 里那句
+<code>ctx.tools.register(defineTool({ name: … }))</code>：
+</p>
+
+<table>
+<thead><tr><th>出处</th><th>它说的名字</th><th>可信度</th></tr></thead>
+<tbody>
+<tr><td><code class="srcpath">tool-cordis/src/index.ts</code></td><td>下面那 7 个</td><td><span class="pill ok">唯一权威</span></td></tr>
+<tr><td><code class="srcpath">docs/tool-catalog.md</code>（生成物）</td><td>同样的 7 个</td><td><span class="pill ok">一致</span></td></tr>
+<tr><td><code class="srcpath">tool-cordis/README.md</code></td><td>5 个：<code>cordis_inspect</code> 一个顶三个</td><td><span class="pill warn">已过时</span></td></tr>
+<tr><td>Agent Note <code class="srcpath">2026-07-08-self-referential-cordis-toolset.md</code></td><td>3 个：<code>cordis_mount</code> / <code>cordis_unmount</code></td><td><span class="pill warn">上一代设计</span></td></tr>
+<tr><td><code class="srcpath">cordis-host-runner/src/lifecycle.ts</code> 的报错文案</td><td><code>cordis_runtime_inspect what:"temporary"</code></td><td><span class="pill bad">字符串里的化石</span></td></tr>
+</tbody>
+</table>
+
+<p>
+生成的目录跟着源码走，手写的散文跟不上。任何"用文档描述行为"的地方都会这样，这个仓库并不特别糟。
+dsh 的应对是把能生成的东西全部生成，再用 <code>verify-*</code> 脚本闸住新鲜度（§9.9 还会提一次）。
+读源码是唯一不会骗你的路径。真实注册的七个是：
+</p>
+
+<table>
+<thead><tr><th>工具</th><th>参数</th><th>做什么</th></tr></thead>
+<tbody>
+<tr><td><code>cordis_inspect_list</code></td><td>无</td><td>列出所有 Inspect Provider（host 侧本地的 + 从浏览器同步来的 manifest），每个带平台、只读方法、输入输出 schema</td></tr>
+<tr><td><code>cordis_inspect_query</code></td><td><code>platform</code> <code>provider</code> <code>method</code> <code>input?</code></td><td>跑一次 Provider 显式声明的只读查询。名字必须来自 list，不许猜。它不能调用业务服务，也不能改运行时</td></tr>
+<tr><td><code>cordis_inspect_self</code></td><td><code>pluginId?</code> <code>packageId?</code></td><td>看当前会话自己的动态对象。三档细节：不给 id 只列 plugin 摘要；给 pluginId 出版本指针与所有 package 摘要；两个都给才返回那个不可变 package 的源码与诊断。<code>packageId</code> 不能单独出现</td></tr>
+<tr><td><code>cordis_define</code></td><td><code>plugin</code> <code>name</code> <code>purpose</code> <code>code.host?</code> <code>code.client?</code></td><td>登记一个<strong>不可变的 Package</strong>。只校验参数与语法、记录源码：不申请批准、不执行 apply、不改 <code>currentPackageId</code></td></tr>
+<tr><td><code>cordis_run</code></td><td><code>pluginId</code> <code>packageId</code> <code>mode</code></td><td>激活某一个精确的 Package。<code>mode:"run"</code> 首次启动 / 重启 / 回滚，<code>mode:"update"</code> 从 current 切到另一个 package</td></tr>
+<tr><td><code>cordis_stop</code></td><td><code>pluginId</code></td><td>停掉当前 Run，取消未完成的批准请求。定义、所有 package、授权、版本指针全部保留，重复 stop 幂等成功</td></tr>
+<tr><td><code>cordis_undefine</code></td><td><code>pluginId</code></td><td>永久删除。必要时先 stop，然后删掉每个 package、每份授权和版本指针</td></tr>
+</tbody>
+</table>
+
+<div class="note">
+  <span class="tag">成对的动词</span>
+  <code>define ↔ undefine</code> 管存在，<code>run ↔ stop</code> 管活着。两条轴正交，
+  于是"停掉但保留版本以便回滚"和"彻底删除"是两个不同的意图，模型不必用一个动词表达两件事。
+  第三类是只读的 inspect，它不参与任何一对。一个只读动词没有反义词，这也是它可以被无脑调用的原因。
+</div>
+
+<p>
+还有一条设计选择藏在 <code>define</code> 的参数里：<code>plugin</code> 是一个 <code>oneOf</code>，
+要么 <code>{ kind: 'new', idPrefix }</code>（给 3 到 6 个小写字母，host 补数字后缀），
+要么 <code>{ kind: 'existing', pluginId }</code>。后者追加一个新 package，旧的原地留着。
+于是"改一版"天然是 append-only：Plugin 是一条版本线，Package 是线上的不可变节点，
+<code>currentPackageId</code> 只是一个指针。回滚就是把指针指回去，再 <code>cordis_run mode:"run"</code>。
+</p>
+
+<h2><span class="num">§9.3</span>host 半与 browser 半</h2>
+
+<p>
+一个动态 package 可以同时带两半：<code>code.host</code> 跑在 Node 进程里，<code>code.client</code> 跑在浏览器里。
+两边都是一段返回 cordis plugin 的普通 JavaScript 函数体，没有 JSX、没有 TypeScript、没有 import 变换。
+第二半的含义比第一半激进：模型可以把 UI 写进正在运行的 web client。
+</p>
+
+<p>浏览器那半的落点不是 innerHTML，而是一份编译期生成的 slot 目录（<code class="srcpath">tool-cordis/src/client-catalog.ts</code>）：
+每个 slot 的 key、注册选项、组件能收到的 props、谁已经占着这个座位。
+生成器宁可失败也不输出模型无法据以行动的条目。</p>
+
+<p>
+两半的启动顺序和授权由 host 的 <code>run()</code> 决定，而这里有本章最重要的一道人类闸门：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">packages/extensions/cordis-host-runner/src/index.ts · run() 的两条分支（节选）</span></div>
+<pre><code data-lang="js">// 没有 browser 半：host 自己直接激活，不问任何人
+if (plan.definition.clientCode === undefined) {
+  const started = await this.activate(plan, undefined, false, attempt)
+  if (started.ok) return this.runResponse(plan.plugin, started)
+  this.failAttempt(plan.plugin, attempt, 'host-load', started)
+  return { ...started, reason: 'host-half-failed' }
+}
+
+// 有 browser 半：先看这个 Package 是否已被授权
+const requestId = ApprovalRequestId(this.registry.mintApprovalRequestId())
+const requiresApproval = !plan.plugin.clientVersionUpdatesApproved
+  &amp;&amp; !plan.plugin.approvedClientPackages.has(packageId)
+attempt.status = requiresApproval ? 'awaiting-approval' : 'starting-host'
+this.ctx.emit('cordis/request-run', { requestId, agentId: agent.id, pluginId, packageId, /* … */ requiresApproval })</code></pre>
+</div>
+
+<p>
+读法：host 半不需要批准，browser 半需要，而且只需要一次。
+用户点"批准"时可以顺带勾上 <code>approveFutureVersions</code>，之后这个 Plugin 的后续版本直接放行
+（<code>clientVersionUpdatesApproved</code>）；不勾，授权就按 Package 记（<code>approvedClientPackages</code>）。
+被批准的对象是页面上会出现的东西，不是代码本身。host 半早就以 bash 级别的权限跑起来了，
+再给它加一道确认框只是安慰剂。
+</p>
+
+<div class="note">
+  <span class="tag">谁来驱动这次 run</span>
+  host 通过 <code>cordis/request-run</code> 事件问所有打开的页面"这个定义要不要跑"。
+  第一个应答的页面负责按顺序驱动：先 host 半，再取源码，再 browser 半，最后回一份说明发生了什么的 resolution。
+  用户在页面上自己按"运行"也走同一条编排，只是没有什么要问的。整段编排在
+  <code class="srcpath">packages/extensions/cordis-client-runner/</code>，它把 guarded plugin 塞进模块表、
+  用 <code>loader.create</code> 挂载，所以动态包和静态包共享同一套激活门禁、fiber effect 清理和状态投影。
+  本地跑起来的那个 Web UI 会去取 37 个 client plugin bundle，模型写的那半用的就是同一条加载路径。
+</div>
+
+<h2><span class="num">§9.4</span>检查活的运行时</h2>
+
+<p>
+模型要给运行时写插件，第一件事是知道运行时长什么样。这里有个值得偷的设计：
+inspect 的数据来自两个性质不同的源头，然后求交集。
+</p>
+
+<ul>
+  <li>能做什么：一份编译期生成的 API catalog（<code class="srcpath">tool-cordis/src/api-catalog.ts</code>），
+      与 <code>docs/subsystems</code> 出自同一次 AST 扫描，含渲染后的方法签名、原始 JSDoc、事件的分发模式。
+      它讲的是仓库在编译期的事实，用 <code>verify-cordis-api</code> 闸住新鲜度。</li>
+  <li>正在跑什么：live service store，也就是进程里此刻真实存在的服务和它们的 owner fiber。</li>
+</ul>
+
+<p>关键在这两者不匹配的时候怎么办。<code class="srcpath">tool-cordis/src/inspect.ts</code> 的选择是：</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">packages/extensions/tool-cordis/src/inspect.ts · liveServices()</span></div>
+<pre><code data-lang="js">/**
+ * Every service this process provides, joined with the generated catalog: what is
+ * RUNNING comes from the store, what each service CAN DO comes from the catalog,
+ * and a live service the catalog does not cover stays in the list as reachable
+ * with no signatures rather than being dropped.
+ */
+function liveServices(ctx, api) {
+  const catalogued = new Map(api.map(entry =&gt; [entry.key, entry]))
+  return liveImpls(ctx).map((impl) =&gt; {
+    const entry = catalogued.get(impl.name)
+    return {
+      name: impl.name,
+      owner: impl.fiber.name,
+      state: STATE_LABELS[impl.fiber.state],
+      summary: entry === undefined ? '' : plainSummary(entry.summary),
+      catalogued: entry !== undefined,
+      methods: entry === undefined ? [] : entry.methods.map(method =&gt; method.signature),
+    }
+  }).sort(/* … */)
+}</code></pre>
+</div>
+
+<p>
+一个活着但目录里没有的服务，被报成<strong>可达，但没有签名</strong>，留在列表里。
+这条规则是自我改造能力的必需品，不只是健壮性好看：动态包 provide 出来的服务，按定义就不可能出现在编译期目录里。
+inspect 若只信目录，模型永远看不见自己上一步造出来的东西，package 之间也无法通过
+<code>provide</code> / <code>inject</code> 组合。
+反过来，目录里有、进程里没有的，单列成 absent 一行：可加载，但此刻不在。
+</p>
+
+<p>
+下面这个 demo 跑在本页真实的 mini-dsh 上。它由前几章的产物拼成，现在真的活在这个页面里；
+三个 inspect 工具都是真工具，通过第 6 章的执行管线调用：
+</p>
+
+<div class="demo" id="d-inspect">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 9.1</span>检查活的运行时</div>
+    <div class="spacer"></div>
+    <button class="btn primary" data-act="run">cordis_inspect_query</button>
+    <button class="btn" data-act="providers">cordis_inspect_list</button>
+    <button class="btn" data-act="self">cordis_inspect_self</button>
+    <button class="btn" data-act="reset">清空</button>
+  </div>
+  <div class="demo-body">
+    <div class="out" id="out-inspect"></div>
+  </div>
+</div>
+
+<div class="note">
+  <span class="tag">先跑这个，回头再跑一次</span>
+  现在 <code>cordis_inspect_self</code> 是空的。等你在 Demo 9.2 里挂上自己的插件之后回到这里再点一次，
+  服务表里会多出一个没有签名的条目、fiber 树里会多出一个子 fiber、工具表里会多出一个新名字。
+  三个 demo 共享同一个运行时对象，不是三份互相隔离的演示数据。
+</div>
+
+<h2><span class="num">§9.5</span>现场造一个工具</h2>
+
+<p>
+到这里为止都是别人写好的东西。这一节你自己写。
+下面文本框里是一段 <strong>host 半</strong>：一个 async 函数体，必须 <code>return</code> 一个 cordis plugin。
+它能看见的全局只有沙箱给的那几个：<code>harness</code>、<code>console</code>，
+加上 <code>require</code> / <code>fetch</code> / <code>setTimeout</code> 这三个一调用就抛错的 trap。
+</p>
+
+<p>按钮和真实动词一一对应，各自只做各自的事：</p>
+
+<ul>
+  <li><code>cordis_define</code>：只编译，不执行。语法过了就铸一个 id 记下来。你把代码改坏，这里会给你一个真的 <code>SyntaxError</code>。</li>
+  <li><code>cordis_run</code>：在沙箱里求值，用白名单 façade 包住 ctx，挂成 <code>cordis-dynamic</code> 组下的一个子 fiber。你的工具真的进入工具表。</li>
+  <li><code>cordis_stop</code>：<code>fiber.dispose()</code>。第 3 章的反序回收把这个插件注册过的一切按相反顺序摘掉。</li>
+  <li>「不给 disposer 的插件」不是真实动词，是一个反面演示：绕开 <code>ctx.effect()</code> 注册工具，然后你会看到 stop 之后它还赖在表里。</li>
+</ul>
+
+<div id="p-stop"></div>
+<script>
+DSH.predict('p-stop', {
+  q: '假设 define + run 已经成功，word_count 出现在工具表里。这时候调用 cordis_stop，工具表会怎么变？',
+  options: [
+    { label: 'word_count 还在，只是不能用了', why: '这是"注册进数组、停止时忘了摘"的结果，也就是幽灵工具。' },
+    { label: 'word_count 消失了', ok: true, why: 'register() 返回的 disposer 是这个插件 fiber 上的一个 effect，dispose 时按注册的相反顺序执行。' },
+    { label: '整张工具表被清空', why: 'dispose 只回收这一个子 fiber 的 effect。read / write / bash 的 owner 是别的 fiber。' }
+  ],
+  explain: '下面的 cordis_stop 会把回收顺序逐条打出来。旁边那个「不给 disposer 的插件」演示的就是第一个选项。'
+});
+</script>
+
+<div class="demo" id="d-forge">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 9.2</span>写一个插件，挂上去，然后调用它</div>
+    <div class="spacer"></div>
+    <button class="btn primary" data-act="define">cordis_define</button>
+    <button class="btn primary" data-act="mount">cordis_run</button>
+    <button class="btn" data-act="turn">跑一个 turn</button>
+    <button class="btn" data-act="stop">cordis_stop</button>
+    <button class="btn sm" data-act="ghost">不给 disposer 的插件</button>
+    <button class="btn sm" data-act="broken">注入语法错误</button>
+    <button class="btn sm" data-act="restore">还原示例</button>
+    <button class="btn sm" data-act="reset">清空输出</button>
+  </div>
+  <div class="demo-body">
+    <div class="pane-label">code.host — 改它，然后按 cordis_define</div>
+    <textarea class="edit" id="forge-src" rows="30" spellcheck="false">// host 半：一个 async 函数体，必须 return 一个 cordis plugin。
+// 沙箱全局：harness、console；require / fetch / setTimeout 是会抛错的 trap。
+return {
+  name: 'word-count',
+  inject: ['tools', 'fs'],
+
+  apply(ctx) {
+    // 工具定义必须过 harness.defineTool：它在宿主 realm 里重建 schema，
+    // 并把 execute 的返回值做一次 JSON 物化，坏形状在注册时就炸，而不是等到组装 prompt。
+    const tool = harness.defineTool({
+      name: 'word_count',
+      description: '统计一个文件的行数与词数。',
+      parameters: {
+        path: { type: 'string', required: true, description: '要统计的文件路径' }
+      },
+      output: {
+        schema: { type: 'json' },
+        render: (args, value) => [
+          { type: 'text', text: value.path + ': ' + value.lines + ' 行 / ' + value.words + ' 词' }
+        ]
+      },
+      execute(args) {
+        const text = ctx.fs.read(args.path);
+        return {
+          path: args.path,
+          lines: text.split('\n').length,
+          words: text.split(/\s+/).filter(Boolean).length
+        };
+      }
+    });
+
+    // 三个副作用，停止时按相反顺序回收：工具 → 服务 → 监听器
+    ctx.tools.register(tool);
+    ctx.provide('wordStats', { calls: 0 });
+    ctx.on('tools/pre-execute', (payload, next) => {
+      if (payload.call.name === 'word_count') ctx.get('wordStats').calls += 1;
+      return next();
+    });
+  }
+};</textarea>
+    <div class="out" id="out-forge" style="margin-top:14px"></div>
+  </div>
+</div>
+
+<div class="note good">
+  <span class="tag">试试这些改法</span>
+  把工具改名成 <code>line_count</code>，重新 define + run，它会以新名字出现在工具表里；<br>
+  把 <code>inject</code> 里的 <code>'fs'</code> 删掉，运行时会在 <code>ctx.fs.read</code> 那一刻拒绝，并告诉你正确的修法是声明 inject；<br>
+  把 <code>harness.defineTool({...})</code> 换成一个裸对象字面量，注册会被标记检查挡下来；<br>
+  按"注入语法错误"，看 define 阶段怎么拦。
+</div>
+
+<h2><span class="num">§9.6</span>沙箱不是安全边界</h2>
+
+<p>
+你刚才挂上去的东西，跑在与 harness 本体同一个进程里。dsh 的源码对这件事的表述没有任何修饰，
+<code class="srcpath">cordis-host-runner/src/sandbox.ts</code> 的模块注释第一段就写着：
+</p>
+
+<blockquote>
+This keeps cooperative packages inspectable and disposable but is <strong>not containment</strong>:
+host-realm helper functions remain an escape route.
+</blockquote>
+
+<p>沙箱到底做了什么、没做什么，摊开是这样：</p>
+
+<table>
+<thead><tr><th>做了</th><th>没做</th></tr></thead>
+<tbody>
+<tr><td>一个全新的 <code>node:vm</code> realm，全局污染不外泄</td><td>不限制已授予服务的权限：<code>ctx.bash</code> 就是宿主 executor 的权限</td></tr>
+<tr><td>Node API 变成会抛错的 trap，错误文案直接告诉你该用哪个 cordis 服务</td><td>宿主 realm 的 helper 函数仍在可达范围内，逃逸是可能的</td></tr>
+<tr><td>ctx 换成白名单 façade，框架内部一律拒绝</td><td>façade 允许的服务照样改动真实运行时，并可能影响同进程的其他会话</td></tr>
+<tr><td><code>vmTimeoutMs</code> 限制求值</td><td>只限制同步部分；async 函数体一 await 就出界了</td></tr>
+</tbody>
+</table>
+
+<p>
+只有函数形状的全局才被 trap。<code>process</code> 和 <code>Buffer</code> 留成 <code>undefined</code>，
+因为一个会抛错的取值器会让常见的 <code>typeof process</code> 探测在解析那一刻就炸掉。
+<code>btoa</code> / <code>atob</code> 是闭包在宿主 <code>Buffer</code> 上的两个函数，一个被明确记录的例外；
+<code>Buffer</code> 自己永不暴露。
+</p>
+
+<p>
+Agent Note 里那段自辩说得更直白：trap 和 façade 的目的是把 API 收窄成正确的那一套，
+把文件、网络、进程、定时器都导向 cordis 服务，从而可被检查、可被回收。安全不在目标里。
+真正的安全边界需要独立进程和权限提示，那与"把活的运行时交给模型"这件事本身冲突。
+所以官方结论只有一句：<strong>把一个动态包当成 bash 权限来对待</strong>。
+</p>
+
+<div class="note vs">
+  <span class="tag">换成别的 harness</span>
+  这是 dsh 明显弱于别人的地方，得说清楚。MCP 工具住在另一个进程里，进程边界是操作系统给的真边界：
+  它崩了不会带走 harness，它也读不到 harness 的堆。Codex 有 approval mode 和沙箱策略。
+  omp 在这条轴上和 dsh 站在一起，有些地方还要往后一点。它的扩展也在主进程里跑，文档的说法是
+  in-process with no isolation：一个脱离 handler 派发的 <code>setTimeout</code> 回调里抛出异常，
+  会浮成进程级 <code>uncaughtException</code>，postmortem handler 按 fatal 处理，整个会话被拆掉。
+  工具执行那一侧它只有审批策略，三档 <code>always-ask</code> / <code>write</code> / <code>yolo</code>，
+  默认那档是 <code>yolo</code>，底下没有内核。
+  dsh 自己在 <code class="srcpath">packages/sandbox</code> 里有 Landlock / seatbelt 那一层，Windows 上换成受限令牌与 ACL，
+  可那一层管的是模型跑的命令，不管模型现场写进本进程的插件。
+  所以两条轴要分开记：命令执行这条 dsh 手里有内核给的东西，omp 手里只有一个确认框；
+  模型写的代码跑在主进程这条，两边一样敞着。
+  动态 package 的好处是可检查、可回收、能直接拿到活的 ctx；它没有隔离，这条没法两全。
+  <code class="srcpath">tool-cordis/README.md</code> 把这笔账写在了小标题里：
+  the sandbox is containment for honest code, not a security boundary。
+</div>
+
+<p>
+下面这个 demo 把这句话变成可点的东西。左边是 façade 拒绝的探针，右边是它放行的探针。
+每一条都真的跑在本页那个 façade 上，输出的报错就是 façade 抛出来的那个字符串：
+</p>
+
+<div class="demo" id="d-facade">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 9.3</span>façade 拒绝什么，放行什么</div>
+    <div class="spacer"></div>
+    <button class="btn primary" data-act="run">跑 12 个探针</button>
+    <button class="btn" data-act="escape">用被授予的权限做点实事</button>
+    <button class="btn" data-act="reset">清空</button>
+  </div>
+  <div class="demo-body">
+    <div class="out" id="out-facade"></div>
+  </div>
+</div>
+
+<div class="note warn">
+  <span class="tag">这才是重点</span>
+  十二个探针里被拒的那九条，没有一条是因为"危险"。它们要么是框架内部
+  （<code>ctx.fiber</code>、<code>ctx.registry</code>、<code>ctx.plugin</code>），
+  要么是没在 inject 里声明的服务，要么是被 trap 掉的 Node API，而最后这一类的理由是"可回收、可检查"。
+  第二个按钮里的插件规规矩矩声明了 <code>inject: ['fs']</code>，于是它可以把工作区的文件覆写成任何内容，
+  façade 全程没有意见，因为这正是它被授予的能力。
+  "bash 级别的信任"是对这个 demo 的准确描述，不是一句免责声明。
+</div>
+
+<p>
+到这里为止，这一节的证据全是 dsh 自己的注释、文档，加上本页这个 demo。
+开源第二天，外面有人把这句自述当成一条待验的命题跑了一遍。
+</p>
+
+<div class="note warn">
+  <span class="tag">两份独立审计的分法</span>
+  Fz0x00 的披露报告（GitHub Discussion #454）把 dsh 切成两条轴分开评。
+  面向模型那一条它给的词是 production-grade：工具执行管线、fail-closed 审批、进程沙箱、凭据引用模型、
+  append-only 审计，还有浏览器那道 confusion-deputy 围栏（对活实例验到 403/415）。
+  面向插件那一条，原话是 plugin code currently has no security design：
+  插件在宿主进程里以宿主权限运行，install、update、篡改、持久化、热重载这几条路径上没有签名、
+  完整性校验、来源，也没有确认闸门；<code>!!js</code> 配置在加载期就是宿主级 RCE，
+  而这个标签是官方 cordis 教程明文教的。xiejin77 在 Discussion #587 上独立走到同一处，
+  他补的是时序：插件能在 boot 期改写 harness 的配置树（sandbox mode、approval policy、凭据），
+  时间点在任何运行时防护激活之前，而 <code>dsh plugin add &lt;pkg&gt;</code> 字面上就是 <code>pnpm add &lt;pkg&gt;</code>。
+  <strong>这一章从头到尾在做的事，落点正是第二条轴</strong>：<code>cordis_define</code> 加
+  <code>cordis_run</code> 挂上去的那个插件，和任何一个第三方插件一样在宿主进程里、以宿主权限跑，
+  只不过作者是模型。审计的头号风险和本章的前提是同一件事，区别在于这里是从里面看的。
+</div>
+
+<p>
+边界两位作者自己都划了。模型写的插件要能跑起来，会话先得挂在 <code>cordis</code> 这个 preset 上，
+而那份 yml 开头的 TRUST 注释已经把话说在前面：挂在这个 preset 上的会话，请当 shell 权限对待，
+和上面那句"bash 级别的信任"是同一个意思。动态 package 只活在这个进程的内存里，不落盘也不改配置，
+重启就没了。要触发插件这条轴上的事，还得受害者自己去跑 <code>dsh plugin add</code>，
+它不是零点击的远程 RCE。Fz0x00 另外专门列了 dsh 已经做对的几项，
+pnpm 的 registry integrity、0600/0700 的文件权限、特权 RPC 的 loopback pinning，
+报告称它们是 real mitigations。
+</p>
+
+<p>
+所以上面那段横向对照的结论一个字不用改，只是从判断变成了有出处的判断。
+命令执行这条轴上 dsh 手里有内核给的东西，<code class="srcpath">packages/sandbox</code>
+里那层 Landlock 与 seatbelt 是真的，同一份审计管这一半叫 production-grade。
+模型现场写进本进程的代码这条轴上，dsh 是这份审计的头版，比 MCP 那种把可执行扩展放到进程外的做法差。
+完整的账在 <a href="compare.html">横向对照</a> 那一页的 §A.6。
+</p>
+
+<div class="note src">
+  <span class="tag">审计原文</span>
+  <a href="https://github.com/deepseek-ai/deepseek-harness/discussions/454">deepseek-harness · Discussion #454</a> — Fz0x00 的披露帖，上面两条轴的分法出自这里<br>
+  <a href="https://github.com/Fz0x00/deepseek-harness-plugin-security-audit">Fz0x00/deepseek-harness-plugin-security-audit</a> — 完整报告：40 条攻击路径、96 条带 file:line 的源码证据、13 个可复现 demo、8 次对已发布版本的活体验证。仓库钉在 commit <code>47f9438</code>，活体验证针对 npm <code>@deepseek-ai/dsh@0.1.0-rc.6</code>，也就是这本书对照的同一份代码<br>
+  <a href="https://github.com/deepseek-ai/deepseek-harness/discussions/587">deepseek-harness · Discussion #587</a> — xiejin77 的独立复核，boot 期改写配置树那一条<br>
+  <code class="srcpath">apps/cli/config/agent-presets/cordis/agent.cordis.yml</code> — 开头那段 TRUST 注释，preset 自己写的信任等级
+</div>
+
+<h2><span class="num">§9.7</span>本章的产物</h2>
+
+<p>
+三个动词，加上那个决定"模型的代码能碰到什么"的 façade。它们跑在本页真实的 mini-dsh 上，
+下面的清单就是刚才那些按钮实际执行的函数：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh v0.9 · cordis_define / cordis_run / cordis_stop</span></div>
+  <pre><code id="src-verbs" data-lang="js"></code></pre>
+</div>
+
+<p>façade 是这一章唯一有安全语义的代码，也是唯一必须逐字对照真实实现的部分：</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh v0.9 · sandboxContext()，对照 cordis-host-runner/src/guard.ts</span></div>
+  <pre><code id="src-facade" data-lang="js"></code></pre>
+</div>
+
+<div class="note good">
+  <span class="tag">这本书到此为止</span>
+  九章之后，mini-dsh 有了循环、服务、fiber、事件、日志、工具、组合、code mode，以及自我改造。
+  它在结构上和真实 dsh 同构，在规模上差三个数量级。最后一节把这段距离量一遍，
+  再挑出三个我认为最值得偷走的设计。
+</div>
+
+<h2><span class="num">§9.8</span>回到真实的 dsh</h2>
+
+<p>真实实现分在三个包里，职责切得很干净：</p>
+
+<table>
+<thead><tr><th>包</th><th>负责</th></tr></thead>
+<tbody>
+<tr><td><code class="srcpath">packages/extensions/tool-cordis</code></td><td>七个模型可见的工具、系统提示片段、inspect 的渲染与 catalog 交集</td></tr>
+<tr><td><code class="srcpath">packages/extensions/cordis-host-runner</code></td><td>定义注册表、id 铸造、vm 沙箱、guard façade、host 半 fiber 生命周期、向浏览器广播</td></tr>
+<tr><td><code class="srcpath">packages/extensions/cordis-client-runner</code></td><td>浏览器半：闭包求值、自己的 guard façade、loader 挂载、run 编排、package 内 RPC、渲染崩溃回报</td></tr>
+</tbody>
+</table>
+
+<p>几个真实签名，都很短。这套东西的复杂度在边界检查里，不在流程里：</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">真实签名节选（三个文件）</span></div>
+<pre><code data-lang="js">// cordis-host-runner/src/sandbox.ts · 只编译不执行；用 vm 而不是 new Function，
+// 是为了让 define 时和 run 时看到同一份"源码行 + 插入符"的报错
+export function precheckCode(code: string, half: 'code.host' | 'code.client'): void
+
+// 同上：vmTimeoutMs 只约束同步部分，async 函数体会越界
+export async function evaluateHostCode(
+  sandbox: object, code: string, id: string, vmTimeoutMs: number,
+): Promise&lt;unknown&gt;
+
+// cordis-host-runner/src/lifecycle.ts · 等 group 就绪，起一个 guarded 子 fiber，
+// 启动失败先 dispose 再抛，绝不留下一个失败的 fiber 挂在树上
+export async function startHostHalf(
+  group: Fiber, plugin: Plugin, reportGuardFailure: (error: Error) =&gt; void,
+): Promise&lt;Fiber&gt;
+
+// 一个 settled 但没激活的 fiber，等的就是这些服务（合法的 cordis 语义：服务出现就激活）
+export function missingServices(ctx: Context, fiber: Fiber): string[]</code></pre>
+</div>
+
+<p>mini 版本刻意省掉的东西：</p>
+
+<ul>
+  <li>真的另一个 realm。我们用 <code>new AsyncFunction(...)</code> 加参数遮蔽来模拟沙箱全局；
+      真实实现是 <code>node:vm</code> 的 <code>createContext</code>，还额外打了一个
+      <strong>dual-realm <code>instanceof</code></strong> 补丁：只改 vm 侧构造器的 <code>Symbol.hasInstance</code>，
+      让 <code>x instanceof Array</code> 对 vm 值和宿主值都成立，宿主 intrinsics 一个不动。
+      没有这个补丁，跨边界传进来的参数、事件、服务返回值全都会在类型判断上诡异地失败。</li>
+  <li>跨 realm 的 JSON 物化。动态工具的 schema 和注解要跨 realm，真实实现用的是迭代式克隆与 schema 归一化
+      （显式工作栈，没有递归），所以深层声明受内存限制而不受调用栈限制；
+      带有 JSON 不可见键的记录、被子类化或装饰过的 schema 数组，在归一化之前就被拒绝。</li>
+  <li>浏览器那一半。整个 <code>cordis-client-runner</code>：approval 往返、按 <code>(id, rev)</code> 收敛的加载、
+      slot 的遮蔽优先级、渲染崩溃的两路上报（回给模型一份，页面自己留一份）。</li>
+  <li><code>@pluginId</code> 注入。<code>tool-cordis</code> 在 <code>agent/pre-step</code> 瀑布上挂了一个监听器：
+      用户消息里写 <code>@dyn-3</code>，它就把那个 plugin 的当前状态渲染成一条 user message 追加进这个 step。
+      这是第 4 章的瀑布在真实产品里的一个典型用法。</li>
+  <li>失败的可诊断性。真实报错会附上出错的源码行与插入符，还会按启发式判断你是不是写了 TypeScript
+      （只检查出错那一行里有没有 <code>as</code>，否则一个描述字符串里的 " as " 就会误导出一条错误建议）。</li>
+</ul>
+
+<div class="note src">
+  <span class="tag">自己去读</span>
+  <code class="srcpath">packages/extensions/tool-cordis/src/index.ts</code> — 七个工具的真实注册，唯一权威的名字来源<br>
+  <code class="srcpath">packages/extensions/tool-cordis/src/inspect.ts</code> — catalog ∩ live store 的交集渲染<br>
+  <code class="srcpath">packages/extensions/tool-cordis/src/providers.ts</code> — Service / Event / Builtin / Tool 四个 host inspect provider<br>
+  <code class="srcpath">packages/extensions/cordis-host-runner/src/sandbox.ts</code> — vm 沙箱、Node API trap、dual-realm instanceof、precheck<br>
+  <code class="srcpath">packages/extensions/cordis-host-runner/src/guard.ts</code> — <code>CTX_VERBS</code> 白名单与 <code>sandboxContext</code><br>
+  <code class="srcpath">packages/extensions/cordis-host-runner/src/lifecycle.ts</code> — <code>startHostHalf</code> / <code>missingServices</code><br>
+  <code class="srcpath">packages/extensions/cordis-client-runner/README.md</code> — 浏览器半的七条职责<br>
+  <code class="srcpath">apps/cli/config/agent-presets/cordis/agent.cordis.yml</code> — 把这套工具装进一个 preset 的完整组合<br>
+  <code class="srcpath">.agents/notes/implemented/feature/2026-07-08-self-referential-cordis-toolset.md</code> — 设计决策与被否掉的方案
+</div>
+
+<h2><span class="num">§9.9</span>尾声：mini-dsh 与真实 dsh 的距离</h2>
+
+<p>
+把九章的产物加起来，mini-dsh 大约两千行 JavaScript，跑在一个 HTML 文件里。真实 dsh 是另一个量级。
+下面这张表想标清楚的是：哪些差距只是"再写点代码"，哪些差距已经是另一个工程问题。
+</p>
+
+<table>
+<thead><tr><th>维度</th><th>mini-dsh</th><th>真实 dsh</th></tr></thead>
+<tbody>
+<tr><td>持久化</td><td>一个内存数组</td><td>SQLite 事件存储，resume 靠重放日志（<code class="srcpath">packages/session/session-persistence-sqlite</code>）</td></tr>
+<tr><td>沙箱</td><td><code>new AsyncFunction</code> + 参数遮蔽</td><td><code>node:vm</code> realm + Node API trap + dual-realm instanceof；另有进程级沙箱 Landlock / seatbelt（<code class="srcpath">packages/sandbox/*</code>、<code class="srcpath">native/landlock-run</code>）</td></tr>
+<tr><td>代码智能</td><td>无</td><td>LSP 服务与 <code>lsp</code> 工具（<code class="srcpath">packages/lsp</code>）</td></tr>
+<tr><td>子 agent</td><td>无</td><td>spawn / fork / codex / claude-code 多 provider，可后台可继续（<code class="srcpath">packages/subagent</code>）</td></tr>
+<tr><td>外部工具</td><td>无</td><td>MCP client（<code class="srcpath">packages/mcp</code>）</td></tr>
+<tr><td>被别人调用</td><td>无</td><td>ACP server（<code class="srcpath">packages/acp</code>）</td></tr>
+<tr><td>hooks</td><td>无</td><td>hook bridges + hook 协议库（<code class="srcpath">packages/hooks</code>）</td></tr>
+<tr><td>Web UI</td><td>一个 <code>.out</code> 里的等宽文本</td><td>React client，host 与浏览器之间走 typert 生成的 codec 与 Remote 命名空间（<code class="srcpath">packages/web</code>、<code class="srcpath">packages/typert</code>）</td></tr>
+<tr><td>工具数量</td><td>本章大约 12 个</td><td><code class="srcpath">docs/tool-catalog.md</code> 里 51 个唯一工具名</td></tr>
+<tr><td>包数量</td><td>1 个 HTML</td><td><code>packages/</code> 下 219 个包，外加 2 个 app 与 9 个 vendor 包</td></tr>
+<tr><td>测试门槛</td><td>没有</td><td>vitest 覆盖率 per-file 100%，statements / branches / functions / lines 四项全要（<code class="srcpath">vitest.config.ts</code>）</td></tr>
+</tbody>
+</table>
+
+<p>
+"per-file 100%" 那一行值得多看一眼。配置里的注释解释了为什么是 per-file 而不是全局：
+"Per-file so a well-covered big file can't subsidize a bare one."
+一个覆盖良好的大文件不许替一个裸文件交税。
+</p>
+
+<h3>三个值得偷走的设计</h3>
+
+<p>要自己写一个 harness，只从这本书里带走三样东西的话，我会挑这三个。它们都不需要 219 个包。</p>
+
+<p>
+<strong>一、用 surfaceOp 折叠出模型视图。</strong>
+会话日志只追加，永不修改；每一条会产生消息的事件记录自己的 <code>surfaceOp</code>；
+模型看到的历史是沿着这些标记折叠出来的一个投影。
+压缩于是不再是破坏性操作：一次 compaction 只追加一条 <code>replace</code>，
+把被它遮蔽的节点从投影里去掉，原始事件仍然躺在日志里可查、可导出、可重新投影。
+审计、fork、时间旅行、"模型可见即已记录"这条不变量，全是它的推论。
+只有三种事件类型能进入这个表面（<code>user/message</code>、<code>assistant/message</code>、<code>tool/result</code>），
+所以一个 chunk、一个 turn 边界"正确地不在其中"。
+见 <code class="srcpath">packages/core/session/src/surface.ts</code> 与
+<code class="srcpath">packages/core/session/src/index.ts</code> 的 <code>deriveMessages()</code>。
+</p>
+
+<p>
+<strong>二、辅助状态只进日志，不进上下文。</strong>
+<code>todo_write</code> 每次调用都把整份列表作为一个 <code>todo/write</code> 事件追加进会话日志，
+当前列表就是最后一条这样的事件（重放时 last-write-wins）。
+而 <code>todo/write</code> 不在上面那三种表面事件类型里，它永远不会变成一条模型消息。
+计划、待办、目标于是有了持久化、有了历史、有了 UI，却不占用任何上下文预算，
+压缩时也不和真正的对话内容抢空间。
+把 todo 列表塞回 system prompt 里反复重发的做法，是在为一个本可以零成本的功能付 token。
+见 <code class="srcpath">packages/todo/tool-todo/README.md</code> 与上面那份 <code>SURFACE_EVENT_TYPES</code>。
+</p>
+
+<p>
+<strong>三、给模型读的东西一律生成，再闸住新鲜度。</strong>
+API catalog、client slot catalog、工具目录，全部由 AST 扫描生成，
+再由 <code>verify-cordis-api</code> / <code>verify-client-catalog</code> 之类的脚本在 CI 里重新生成一遍并比对，
+有 diff 就失败。配套的是提示词层面的逐字断言：system prompt 的组装测试直接
+<code>expect(render(...)).toBe('…')</code> 比对整串文本，改一个字就红。
+这两件事治的是同一个病：模型读到的描述和代码的真实行为悄悄分叉。
+§9.2 那张"四个版本的工具名"是这条纪律的反面教材，手写散文没有闸门，于是它是唯一漂走的那个。
+</p>
+
+<h3>延伸阅读</h3>
+
+<p>真要读源码，按这个顺序进去最省力：</p>
+
+<div class="note src">
+  <span class="tag">建议的阅读顺序</span>
+  <code class="srcpath">docs/architecture.md</code> — 先看 Turn flow 一节，整本书的骨架都在那里<br>
+  <code class="srcpath">docs/cordis-primer.md</code> — Context / Service / Fiber / 五种事件模式，第 2 到 4 章的原文<br>
+  <code class="srcpath">packages/core/session/src/surface.ts</code> — 全书最重要的一百行<br>
+  <code class="srcpath">packages/core/agent-loop/src/agent.ts</code> — <code>kick</code> / <code>turn</code> / <code>preStep</code> / <code>step</code><br>
+  <code class="srcpath">packages/core/tools/src/index.ts</code> — <code>register</code> 与执行管线，第 6 章的正本<br>
+  <code class="srcpath">docs/tool-catalog.md</code> — 51 个工具的生成目录，想知道产品长什么样看这个最快<br>
+  <code class="srcpath">.agents/notes/implemented/</code> — 每个特性的决策记录，含被否掉的方案与理由。这是整个仓库里信息密度最高的目录
+</div>
+
+<h3>下一页：横向对照</h3>
+
+<p>
+这本书从头到尾只讲一个 harness。哪些设计是 dsh 的选择、哪些是所有 harness 都得这么干，
+要把别的实现摊在旁边才看得出来。附录
+<a href="compare.html">横向对照：Pi、Claude Code、Codex、OpenCode、omp</a>
+把前九章的每个机制逐条对齐，也收着一些 dsh 自己不太好意思讲的细节，
+比如它那个多 provider 适配层依赖的是 Pi 的 <code>@earendil-works/pi-ai</code>。
+那一页比的是架构，不是效果。
+</p>
+
+<p>
+效果这件事目前谁都没有数据。同一个 HN 线程里 flaburgan 问的就是这个：没有人做过同模型、同 prompt、
+跨 harness 的质量对比。这本书也没做。所以本书里所有"更好"的说法，都只针对结构，不针对结果。
+</p>
+
+<p>
+同一条线程里还有一句更短的比较，217 写的：「if it's not better than omp im not trying it」。
+omp 是我自己每天在用的 harness，也是这本书唯一被人拿来当过尺子的东西，所以这句要单独交代。
+它和 dsh 还算亲戚：omp 是 Mario Zechner 的 pi-mono 的下游 fork，而 dsh 的模型层依赖 Pi 的
+<code>@earendil-works/pi-ai</code>。
+</p>
+
+<p>
+mini-dsh 写完、两边的源码和文档都翻过一遍之后，我能落到纸上的差别是这些。
+dsh 有而 omp 没有的：agent loop 可以整个换掉（omp 的循环由 <code>@oh-my-pi/pi-agent-core</code> 硬编码持有，
+扩展只能拦事件、改消息、steer）；命令执行底下有一层 OS 内核沙箱（只覆盖这一条轴，
+插件那条轴上的两份审计见 §9.6，全文在 <a href="compare.html">横向对照</a> 的 §A.6）；子 agent 可以是外面的
+<code>claude</code> 或 <code>codex</code> 进程；还有第 8 章那个 presentation 折叠，一行 preset 把整张工具面收成一条代码入口，
+而 omp 的 <code>eval</code> 是与另外 30 个并列的一个工具，不动工具面。
+omp 有而 dsh 没有的：snapcompact 把要丢的历史用像素字体画成 PNG 位图交给视觉模型，不调 LLM，也不联网；
+性能路径是 Rust N-API；会话是一棵带 <code>rewind</code> 和 <code>checkpoint</code> 的 entry 树，
+被放弃的探索分支留在盘上；记忆可以落到本地 SQLite 加向量召回；30 多家 provider 带多凭据轮询；
+还有一个真正的 TUI。
+</p>
+
+<p>
+逐行的版本在 <a href="compare.html">横向对照：Pi、Claude Code、Codex、OpenCode、omp</a> 那一页。
+217 那句问的是效果，这本书答不上来，它从头到尾只量了结构。
+</p>
+
+<p class="footernote">
+读完这九章，你手上应该有两样东西：一个能跑的 mini-dsh，以及看到一个 harness 时问得出来的三个问题：
+你的工具表能在运行时被写入吗，你的压缩是破坏性的吗，你的 todo 列表占上下文吗。
+</p>
+
+<p class="footernote">
+最后说一下这份代码此刻的状态。DeepSeek 在 2026-08-13 把它开源，仓库创建于当天 11:56 UTC，
+接下来 24 小时里收到 43,437 个 star 和 3,404 个 fork，而 <code>master</code> 上一个新 commit 都没有，
+npm 上仍然是 <code>0.1.0-rc.6</code>。热度和口碑不是一回事：同一天那条 545 分、234 条评论的 HN 帖子里
+（item 49285244），票数最高的一条是 rco8786 的
+「But like, what is it? Odd that this reached #1 on HN. The README is pretty bare outside of
+installation instructions and a link to "Cordis"」，
+另一条被顶起来的就是上面那句 217 的 omp。
+我读的是那个一动没动的快照，commit <code>47f9438</code>。你明天去 clone，大概还是它。
+</p>
+
+</main>
+<aside id="dsh-toc"></aside>
+</div>
+
+<script>
+// =====================================================================
+// mini-dsh v0.9 · 把第 2/3/4/5/6 章的产物折在一页里。
+// 三个 demo 共享下面这一个运行时实例。
+// =====================================================================
+
+var SERVICES = new Map();    // ch02: name -> { value, owner, bind }
+var LISTENERS = new Map();   // ch04: event -> [listener]
+var TOOLS = new Map();       // ch06: name -> { def, owner }
+var SESSION = { seq: 0, events: [] };  // ch05
+var TOOL_MARK = '__dshDynamicTool';    // 对应 guard.ts 里的 DYNAMIC_TOOL symbol
+var CONSOLE_SINK = null;               // 沙箱 console 的写穿目标（真实实现写到 host stdout）
+
+// ---------------------------------------------------------------- ch03
+function createFiber(name, parent, inject) {
+  var fiber = { name: name, parent: parent || null, inject: inject || [],
+                effects: [], children: [], state: 'pending' };
+  if (parent) parent.children.push(fiber);
+  return fiber;
+}
+
+/** 反序回收：先子后父，同一层按注册的相反顺序。第 3 章的核心不变量。 */
+function disposeFiber(fiber, trace) {
+  fiber.children.slice().reverse().forEach(function (child) { disposeFiber(child, trace); });
+  for (var i = fiber.effects.length - 1; i >= 0; i--) {
+    var effect = fiber.effects[i];
+    if (trace) trace(effect.label);
+    effect.dispose();
+  }
+  fiber.effects.length = 0;
+  fiber.state = 'disposed';
+  if (fiber.parent) {
+    var ix = fiber.parent.children.indexOf(fiber);
+    if (ix >= 0) fiber.parent.children.splice(ix, 1);
+  }
+}
+
+function withinFiber(fiber, root) {
+  for (var f = fiber; f; f = f.parent) if (f === root) return true;
+  return false;
+}
+
+var ROOT = createFiber('root', null, []);
+ROOT.state = 'active';
+
+// ---------------------------------------------------------------- ch02
+function createContext(fiber) {
+  var ctx;
+  var base = {
+    fiber: fiber,                       // 框架内部：façade 会拒绝它
+    registry: { SERVICES: SERVICES, TOOLS: TOOLS },
+    __isContext: true,
+    effect: function (start, label) {
+      var dispose = start();
+      var entry = { label: label || 'ctx.effect()',
+                    dispose: typeof dispose === 'function' ? dispose : function () {} };
+      fiber.effects.push(entry);
+      return function () {
+        var ix = fiber.effects.indexOf(entry);
+        if (ix < 0) return;
+        fiber.effects.splice(ix, 1);
+        entry.dispose();
+      };
+    },
+    on: function (event, listener) {
+      return base.effect(function () {
+        var list = LISTENERS.get(event) || [];
+        list.push(listener);
+        LISTENERS.set(event, list);
+        return function () {
+          var current = LISTENERS.get(event) || [];
+          var ix = current.indexOf(listener);
+          if (ix >= 0) current.splice(ix, 1);
+        };
+      }, "ctx.on('" + event + "')");
+    },
+    once: function (event, listener) {
+      var off = base.on(event, function (payload, next) { off(); return listener(payload, next); });
+      return off;
+    },
+    // 第三个参数是 mini 的简化：真实 cordis 里服务天生 ctx-bound（Service 基类持有调用方 ctx）
+    provide: function (name, value, bind) {
+      return base.effect(function () {
+        if (SERVICES.has(name)) {
+          throw new Error('service "' + name + '" is already provided by fiber "' + SERVICES.get(name).owner.name + '"');
+        }
+        SERVICES.set(name, { value: value, owner: fiber, bind: bind || null });
+        return function () { SERVICES.delete(name); };
+      }, "ctx.provide('" + name + "')");
+    },
+    get: function (name) {
+      var slot = SERVICES.get(name);
+      if (!slot) return undefined;
+      return slot.bind ? slot.bind(ctx) : slot.value;
+    },
+    plugin: function (plugin) { return mountPlugin(fiber, plugin); }
+  };
+  ctx = new Proxy(base, {
+    get: function (target, prop) {
+      if (prop in target) return target[prop];
+      if (typeof prop !== 'string') return undefined;
+      return base.get(prop);
+    }
+  });
+  return ctx;
+}
+
+function pluginName(plugin) {
+  if (typeof plugin === 'function') return plugin.name || 'anonymous';
+  return (plugin && plugin.name) || 'anonymous';
+}
+
+/** 挂载一个 plugin 成为子 fiber。inject 没满足就停在 pending，apply 抛错就先 dispose 再抛。 */
+function mountPlugin(parent, plugin) {
+  var inject = (typeof plugin === 'object' && plugin && plugin.inject) || [];
+  var fiber = createFiber(pluginName(plugin), parent, inject);
+  var missing = inject.filter(function (name) { return !SERVICES.has(name); });
+  if (missing.length) return fiber;            // 合法的 cordis 语义：服务出现时才激活
+  var apply = typeof plugin === 'function' ? plugin : plugin.apply;
+  try {
+    apply(createContext(fiber));
+  } catch (error) {
+    disposeFiber(fiber);
+    throw error;
+  }
+  fiber.state = 'active';
+  return fiber;
+}
+
+function missingServices(fiber) {
+  return fiber.inject.filter(function (name) { return !SERVICES.has(name); });
+}
+
+function providedServices(fiber) {
+  var names = [];
+  SERVICES.forEach(function (slot, name) { if (withinFiber(slot.owner, fiber)) names.push(name); });
+  return names.sort();
+}
+
+// ---------------------------------------------------------------- ch04
+/** 瀑布：listener 不调 next() 就短路整条链。 */
+function dispatchWaterfall(event, payload) {
+  var chain = (LISTENERS.get(event) || []).slice();
+  var index = 0;
+  function next() {
+    if (index >= chain.length) return Promise.resolve(payload);
+    var listener = chain[index++];
+    return Promise.resolve(listener(payload, next)).then(function (r) {
+      return r === undefined ? payload : r;
+    });
+  }
+  return next();
+}
+
+// ---------------------------------------------------------------- ch05
+var SURFACE_TYPES = { 'user/message': 1, 'assistant/message': 1, 'tool/result': 1 };
+
+function sessionAppend(type, data, surfaceOp) {
+  var event = { seq: ++SESSION.seq, type: type, data: data, surfaceOp: surfaceOp || null };
+  SESSION.events.push(event);
+  return event;
+}
+
+function deriveMessages() {
+  return SESSION.events
+    .filter(function (e) { return e.surfaceOp === 'append' && SURFACE_TYPES[e.type]; })
+    .map(function (e) {
+      return { role: e.type === 'user/message' ? 'user' : e.type === 'tool/result' ? 'tool' : 'assistant',
+               text: e.data.text };
+    });
+}
+
+var SESSION_SERVICE = { append: sessionAppend, deriveMessages: deriveMessages,
+                        events: function () { return SESSION.events.slice(); } };
+
+// ---------------------------------------------------------------- ch06
+function defineTool(options) { return options; }
+
+function toolSchemas() {
+  return Array.from(TOOLS.values()).map(function (entry) {
+    return { name: entry.def.name, description: entry.def.description,
+             parameters: entry.def.parameters || {} };
+  });
+}
+
+/** ctx-bound 的 tools 服务。register 返回的 disposer 就是调用方 fiber 上的一个 effect。 */
+function toolsBind(ctx) {
+  return {
+    register: function (definition) {
+      if (!definition || typeof definition.name !== 'string') {
+        throw new TypeError('tool definition must declare a name');
+      }
+      var output = definition.output;
+      if (!output || typeof output.render !== 'function') {
+        throw new TypeError('tool "' + definition.name + '" must declare output { schema, render, presentationMeta? }');
+      }
+      if (typeof definition.execute !== 'function') {
+        throw new TypeError('tool "' + definition.name + '" must declare an execute function');
+      }
+      if (TOOLS.has(definition.name)) {
+        throw new Error('tool "' + definition.name + '" is already registered by fiber "'
+          + TOOLS.get(definition.name).owner.name + '"');
+      }
+      return ctx.effect(function () {
+        TOOLS.set(definition.name, { def: definition, owner: ctx.fiber });
+        return function () { TOOLS.delete(definition.name); };
+      }, 'tools.register()');
+    },
+    schemas: toolSchemas,
+    get: function (name) {
+      return toolSchemas().find(function (schema) { return schema.name === name; });
+    },
+    execute: executeToolCall
+  };
+}
+
+async function executeToolCall(call) {
+  var entry = TOOLS.get(call.name);
+  if (!entry) throw new Error('unknown tool: ' + call.name);
+  var payload = await dispatchWaterfall('tools/pre-execute', { call: call, blocked: null });
+  if (payload.blocked) return { name: call.name, blocked: payload.blocked, text: payload.blocked };
+  var value = await entry.def.execute(payload.call.args || {}, { signal: null });
+  var blocks = entry.def.output.render(payload.call.args || {}, value);
+  return { name: call.name, value: value,
+           text: blocks.map(function (b) { return b.text; }).join('\n') };
+}
+
+// =====================================================================
+// 沙箱：realm 换不了，就用 AsyncFunction 的参数遮蔽全局。
+// 真实实现是 node:vm 的 createContext + Node API trap，见 sandbox.ts。
+// =====================================================================
+var AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+
+var NODE_API_REDIRECTS = {
+  require: 'Node modules are unavailable. Use the cordis services on ctx instead — e.g. '
+    + "inject: ['fs'] for files, ['web'] for HTTP, ['bash'] for processes.",
+  fetch: "Network access goes through the cordis web service: declare inject: ['web'] and call ctx.web.",
+  setTimeout: 'Node timers are unavailable. Use the cordis timer service instead: declare '
+    + "inject: ['timer'] and call ctx.timeout / ctx.interval. Those calls are fiber effects, "
+    + 'cleaned up automatically when stopped.'
+};
+
+function nodeApiTrap(name) {
+  return function () {
+    throw new Error(name + ' is not available in the dynamic package sandbox — ' + NODE_API_REDIRECTS[name]);
+  };
+}
+
+function taggedConsole(id) {
+  var tag = '[cordis:' + id + ']';
+  var write = function () {
+    var text = Array.prototype.slice.call(arguments).map(String).join(' ');
+    if (CONSOLE_SINK) CONSOLE_SINK(tag + ' ' + text);
+  };
+  return { log: write, info: write, warn: write, debug: write, error: write };
+}
+
+function cloneJson(value, path) {
+  if (value === undefined) throw new Error(path + ' must be JSON, got undefined');
+  try { return JSON.parse(JSON.stringify(value)); }
+  catch (error) { throw new Error(path + ' must be JSON: ' + error.message); }
+}
+
+/** harness.defineTool：在宿主 realm 重建 execute，返回值做一次 JSON 物化，并打上标记。 */
+function sandboxDefineTool(options) {
+  if (!options || typeof options !== 'object') throw new Error('harness.defineTool options must be an object');
+  if (!options.output || typeof options.output !== 'object') {
+    throw new Error('harness.defineTool output must declare { schema, render, presentationMeta? }');
+  }
+  if (typeof options.output.render !== 'function') {
+    throw new Error('harness.defineTool output.render must be a function');
+  }
+  if (typeof options.execute !== 'function') throw new Error('harness.defineTool execute must be a function');
+  var rawExecute = options.execute;
+  var tool = Object.assign({}, options, {
+    execute: async function (args, exec) {
+      return cloneJson(await rawExecute(args, exec), 'harness.defineTool execute result');
+    }
+  });
+  tool[TOOL_MARK] = true;
+  return tool;
+}
+
+function assertDynamicTool(tool) {
+  if (!tool || tool[TOOL_MARK] !== true) {
+    throw new Error('ctx.tools.register expects a definition produced by harness.defineTool(...)');
+  }
+}
+
+function createHarness(extras) {
+  var harness = {
+    defineTool: sandboxDefineTool,
+    registerTool: function (ctx, tool) { assertDynamicTool(tool); return ctx.tools.register(tool); }
+  };
+  if (extras) Object.keys(extras).forEach(function (key) { harness[key] = extras[key]; });
+  return harness;
+}
+
+// ---------------------------------------------------- guard.ts 的白名单
+var CTX_VERBS = { effect: 1, on: 1, once: 1, provide: 1, timeout: 1, interval: 1 };
+var TIMER_VERBS = { timeout: 1, interval: 1 };
+
+/** tools façade：register 要过标记检查，get 只给 schema 视图，永远拿不到活的 definition。 */
+function sandboxTools(ctx) {
+  return {
+    register: function (tool) { assertDynamicTool(tool); return ctx.tools.register(tool); },
+    schemas: function () { return ctx.tools.schemas(); },
+    get: function (name) { return ctx.tools.get(name); }
+  };
+}
+
+function isRuntimeContext(value) {
+  return !!value && typeof value === 'object' && value.__isContext === true;
+}
+
+function sandboxContext(ctx, declared, reportFailure) {
+  var tools = sandboxTools(ctx);
+  function reject(message) {
+    var error = new Error(message);
+    reportFailure(error);
+    throw error;
+  }
+  function denyContext(value, service) {
+    if (isRuntimeContext(value)) {
+      reject('service "' + service + '" returned a cordis Context, which the sandbox does not expose. '
+        + 'Operate through your own plugin ctx (ctx.on / ctx.provide / ctx.tools.register) '
+        + 'and the services you inject — never another context.');
+    }
+    return value;
+  }
+  function denyRead(prop) {
+    if (ctx.get(prop) !== undefined) {
+      reject('service "' + prop + '" is not injected. Declare it: inject: [\'' + prop + '\', …] '
+        + 'on your plugin, so cordis parks this dynamic package if the provider later goes away.');
+    }
+    reject('sandbox ctx does not expose "' + prop + '". Available: ctx.tools.register / ctx.on / '
+      + 'ctx.provide / the timer helpers after injecting timer, and any service you declared in inject. '
+      + 'Framework internals (root, fiber, registry, extend, plugin, …) are withheld by design.');
+  }
+  function guardedService(service, name) {
+    return new Proxy(service, {
+      get: function (target, prop) {
+        var value = Reflect.get(target, prop, target);
+        if (typeof value !== 'function') return denyContext(value, name);
+        return function () {
+          var result = Reflect.apply(value, target, arguments);
+          if (result && typeof result.then === 'function') {
+            return result.then(function (v) { return denyContext(v, name); });
+          }
+          return denyContext(result, name);
+        };
+      }
+    });
+  }
+  function readService(name, requireDeclaration) {
+    if (name === 'tools') return tools;
+    if (requireDeclaration && declared.indexOf(name) < 0) return denyRead(name);
+    var service = denyContext(ctx.get(name), name);
+    if (service === null || typeof service !== 'object') return service;
+    return guardedService(service, name);
+  }
+  return new Proxy({}, {
+    get: function (_target, prop) {
+      if (prop === 'tools') return tools;
+      if (prop === 'get') return function (name) { return readService(name, false); };
+      if (typeof prop !== 'string') return undefined;
+      if (CTX_VERBS[prop]) {
+        return function () {
+          if (TIMER_VERBS[prop] && declared.indexOf('timer') < 0) {
+            reject('service "timer" is not injected. Declare it: inject: [\'timer\', …] on your plugin.');
+          }
+          return ctx[prop].apply(ctx, arguments);
+        };
+      }
+      return readService(prop, true);
+    },
+    // façade 不是真 ctx：与其让代码把状态挂在一个临时对象上还以为存住了，不如直接拒绝
+    set: function (_target, prop) { return reject('sandbox ctx is read-only; cannot assign "' + String(prop) + '"'); },
+    has: function (_target, prop) {
+      return prop === 'tools' || prop === 'get'
+        || (typeof prop === 'string' && (!!CTX_VERBS[prop] || declared.indexOf(prop) >= 0));
+    }
+  });
+}
+
+function isPlugin(value) {
+  if (typeof value === 'function') return true;
+  return typeof value === 'object' && value !== null && typeof value.apply === 'function';
+}
+
+/** 包一层，让 apply 收到的是 façade 而不是真 ctx；inject 元数据原样保留。 */
+function guardedPlugin(plugin, reportFailure) {
+  if (typeof plugin === 'function') {
+    return { name: pluginName(plugin), inject: [],
+             apply: function (ctx) { return plugin(sandboxContext(ctx, [], reportFailure)); } };
+  }
+  var declared = plugin.inject || [];
+  return Object.assign({}, plugin, {
+    apply: function (ctx) { return plugin.apply(sandboxContext(ctx, declared, reportFailure)); }
+  });
+}
+
+/** 对照 lifecycle.ts：起一个 guarded 子 fiber，失败先 dispose，"已注册"的碰撞给出替换配方。 */
+function startHostHalf(group, plugin, reportGuardFailure) {
+  try {
+    return createContext(group).plugin(guardedPlugin(plugin, reportGuardFailure));
+  } catch (error) {
+    var message = error.message || String(error);
+    if (message.indexOf('already registered') >= 0) {
+      throw new Error(message + " — to REPLACE something an earlier dynamic package registered, "
+        + "first cordis_stop that package's id, then run the new version.");
+    }
+    throw error;
+  }
+}
+
+// =====================================================================
+// 编译期 API catalog（mini 版）。inspect 把它和 live service store 求交集。
+// =====================================================================
+var API_CATALOG = [
+  { key: 'fs', summary: '工作区文件读写。',
+    methods: ['read(path: string): string', 'write(path: string, text: string): void', 'list(): string[]'] },
+  { key: 'bash', summary: '在工作区执行命令。', methods: ['exec(command: string): string'] },
+  { key: 'tools', summary: '模型可见工具的注册表与执行管线。',
+    methods: ['register(tool): () => void', 'schemas(): ToolSchema[]', 'execute(call): Promise<ToolResult>'] },
+  { key: 'session', summary: '只追加的会话日志与表面投影。',
+    methods: ['append(type, data, surfaceOp): SessionEvent', 'deriveMessages(): Message[]'] },
+  { key: 'timer', summary: '受 fiber 管理的定时器。', methods: ['timeout(ms, fn): () => void'] },
+  { key: 'web', summary: 'HTTP 抓取与搜索。', methods: ['fetch(url: string): Promise<string>'] }
+];
+
+/** what is RUNNING 来自 store，what it CAN DO 来自 catalog；目录没覆盖的活服务照样在列。 */
+function liveServices() {
+  var catalogued = new Map(API_CATALOG.map(function (e) { return [e.key, e]; }));
+  var rows = [];
+  SERVICES.forEach(function (slot, name) {
+    var entry = catalogued.get(name);
+    rows.push({ name: name, owner: slot.owner.name, state: slot.owner.state,
+                summary: entry ? entry.summary : '', catalogued: !!entry,
+                methods: entry ? entry.methods.slice() : [] });
+  });
+  return rows.sort(function (a, b) { return a.name.localeCompare(b.name); });
+}
+
+function absentServices() {
+  return API_CATALOG.filter(function (e) { return !SERVICES.has(e.key); })
+                    .map(function (e) { return e.key; }).sort();
+}
+
+// =====================================================================
+// 动态 package 注册表 + 五个动词。这是本章的产物。
+// =====================================================================
+var DYN = { plugins: new Map(), group: null, nextPlugin: 1, nextPackage: 1, failures: [] };
+
+function parseErrorMessage(half, error, code) {
+  var text = 'dynamic package `' + half + '` failed to parse:\n' + error.name + ': ' + error.message;
+  // 真实实现只检查"出错那一行"里的 as，避免描述字符串里的 " as " 误导；
+  // 浏览器的 SyntaxError 不带源码行与插入符，所以这里退化成对整段源码的检查。
+  if (/\bas\b\s*[A-Za-z{]/.test(code)) {
+    return text + '\nThe sandbox runs plain JavaScript, not TypeScript. Remove type annotations:\n'
+      + "  ✗ { type: 'text' as const, text: x }\n  ✓ { type: 'text', text: x }";
+  }
+  return text + '\nNote: it runs as the BODY of an async function (line numbers are offset by the '
+    + '1-line wrapper). Check bracket balance — ending the returned plugin object with `});` closes '
+    + 'a call that was never opened; a plain `return { … }` ends with `}` (an optional `;`), never `)`.';
+}
+
+/** 只编译，不执行：坏代码进不了注册表，模型改完重新 define。 */
+function precheckCode(code, half) {
+  try {
+    new AsyncFunction('harness', 'console', 'require', 'fetch', 'setTimeout', '"use strict";\n' + code);
+  } catch (error) {
+    throw new Error(parseErrorMessage(half, error, code));
+  }
+}
+
+function cordisDefine(input) {
+  if (!input.code || typeof input.code.host !== 'string' || input.code.host.trim() === '') {
+    throw new Error('cordis_define needs at least one of code.host and code.client');
+  }
+  precheckCode(input.code.host, 'code.host');            // 语法关，唯一的关
+
+  var pluginId;
+  if (input.plugin.kind === 'new') {
+    if (!/^[a-z]{3,6}$/.test(input.plugin.idPrefix)) {
+      throw new Error('idPrefix must be 3–6 lowercase English letters');
+    }
+    pluginId = input.plugin.idPrefix + '-' + (DYN.nextPlugin++);
+    DYN.plugins.set(pluginId, { pluginId: pluginId, packages: [], currentPackageId: undefined,
+                                nextPackageId: undefined, fiber: null });
+  } else {
+    pluginId = input.plugin.pluginId;
+    if (!DYN.plugins.has(pluginId)) throw new Error('unknown dynamic plugin "' + pluginId + '"');
+  }
+
+  // Package 不可变：改一版就追加一个，旧版本原地留着，回滚只是把指针指回去
+  var packageId = 'pkg-' + (DYN.nextPackage++);
+  DYN.plugins.get(pluginId).packages.push({
+    packageId: packageId, name: input.name, purpose: input.purpose, host: input.code.host
+  });
+  return { pluginId: pluginId, packageId: packageId, name: input.name, purpose: input.purpose,
+           hasHostHalf: true, hasClientHalf: false };
+}
+
+async function cordisRun(pluginId, packageId, mode) {
+  var plugin = DYN.plugins.get(pluginId);
+  if (!plugin) throw new Error('unknown dynamic plugin "' + pluginId + '"');
+  var pkg = plugin.packages.find(function (p) { return p.packageId === packageId; });
+  if (!pkg) throw new Error('package "' + packageId + '" is not owned by ' + pluginId);
+
+  // mode:"run" 覆盖首启/重启/回滚，mode:"update" 从 current 切到另一个 package
+  var restarted = false;
+  if (plugin.fiber) { disposeFiber(plugin.fiber); plugin.fiber = null; restarted = true; }
+  plugin.nextPackageId = packageId;
+
+  // 沙箱求值：全局只有 harness / console，Node API 是会抛错的 trap
+  var body = new AsyncFunction('harness', 'console', 'require', 'fetch', 'setTimeout',
+                               '"use strict";\n' + pkg.host);
+  var value = await body(createHarness(), taggedConsole(pluginId),
+                         nodeApiTrap('require'), nodeApiTrap('fetch'), nodeApiTrap('setTimeout'));
+  if (!isPlugin(value)) {
+    throw new Error('the host half must return a cordis plugin: a function, or an object with an apply function');
+  }
+
+  var fiber = startHostHalf(DYN.group, value, function (error) { DYN.failures.push(error.message); });
+  plugin.fiber = fiber;
+  plugin.currentPackageId = packageId;    // 只有完全成功之后才动指针
+
+  var waiting = missingServices(fiber);
+  return { status: waiting.length === 0 ? 'running' : 'waiting', mode: mode, restarted: restarted,
+           pluginId: pluginId, packageId: packageId,
+           provides: providedServices(fiber), waitingFor: waiting };
+}
+
+/** 停止不需要任何专门的清理代码：插件注册过的一切都是它 fiber 上的 effect。 */
+function cordisStop(pluginId) {
+  var plugin = DYN.plugins.get(pluginId);
+  if (!plugin) throw new Error('unknown dynamic plugin "' + pluginId + '"');
+  if (!plugin.fiber) return { pluginId: pluginId, stopped: false, teardown: [] };  // 幂等
+  var teardown = [];
+  disposeFiber(plugin.fiber, function (label) { teardown.push(label); });
+  plugin.fiber = null;
+  // 定义、每个 package、版本指针全部保留，所以之后还能直接 run 或 rollback
+  return { pluginId: pluginId, stopped: true, teardown: teardown };
+}
+
+function cordisUndefine(pluginId) {
+  var plugin = DYN.plugins.get(pluginId);
+  if (!plugin) throw new Error('unknown dynamic plugin "' + pluginId + '"');
+  var wasRunning = !!plugin.fiber;
+  if (wasRunning) cordisStop(pluginId);
+  DYN.plugins.delete(pluginId);
+  return { pluginId: pluginId, wasRunning: wasRunning };
+}
+
+function listDynamicPlugins() {
+  var rows = [];
+  DYN.plugins.forEach(function (plugin) {
+    rows.push({
+      pluginId: plugin.pluginId,
+      packages: plugin.packages.length,
+      currentPackageId: plugin.currentPackageId || null,
+      state: plugin.fiber ? plugin.fiber.state : 'stopped',
+      provides: plugin.fiber ? providedServices(plugin.fiber) : [],
+      waitingFor: plugin.fiber ? missingServices(plugin.fiber) : []
+    });
+  });
+  return rows;
+}
+
+// =====================================================================
+// 启动这个运行时：把前几章的插件挂上去。
+// =====================================================================
+var FILES = {
+  'README.md': '# mini-dsh\n\nA harness you can read in one sitting.\nNine chapters, one artifact.\n',
+  'src/agent.ts': 'export async function kick() {\n  while (await turn()) {}\n}\n'
+};
+
+var FS_SERVICE = {
+  read: function (path) {
+    if (!Object.prototype.hasOwnProperty.call(FILES, path)) throw new Error('ENOENT: ' + path);
+    return FILES[path];
+  },
+  write: function (path, text) { FILES[path] = text; return undefined; },
+  list: function () { return Object.keys(FILES); }
+};
+
+var BASH_SERVICE = {
+  exec: function (command) { return '$ ' + command + '\n(mini-dsh 里的 bash 只会回显)'; }
+};
+
+// 一个故意行为不端的服务：它的方法返回一个真 Context，用来演示 denyContext 这条规则
+var LEAKY_SERVICE = { peek: function () { return createContext(ROOT); } };
+
+function bootRuntime() {
+  var rootCtx = createContext(ROOT);
+
+  rootCtx.plugin({ name: 'dsh-session', apply: function (ctx) { ctx.provide('session', SESSION_SERVICE); } });
+  rootCtx.plugin({ name: 'dsh-tools', apply: function (ctx) { ctx.provide('tools', null, toolsBind); } });
+  rootCtx.plugin({ name: 'leaky-probe', apply: function (ctx) { ctx.provide('leakyProbe', LEAKY_SERVICE); } });
+
+  rootCtx.plugin({
+    name: 'tool-fs', inject: ['tools'],
+    apply: function (ctx) {
+      ctx.provide('fs', FS_SERVICE);
+      ctx.tools.register(defineTool({
+        name: 'read', description: '读一个文件。',
+        parameters: { path: { type: 'string', required: true } },
+        output: { schema: { type: 'json' },
+                  render: function (a, v) { return [{ type: 'text', text: v.text }]; } },
+        execute: function (args) { return { text: FS_SERVICE.read(args.path) }; }
+      }));
+      ctx.tools.register(defineTool({
+        name: 'write', description: '覆写一个文件。',
+        parameters: { path: { type: 'string', required: true }, text: { type: 'string', required: true } },
+        output: { schema: { type: 'json' },
+                  render: function (a, v) { return [{ type: 'text', text: '已写入 ' + v.path }]; } },
+        execute: function (args) { FS_SERVICE.write(args.path, args.text); return { path: args.path }; }
+      }));
+    }
+  });
+
+  rootCtx.plugin({
+    name: 'tool-bash', inject: ['tools'],
+    apply: function (ctx) {
+      ctx.provide('bash', BASH_SERVICE);
+      ctx.tools.register(defineTool({
+        name: 'bash', description: '执行一条 shell 命令。',
+        parameters: { command: { type: 'string', required: true } },
+        output: { schema: { type: 'json' },
+                  render: function (a, v) { return [{ type: 'text', text: v.output }]; } },
+        execute: function (args) { return { output: BASH_SERVICE.exec(args.command) }; }
+      }));
+    }
+  });
+
+  // 真实分工：cordis-host-runner 提供 dynamicCordisRunner，tool-cordis 注入它。
+  // 这个服务是活的，但编译期 catalog 里没有它。Demo 9.1 的第一个"无签名"条目就是它。
+  rootCtx.plugin({
+    name: 'cordis-host-runner',
+    apply: function (ctx) {
+      ctx.provide('dynamicCordisRunner', {
+        define: cordisDefine, run: cordisRun, stop: cordisStop,
+        undefine: cordisUndefine, listPlugins: listDynamicPlugins
+      });
+    }
+  });
+
+  rootCtx.plugin({ name: 'tool-cordis', inject: ['tools', 'dynamicCordisRunner'], apply: applyToolCordis });
+}
+
+// ------------------------------------------------- 七个工具里的五个（mini 版）
+var INSPECT_PROVIDERS = [
+  { platform: 'host', id: 'Service', description: '渐进式服务发现：紧凑目录，然后一个精确契约。',
+    methods: ['listService'] },
+  { platform: 'host', id: 'Event', description: '渐进式事件发现：监听器目录与分发模式。',
+    methods: ['listEvents'] },
+  { platform: 'host', id: 'Builtin', description: 'host 半可用的纯 JavaScript 符号。',
+    methods: ['listBuiltins'] },
+  { platform: 'host', id: 'Tool', description: '当前 agent 可见的工具，含作用域与动态注册。',
+    methods: ['listTools'] }
+];
+
+var HOST_BUILTIN_INSPECTION = [
+  { name: 'ctx', signatures: ['ctx.get(name)', 'ctx.on(name, listener)', 'ctx.provide(name, value)', 'ctx.effect(callback, label?)'] },
+  { name: 'harness', signatures: ['harness.defineTool(definition)', 'harness.registerTool(ctx, tool)'] },
+  { name: 'console', signatures: ['console.log(...values)'] }
+];
+
+function queryInspect(provider, method) {
+  if (provider === 'Service' && method === 'listService') {
+    return { live: liveServices(), absent: absentServices() };
+  }
+  if (provider === 'Event' && method === 'listEvents') {
+    var events = [];
+    LISTENERS.forEach(function (list, name) { events.push({ name: name, mode: 'waterfall', listeners: list.length }); });
+    return { events: events.sort(function (a, b) { return a.name.localeCompare(b.name); }) };
+  }
+  if (provider === 'Builtin' && method === 'listBuiltins') return { builtins: HOST_BUILTIN_INSPECTION };
+  if (provider === 'Tool' && method === 'listTools') return { tools: toolSchemas() };
+  throw new Error('unknown ' + provider + ' inspect method "' + method + '"');
+}
+
+function applyToolCordis(ctx) {
+  DYN.group = ctx.plugin({ name: 'cordis-dynamic', apply: function () {} });
+  DYN.group.state = 'active';
+
+  ctx.tools.register(defineTool({
+    name: 'cordis_inspect_list', description: '列出所有 Inspect Provider。', parameters: {},
+    output: { schema: { type: 'json' },
+              render: function (a, v) { return [{ type: 'text', text: JSON.stringify(v, null, 2) }]; } },
+    execute: function () { return { providers: INSPECT_PROVIDERS }; }
+  }));
+
+  ctx.tools.register(defineTool({
+    name: 'cordis_inspect_query', description: '跑一次 Provider 声明的只读查询。',
+    parameters: { platform: { type: 'string', required: true }, provider: { type: 'string', required: true },
+                  method: { type: 'string', required: true } },
+    output: { schema: { type: 'json' },
+              render: function (a, v) { return [{ type: 'text', text: JSON.stringify(v.data, null, 2) }]; } },
+    execute: function (args) {
+      return { platform: args.platform, provider: args.provider, method: args.method,
+               data: queryInspect(args.provider, args.method) };
+    }
+  }));
+
+  ctx.tools.register(defineTool({
+    name: 'cordis_inspect_self', description: '看当前会话自己的动态 plugin。',
+    parameters: { pluginId: { type: 'string' } },
+    output: { schema: { type: 'json' },
+              render: function (a, v) { return [{ type: 'text', text: JSON.stringify(v, null, 2) }]; } },
+    execute: function () { return { mode: 'plugins', plugins: listDynamicPlugins() }; }
+  }));
+
+  ctx.tools.register(defineTool({
+    name: 'cordis_define', description: '登记一个不可变的 Package，只校验语法。',
+    parameters: { plugin: { type: 'object', required: true }, name: { type: 'string', required: true },
+                  purpose: { type: 'string', required: true }, code: { type: 'object', required: true } },
+    output: { schema: { type: 'json' },
+              render: function (a, v) {
+                return [{ type: 'text', text: 'Defined ' + v.pluginId + '/' + v.packageId + ' (' + v.name
+                  + '); it is not running yet. Use cordis_run to activate this Package.' }];
+              } },
+    execute: function (args) { return cordisDefine(args); }
+  }));
+
+  ctx.tools.register(defineTool({
+    name: 'cordis_run', description: '激活一个精确的 Package。',
+    parameters: { pluginId: { type: 'string', required: true }, packageId: { type: 'string', required: true },
+                  mode: { type: 'string', required: true } },
+    output: { schema: { type: 'json' },
+              render: function (a, v) {
+                return [{ type: 'text', text: v.pluginId + '/' + v.packageId + ' is ' + v.status + '.' }];
+              } },
+    execute: function (args) { return cordisRun(args.pluginId, args.packageId, args.mode); }
+  }));
+
+  ctx.tools.register(defineTool({
+    name: 'cordis_stop', description: '停掉当前 Run，保留定义与所有版本。',
+    parameters: { pluginId: { type: 'string', required: true } },
+    output: { schema: { type: 'json' },
+              render: function (a, v) {
+                return [{ type: 'text', text: 'Dynamic Plugin ' + v.pluginId
+                  + ' is stopped; its definition and versions remain.' }];
+              } },
+    execute: function (args) { return cordisStop(args.pluginId); }
+  }));
+
+  ctx.tools.register(defineTool({
+    name: 'cordis_undefine', description: '永久删除一个动态 plugin。',
+    parameters: { pluginId: { type: 'string', required: true } },
+    output: { schema: { type: 'json' },
+              render: function (a, v) { return [{ type: 'text', text: 'Removed dynamic Plugin ' + v.pluginId + '.' }]; } },
+    execute: function (args) { return cordisUndefine(args.pluginId); }
+  }));
+}
+
+bootRuntime();
+
+// =====================================================================
+// Demo 9.1 · 检查活的运行时
+// =====================================================================
+function renderFiberTree(fiber, depth, lines) {
+  var suffix = fiber.effects.length ? '   effects=' + fiber.effects.length : '';
+  lines.push(new Array(depth + 1).join('  ') + fiber.name + '  [' + fiber.state + ']' + suffix);
+  fiber.children.forEach(function (child) { renderFiberTree(child, depth + 1, lines); });
+  return lines;
+}
+
+function pad(text, width) {
+  var s = String(text);
+  while (s.length < width) s += ' ';
+  return s;
+}
+
+(function () {
+  DSH.demo('d-inspect', {
+    reset: function (o) { o.clear(); },
+
+    providers: async function (o) {
+      o.clear();
+      o.head('tool/call  cordis_inspect_list');
+      var result = await executeToolCall({ name: 'cordis_inspect_list', args: {} });
+      result.value.providers.forEach(function (p) {
+        o.acc('  ' + pad(p.platform + ':' + p.id, 16) + p.methods.join(', '));
+        o.dim('      ' + p.description);
+      });
+      o.rule();
+      o.dim('Provider 的名字必须来自这里，cordis_inspect_query 不接受猜出来的名字。');
+    },
+
+    run: async function (o) {
+      o.head('tool/call  cordis_inspect_query { provider: "Service", method: "listService" }');
+      var result = await executeToolCall({
+        name: 'cordis_inspect_query',
+        args: { platform: 'host', provider: 'Service', method: 'listService' }
+      });
+      var data = result.value.data;
+
+      o.acc('services  (live store ∩ 编译期 catalog)');
+      data.live.forEach(function (service) {
+        if (service.catalogued) {
+          o.ok('  ' + pad(service.name, 22) + pad('[' + service.owner + ']', 22)
+               + service.methods.length + ' 个签名   ' + service.summary);
+        } else {
+          o.warn('  ' + pad(service.name, 22) + pad('[' + service.owner + ']', 22)
+                 + 'no signatures  目录没覆盖，但它在跑');
+        }
+      });
+      o.dim('  absent (catalog 有、进程里没有): ' + data.absent.join(', '));
+
+      o.acc('fibers');
+      renderFiberTree(ROOT, 1, []).forEach(function (line) { o.log('  ' + line); });
+
+      var tools = await executeToolCall({
+        name: 'cordis_inspect_query',
+        args: { platform: 'host', provider: 'Tool', method: 'listTools' }
+      });
+      o.acc('tools  (' + tools.value.data.tools.length + ' 个，模型此刻能调用的)');
+      o.log('  ' + tools.value.data.tools.map(function (t) { return t.name; }).join('  '));
+      o.rule();
+      o.dim('黄色那几行是"活着但目录没覆盖"：dynamicCordisRunner 这类运行时对象，');
+      o.dim('以及你在 Demo 9.2 里 provide 出来的服务。编译期目录按定义不可能覆盖运行时才出现的东西，');
+      o.dim('所以它们被报成"可达、无签名"，留在列表里。否则模型就看不见自己上一步造出来的东西。');
+    },
+
+    self: async function (o) {
+      o.clear();
+      o.head('tool/call  cordis_inspect_self');
+      var result = await executeToolCall({ name: 'cordis_inspect_self', args: {} });
+      var plugins = result.value.plugins;
+      if (!plugins.length) {
+        o.dim('这个会话还没有定义过任何动态 plugin。');
+        o.dim('动态 package 只活在这个进程的内存里：不写文件、不改配置、不跨重启，也没有自动提升的路径。');
+        o.dim('去 Demo 9.2 定义一个，然后回来再点一次。');
+        return;
+      }
+      plugins.forEach(function (p) {
+        o.acc('  ' + p.pluginId + '   packages=' + p.packages + '   current=' + p.currentPackageId
+              + '   state=' + p.state);
+        o.log('      provides: ' + (p.provides.length ? p.provides.join(', ') : '(无)'));
+        if (p.waitingFor.length) o.warn('      waitingFor: ' + p.waitingFor.join(', '));
+      });
+    }
+  });
+})();
+
+// =====================================================================
+// Demo 9.2 · 写一个插件，挂上去，然后调用它
+// =====================================================================
+(function () {
+  var GOOD_SOURCE = null;
+  var state = { pluginId: null, packageId: null };
+
+  function currentSource(api) { return api.$('#forge-src').value; }
+
+  function dynamicToolNames() {
+    if (!DYN.group) return [];
+    return Array.from(TOOLS.values())
+      .filter(function (entry) { return withinFiber(entry.owner, DYN.group); })
+      .map(function (entry) { return entry.def.name; });
+  }
+
+  async function define(o, api) {
+    var args = {
+      plugin: state.pluginId ? { kind: 'existing', pluginId: state.pluginId }
+                             : { kind: 'new', idPrefix: 'wordc' },
+      name: 'word-count',
+      purpose: '给 agent 加一个统计文件行数与词数的工具。',
+      code: { host: currentSource(api) }
+    };
+    o.head('tool/call  cordis_define  ' + JSON.stringify(args.plugin));
+    var result;
+    try {
+      result = await executeToolCall({ name: 'cordis_define', args: args });
+    } catch (error) {
+      o.bad('tool/error  cordis_define 失败：');
+      String(error.message).split('\n').forEach(function (line) { o.bad('    ' + line); });
+      o.rule();
+      o.dim('注意：这一步只编译，没有执行任何代码。坏代码进不了注册表。');
+      return;
+    }
+    state.pluginId = result.value.pluginId;
+    state.packageId = result.value.packageId;
+    o.ok('  ' + result.text);
+    o.dim('  语法通过。Package 不可变；再 define 一次会在同一个 plugin 上追加新版本，旧版本留着可回滚。');
+  }
+
+  async function mount(o, api) {
+    if (!state.packageId) { o.warn('先按 cordis_define。run 只接受一个已经登记过的精确 Package。'); return; }
+    var before = toolSchemas().map(function (s) { return s.name; });
+    o.head('tool/call  cordis_run  { pluginId: "' + state.pluginId + '", packageId: "'
+           + state.packageId + '", mode: "run" }');
+    CONSOLE_SINK = function (line) { o.dim('  ' + line); };
+    var result;
+    try {
+      result = await executeToolCall({
+        name: 'cordis_run',
+        args: { pluginId: state.pluginId, packageId: state.packageId, mode: 'run' }
+      });
+    } catch (error) {
+      o.bad('tool/error  cordis_run 失败：');
+      String(error.message).split('\n').forEach(function (line) { o.bad('    ' + line); });
+      o.dim('  失败的 fiber 已经被 dispose，树上不会留下半死不活的东西。');
+      return;
+    } finally {
+      CONSOLE_SINK = null;
+    }
+    var value = result.value;
+    if (value.restarted) o.dim('  当前 Run 已存在，先停掉再起新的（mode:"run" 覆盖首启 / 重启 / 回滚）。');
+    o.ok('  ' + result.text);
+    o.log('  provides: ' + (value.provides.length ? value.provides.join(', ') : '(无)'));
+    if (value.waitingFor.length) o.warn('  waitingFor: ' + value.waitingFor.join(', '));
+
+    var after = toolSchemas().map(function (s) { return s.name; });
+    var added = after.filter(function (name) { return before.indexOf(name) < 0; });
+    o.rule();
+    o.acc('工具表变化：+' + (added.length ? added.join(', ') : '(无)'));
+    o.log('  现在的工具表 (' + after.length + '): ' + after.join('  '));
+    o.dim('  这个新名字下一次组装 prompt 时就在里面了。它是注册表里的一条真实记录，不是模拟。');
+  }
+
+  async function turn(o) {
+    var names = dynamicToolNames();
+    if (!names.length) { o.warn('工具表里还没有动态工具。先 define + run。'); return; }
+    var toolName = names[0];
+
+    var userText = '统计一下 README.md';
+    sessionAppend('user/message', { text: userText }, 'append');
+    o.head('turn/start');
+    o.log('  user: ' + userText);
+
+    var model = DSH.mockLLM([
+      { text: '我用这次会话里现造的 ' + toolName + ' 来数。',
+        toolCalls: [{ name: toolName, args: { path: 'README.md' } }] },
+      function (ctx) { return { text: '结果：' + ctx.lastResult + '。这个工具十秒钟之前还不存在。', toolCalls: [] }; }
+    ]);
+
+    var step = 0, reason = null, lastResult = '';
+    while (!reason && step < 4) {
+      o.log('  step/start  step=' + step);
+      await DSH.wait(200);
+      var reply = model.next({ lastResult: lastResult });
+      sessionAppend('assistant/message', { text: reply.text }, 'append');
+      o.acc('  assistant: ' + reply.text);
+
+      if (!reply.toolCalls.length) { reason = 'completed'; break; }
+
+      for (var i = 0; i < reply.toolCalls.length; i++) {
+        var call = reply.toolCalls[i];
+        o.log('  tool/call   ' + call.name + ' ' + JSON.stringify(call.args));
+        await DSH.wait(200);
+        var result = await executeToolCall(call);      // ch04 瀑布 → ch06 执行 → 渲染
+        lastResult = result.text;
+        sessionAppend('tool/result', { text: result.text, name: call.name }, 'append');
+        o.ok('  tool/result ' + result.text);
+      }
+      o.log('  step/end    step=' + step);
+      step++;
+    }
+    o.acc('turn/end  reason=' + (reason || 'completed'));
+
+    o.rule();
+    var stats = SERVICES.get('wordStats');
+    if (stats) o.dim('动态插件自己挂的 tools/pre-execute 监听器数到了 ' + stats.value.calls + ' 次调用。');
+    o.dim('会话日志: ' + SESSION.events.length + ' 条事件 → 表面投影出 '
+          + deriveMessages().length + ' 条模型可见消息。');
+    o.dim('工具结果是通过第 6 章那条管线回来的，事件是按第 5 章的 surfaceOp 追加的：这条路径没有为动态工具开任何后门。');
+  }
+
+  async function stop(o) {
+    if (!state.pluginId) { o.warn('还没有东西可以停。'); return; }
+    var before = toolSchemas().map(function (s) { return s.name; });
+    o.head('tool/call  cordis_stop  { pluginId: "' + state.pluginId + '" }');
+    var result = await executeToolCall({ name: 'cordis_stop', args: { pluginId: state.pluginId } });
+    o.ok('  ' + result.text);
+    if (!result.value.stopped) { o.dim('  它本来就没在跑。stop 是幂等的。'); return; }
+
+    o.acc('  effect 回收顺序（注册顺序的逆序）');
+    result.value.teardown.forEach(function (label, i) { o.log('    ' + (i + 1) + '. ' + label); });
+
+    var after = toolSchemas().map(function (s) { return s.name; });
+    var removed = before.filter(function (name) { return after.indexOf(name) < 0; });
+    o.log('  工具表变化：-' + (removed.length ? removed.join(', ') : '(无)'));
+    o.log('  wordStats 服务还在吗：' + (SERVICES.has('wordStats') ? '在' : '没了'));
+    o.log('  tools/pre-execute 上还剩几个监听器：' + ((LISTENERS.get('tools/pre-execute') || []).length));
+    o.rule();
+    o.dim('没有任何一行"清理代码"参与其中。工具、服务、监听器都是 fiber 上的 effect，');
+    o.dim('disposeFiber 按注册的相反顺序把它们摘掉，这是第 3 章的产物在替本章收尾。');
+  }
+
+  // 「不给 disposer 的插件」。它不走 ctx.tools.register()，自己往注册表里塞一条记录，
+  // 于是 fiber 上没有任何 effect 记着这件事。真实 dsh 的 façade 既不给 registry 也不给
+  // effect()，模型写的代码走不到这里；下面这个插件是以框架自己的身份挂的，只为演示后果。
+  var GHOST_APPLY = [
+    "apply(ctx) {",
+    "  ctx.registry.TOOLS.set('ghost_count', {          // 没有 disposer",
+    "    def: { name: 'ghost_count', parameters: {}, description: '一个没人负责回收的工具。',",
+    "           output: { schema: { type: 'json' },",
+    "                     render: (a, v) => [{ type: 'text', text: v.text }] },",
+    "           execute: () => ({ text: '我还在。' }) },",
+    "    owner: ctx.fiber",
+    "  });",
+    "}"
+  ];
+
+  function ghostTool() {
+    return {
+      name: 'ghost_count', description: '一个没人负责回收的工具。', parameters: {},
+      output: { schema: { type: 'json' },
+                render: function (a, v) { return [{ type: 'text', text: v.text }]; } },
+      execute: function () { return { text: '我还在。' }; }
+    };
+  }
+
+  async function ghost(o) {
+    o.clear();
+    o.head('挂一个绕开 ctx.effect() 的插件');
+    GHOST_APPLY.forEach(function (line) { o.log('  ' + line); });
+    o.rule();
+
+    var fiber = createContext(DYN.group).plugin({
+      name: 'ghost-tool',
+      apply: function (ctx) {
+        ctx.registry.TOOLS.set('ghost_count', { def: ghostTool(), owner: ctx.fiber });
+      }
+    });
+    o.ok('  fiber ' + fiber.name + ' [' + fiber.state + ']   effects=' + fiber.effects.length);
+    o.log('  工具表 (' + toolSchemas().length + '): '
+          + toolSchemas().map(function (s) { return s.name; }).join('  '));
+
+    var listed = await executeToolCall({ name: 'cordis_inspect_query',
+      args: { platform: 'host', provider: 'Tool', method: 'listTools' } });
+    var visible = listed.value.data.tools.some(function (t) { return t.name === 'ghost_count'; });
+    o.log('  模型此刻看得见它吗：' + (visible ? '看得见' : '看不见'));
+
+    o.head('dispose 这个 fiber，也就是 cordis_stop 干的事');
+    var teardown = [];
+    disposeFiber(fiber, function (label) { teardown.push(label); });
+    o.log('  回收了 ' + teardown.length + ' 个 effect：' + (teardown.join(', ') || '(一个都没有)'));
+    var entry = TOOLS.get('ghost_count');
+    o.bad('  ghost_count 还在工具表里吗：' + (entry ? '在' : '没了')
+          + (entry ? '，owner=' + entry.owner.name + ' [' + entry.owner.state + ']' : ''));
+    o.dim('  owner 已经死了，工具还在。下一次组装 prompt 会带上一个调用后果不可知的名字。');
+    o.dim('  幽灵工具就是这么来的，仓库那条"注册必须经过 ctx.effect()"的规矩也是这么来的。');
+    o.rule();
+    TOOLS.delete('ghost_count');
+    o.ok("  手动打扫：TOOLS.delete('ghost_count')。这一行就是 dsh 从来不需要写的那种代码。");
+  }
+
+  DSH.demo('d-forge', {
+    init: function (o, api) { GOOD_SOURCE = api.$('#forge-src').value; },
+    reset: function (o) { o.clear(); },
+    define: define,
+    mount: mount,
+    turn: turn,
+    stop: stop,
+    ghost: ghost,
+    broken: async function (o, api) {
+      o.clear();
+      var broken = GOOD_SOURCE.replace(/\};\s*$/, '});');
+      api.$('#forge-src').value = broken;
+      o.warn('已经把结尾的 `};` 换成 `});`，一个真实模型最常犯的括号错误。');
+      o.dim('现在跑一次 cordis_define：');
+      o.rule();
+      await define(o, api);
+    },
+    restore: function (o, api) {
+      api.$('#forge-src').value = GOOD_SOURCE;
+      o.ok('示例源码已还原。');
+    }
+  });
+})();
+
+// =====================================================================
+// Demo 9.3 · façade 拒绝什么，放行什么
+// =====================================================================
+(function () {
+  /** 把探针跑在真实的 façade 上：挂一个只做探测的动态插件，用 harness 的额外动词回报结果。 */
+  async function runProbes(probeBody, declared, extras) {
+    var results = [];
+    var harness = createHarness(Object.assign({
+      report: function (name, ok, detail) { results.push({ name: name, ok: ok, detail: detail }); }
+    }, extras || {}));
+    var body = new AsyncFunction('harness', 'console', 'require', 'fetch', 'setTimeout',
+                                 '"use strict";\n' + probeBody);
+    var plugin = await body(harness, taggedConsole('probe'),
+                            nodeApiTrap('require'), nodeApiTrap('fetch'), nodeApiTrap('setTimeout'));
+    var fiber = startHostHalf(DYN.group, plugin, function () {});
+    disposeFiber(fiber);
+    return results;
+  }
+
+  var PROBE_SOURCE = [
+    'function probe(name, fn) {',
+    '  try { var value = fn(); harness.report(name, true, String(value).slice(0, 90)); }',
+    '  catch (error) { harness.report(name, false, error.message); }',
+    '}',
+    'return {',
+    "  name: 'facade-probe',",
+    "  inject: ['fs', 'leakyProbe'],",
+    '  apply(ctx) {',
+    "    probe('ctx.fiber', () => ctx.fiber.name);",
+    "    probe('ctx.registry', () => Object.keys(ctx.registry));",
+    "    probe('ctx.plugin(...)', () => ctx.plugin({ apply() {} }));",
+    "    probe('ctx.bash (undeclared)', () => ctx.bash.exec('id'));",
+    "    probe('ctx.nope (absent)', () => ctx.nope);",
+    "    probe('ctx.leakyProbe.peek()', () => ctx.leakyProbe.peek());",
+    "    probe('ctx.stash = 1', () => { ctx.stash = 1; return 'ok'; });",
+    "    probe('ctx.tools.get(\"bash\").execute', () => typeof ctx.tools.get('bash').execute);",
+    "    probe('require(\"node:fs\")', () => require('node:fs'));",
+    "    probe('setTimeout(fn, 0)', () => setTimeout(function () {}, 0));",
+    "    probe('ctx.fs.list() (declared)', () => ctx.fs.list().join(', '));",
+    "    probe('ctx.tools.schemas().length', () => ctx.tools.schemas().length);",
+    '  }',
+    '};'
+  ].join('\n');
+
+  var ESCAPE_SOURCE = [
+    'return {',
+    "  name: 'granted-power',",
+    "  inject: ['fs'],",
+    '  apply(ctx) {',
+    "    var before = ctx.fs.read('README.md');",
+    "    ctx.fs.write('README.md', '# owned by a model-written plugin\\n');",
+    "    harness.report('ctx.fs.write', true, 'README.md 已被改写');",
+    "    harness.report('before', true, before.split('\\n')[0]);",
+    "    harness.report('after', true, ctx.fs.read('README.md').split('\\n')[0]);",
+    '  }',
+    '};'
+  ].join('\n');
+
+  DSH.demo('d-facade', {
+    reset: function (o) { o.clear(); },
+
+    run: async function (o) {
+      var results = await runProbes(PROBE_SOURCE, ['fs', 'leakyProbe']);
+      var denied = results.filter(function (r) { return !r.ok; });
+      var allowed = results.filter(function (r) { return r.ok; });
+
+      o.head('被拒绝 (' + denied.length + ')');
+      denied.forEach(function (r) {
+        o.bad('  ' + r.name);
+        o.dim('      ' + r.detail);
+      });
+      o.head('被放行 (' + allowed.length + ')');
+      allowed.forEach(function (r) { o.ok('  ' + pad(r.name, 34) + '→ ' + r.detail); });
+      o.rule();
+      o.dim('注意 ctx.tools.get("bash").execute 是 undefined：façade 给的是 schema 视图，');
+      o.dim('不是活的 definition。拿到 definition 就能绕过 ToolRuntime.execute 直接调另一个工具，');
+      o.dim('也就绕过了身份保护、前后置策略、单调守卫和结果归一化。');
+      o.dim('leakyProbe 是一个故意行为不端的服务：它的方法返回一个真 Context，于是被 denyContext 拦下。');
+    },
+
+    escape: async function (o) {
+      o.clear();
+      o.head('一个规规矩矩声明了 inject: [\'fs\'] 的插件');
+      var results = await runProbes(ESCAPE_SOURCE, ['fs']);
+      results.forEach(function (r) { o.warn('  ' + pad(r.name, 14) + '→ ' + r.detail); });
+      o.rule();
+      o.bad('façade 全程没有任何意见。它拒绝框架内部，但从不限制被授予服务的权限。');
+      o.dim('真实 dsh 里这个位置上的是 ctx.fs / ctx.web / ctx.bash，权限等同宿主 executor，');
+      o.dim('而且这段代码跑在共享进程里，可能影响同进程的其他会话。');
+      o.dim('sandbox.ts 的原话：not containment — host-realm helper functions remain an escape route。');
+      o.dim('（README.md 已被改回原样，别担心。）');
+      FILES['README.md'] = '# mini-dsh\n\nA harness you can read in one sitting.\nNine chapters, one artifact.\n';
+    }
+  });
+})();
+
+// =====================================================================
+// 本章的产物
+// =====================================================================
+DSH.showSource('src-verbs', [cordisDefine, cordisRun, cordisStop]);
+DSH.showSource('src-facade', [sandboxContext]);
+</script>
+
+</body>
+</html>

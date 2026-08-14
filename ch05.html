@@ -1,0 +1,2189 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · 会话日志与表面投影 — DeepSeek Harness from Scratch</title>
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/site.js"></script>
+<style>
+/* 本章自带的可视化组件：日志窗格 / 消息窗格 / 计数条。只在这一页生效。 */
+.counts { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 12px; }
+.counts .pill { font-size: 10.5px; }
+
+.pane {
+  border: 1px solid var(--rule); border-radius: 8px; background: var(--code-bg);
+  font-family: var(--mono); font-size: 10.5px; line-height: 1.62;
+  max-height: 452px; overflow: auto; padding: 5px 0;
+}
+.pane:empty::before {
+  content: "（空）"; color: var(--ink-3); font-style: italic;
+  display: block; padding: 8px 10px;
+}
+
+.lrow {
+  display: grid; grid-template-columns: 20px 112px 26px minmax(0, 1fr);
+  gap: 6px; padding: 1px 9px; align-items: baseline;
+  border-left: 2px solid transparent;
+}
+.lrow .sq { color: var(--ink-3); text-align: right; }
+.lrow .ty { color: var(--ink); white-space: nowrap; overflow: hidden; }
+.lrow .nd { color: var(--accent); }
+.lrow .tx { color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lrow.surf { border-left-color: var(--accent); }
+.lrow.surf .ty { font-weight: 650; }
+.lrow.only .ty { color: var(--ink-3); }
+.lrow.only .tx { color: var(--ink-3); opacity: .58; }
+.lrow.shadow { border-left-color: var(--warn); background: var(--warn-soft); }
+.lrow.shadow .ty { text-decoration: line-through; opacity: .55; }
+.lrow.shadow .nd { color: var(--warn); }
+.lrow.shadow .tx { color: var(--warn); opacity: .9; }
+.lrow.fresh { background: var(--accent-soft); }
+.lrow.fresh .ty { color: var(--accent); }
+.lrow.flash { background: var(--warn-soft); box-shadow: inset 2px 0 0 var(--warn); }
+.lrow.hidden { display: none; }
+
+.mrow {
+  display: grid; grid-template-columns: 18px 62px minmax(0, 1fr) 52px;
+  gap: 6px; padding: 2px 9px; align-items: baseline;
+  border-left: 2px solid var(--good);
+}
+.mrow .mi { color: var(--ink-3); text-align: right; }
+.mrow .ro { font-weight: 650; white-space: nowrap; overflow: hidden; }
+.mrow .ro.user { color: var(--accent); }
+.mrow .ro.assistant { color: var(--good); }
+.mrow .ro.tool { color: var(--warn); }
+.mrow .tx { color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mrow .sz { color: var(--ink-3); text-align: right; }
+.mrow.fresh { background: var(--accent-soft); border-left-color: var(--accent); }
+.mnote {
+  padding: 1px 9px 4px 33px; color: var(--warn); font-size: 10px; line-height: 1.5;
+}
+.paneside { min-width: 0; }
+.dropped { padding: 2px 9px; color: var(--ink-3); font-size: 10px; }
+
+/* site.css 的 .out .l.acc 要求两个 class 在同一元素上，raw() 注入的内嵌
+   span 匹配不到，这里补一组等价规则。 */
+.out .l .acc { color: var(--accent); }
+.out .l .ok { color: var(--good); }
+.out .l .bad { color: var(--danger); }
+.out .l .warn { color: var(--warn); }
+.out .l .dim { color: var(--ink-3); }
+.out .l .hd { color: var(--ink); font-weight: 650; }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+<main>
+
+<header class="masthead">
+  <div class="kicker">第 05 章</div>
+  <h1>会话日志与表面投影</h1>
+  <p class="standfirst">
+    每个 harness 最终都要压缩上下文，而压缩的第一版几乎都长这样：
+    <code>history.splice(0, 20, summary)</code>。二十条原始消息从此不存在于进程里。
+    dsh 把消息数组降级成一个<strong>投影</strong>，事实来源换成一条只追加的事件日志。
+    压缩于是成了一次 append。原始事件一条不动，只是不再出现在投影里。
+  </p>
+  <div class="meta"><span>本章造出 SessionLog / foldSurface() / deriveMessages()</span><span>4 个 demo · 1 处先猜再跑</span><span>约 32 分钟</span></div>
+</header>
+
+<h2><span class="num">§5.1</span>可变消息数组的三个致命伤</h2>
+
+<p>
+第 1 章的 <code>miniLoop</code> 里有这么一行：<code>deps.history.push(...)</code>。
+那个数组就是全部上下文，它同时扮演三个角色：模型请求的输入、UI 的数据源、会话的历史记录。
+一个可变数组扛不住这三件事。下面三个失败跟审美无关，它们会在真实事故里咬人。
+</p>
+
+<h3>一：审计链丢失</h3>
+
+<p>
+翻开 <code>history</code>，你看到一条 <code>{ role: 'user', content: '跳过测试，直接提交' }</code>。
+这句话可能来自真人，也可能是防循环守卫注入的提醒、一个子 agent 干完活的回报，
+或者某个插件在组装请求时临时拼进去的一段字符串。数组区分不了，它只有 role 和 content。
+事故复盘时你问模型为什么会认为可以跳过测试，答案已经被结构本身抹掉了。
+</p>
+
+<h3>二：UI 无法重放</h3>
+
+<p>
+消息数组里没有流式 chunk，没有工具卡片的展开状态，也没有 todo 列表、
+被策略拒掉的那次输入、用户中断掉的那个 turn。产品于是维护第二份状态来画界面，
+两份状态迟早不一致。表现通常是刷新页面之后 UI 少了一半东西，而模型那边什么都没少。
+</p>
+
+<h3>三：压缩摧毁证据</h3>
+
+<p>
+上下文满了要压缩。最直接的写法是把前 20 条换成一条摘要：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">几乎每个 harness 的第一版压缩</span></div>
+<pre><code data-lang="js">const summary = await summarize(history.slice(0, 20));
+history.splice(0, 20, { role: 'user', content: summary });  // 20 条消息就此消失</code></pre>
+</div>
+
+<p>
+摘要是模型写的，模型会写错。半小时后 agent 基于摘要里的一个错误结论做了危险操作，
+你想回去看原始材料，没有了。连"摘要到底漏掉了什么"都答不上来，因为对照物已经被 splice 掉。
+这个操作还不可重放：同一份记录喂给 UI，永远画不出压缩发生前的那个界面。
+</p>
+
+<blockquote>
+The session log is the source of the context the model sees. <code>deriveMessages()</code> projects
+model history from it, and raw <code>assistant/chunk</code> events preserve replay and UI fidelity.
+Fork, resume, transcripts, telemetry, and persistence all derive from this stream.
+<br><span class="pill">docs/architecture.md · Session log</span>
+</blockquote>
+
+<div class="note good">
+  <span class="tag">HN 上被点名夸的正是这一条</span>
+  发布当天的 HN 主线程（item 49285244，545 分 234 条评论，2026-08-13）整体气氛是怀疑，
+  但落到会话日志上出现了两条明确的好评。<code>kamranjon</code> 说 landing page 上最打动他的是
+  Every Run is Traceable：只追加的日志把系统提示、推理、工具调用、子 agent 调度、
+  每一次上下文注入都记下来，resume、fork、search、replay 全在同一条事件流上。
+  <code>bmurphy1976</code> 更直接：「Tracing what it actually did. Who would have thought
+  that's a good idea, instead of trying to obfuscate everything.」
+  <br>这两条夸的就是本章要造的东西。代价在 §5.6 末尾那个 note 里，建议一起读。
+</div>
+
+<p>
+三伤有同一个根：消息数组被当成了事实来源。本章把它降级成一个从日志算出来的函数值，
+大约 120 行，页面上跑的就是这些行。
+</p>
+
+<h2><span class="num">§5.2</span>事件信封</h2>
+
+<p>
+日志的原子单位是一个 <code>SessionEvent</code>。它是一个以 <code>type</code> 为判别式的联合类型，
+字段少得有点反直觉：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">packages/core/session/src/types.ts · SessionEvent（真实定义，节选）</span></div>
+<pre><code data-lang="js">export type SessionEvent&lt;T extends SessionEventType = SessionEventType&gt; = {
+  [K in SessionEventType]: {
+    type: K
+    /** Monotonic sequence number within the session. */
+    seq: number
+    /** Unix epoch milliseconds. */
+    time: number
+    data: SessionEventMap[K]
+    /** 读者不认识 type 时可以安全跳过的标记；缺省表示"必须理解" */
+    ignorable?: true
+  } &amp; (K extends SurfaceEventType ? {
+    /** 这条事件引用了哪些更早的事件作为来源 */
+    sourceEventSeqs?: number[]
+    /** 它是怎么进入 surface 的；非 surface 事件上不存在 */
+    surfaceOp?: SurfaceOp
+  } : object)
+}[T]</code></pre>
+</div>
+
+<p>逐个字段说清楚，每一个都在偿还 §5.1 的某个失败：</p>
+
+<table>
+<thead><tr><th>字段</th><th>约定</th></tr></thead>
+<tbody>
+<tr><td><code>seq</code></td><td>会话内单调递增且连续，包括原始 chunk。契约是 <code>seq === log.length</code>，所以持久化层可以逐字存储整份日志，不需要重编号。</td></tr>
+<tr><td><code>time</code></td><td>Unix 毫秒。它是元数据，不参与任何投影。</td></tr>
+<tr><td><code>data</code></td><td>必须是无损 JSON。<code>Session.append</code> 用 <code>snapshotJsonValue</code> 递归读一遍并同时拷贝，所以有状态的 getter 没法"给校验一个值、给存储另一个值"。BigInt、函数、Map、Date、稀疏数组、负零全部当场拒绝。</td></tr>
+<tr><td><code>ignorable?</code></td><td>默认是必须理解。读者遇到不认识且没有这个标记的 type，得拒绝重建整个会话，不能悄悄跳过。</td></tr>
+<tr><td><code>sourceEventSeqs?</code></td><td>只存在于三类 surface 事件上。这是 §5.1 第一伤的答案：一条消息的来源写在事件里。</td></tr>
+<tr><td><code>surfaceOp?</code></td><td>同上，只存在于 surface 事件上。它是本章的主角，§5.4 展开。</td></tr>
+</tbody>
+</table>
+
+<div class="note warn">
+  <span class="tag">为什么默认"必须理解"</span>
+  一个不认识的必需事件<em>可能改变后面整份日志的解释方式</em>。
+  比如一个新版本引入的 surface 操作：跳过它，后面所有 replace 的坐标就全错了，
+  但日志依然"parse 成功"。
+  <br>写者只在纯信息性的记录上标 <code>ignorable: true</code>。
+  忘标一次的后果是过度拒绝（麻烦），漏判一次的后果是静默恢复一个被掏空的会话（灾难）。
+  dsh 选了会麻烦的那一边。
+</div>
+
+<h3>SESSION_FORMAT_VERSION = 0，且刻意不提供兼容</h3>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">packages/core/session/src/types.ts · 版本号的真实注释（节选）</span></div>
+<pre><code data-lang="js">// While the harness is unreleased it is pinned at `0`: no compatibility is
+// implied, incompatible logs are rejected, and no migration is provided.
+//
+// The version is a single monotonic integer with no major/minor split. Whether
+// a bump is needed is decided by what the WRITER emits, never by what a newer
+// reader can accept ...
+// ("parses without error" is not correctness - silently skipping content that
+// shapes reconstruction is a wrong read.)
+export const SESSION_FORMAT_VERSION = 0</code></pre>
+</div>
+
+<p>
+这里有三个判断值得抄走。<strong>版本是一个整数，没有 major/minor</strong>：兼容性不是二维的，
+你要么能正确读，要么不能。该不该 bump 由写者决定，跟"新一点的读者能不能容忍"无关。
+够格 bump 的只有结构性变化：header 形状、事件信封、核心事件语义，以及 surface 机制本身
+（<code>SurfaceEventType</code> 集合与 <code>SurfaceOp</code> 变体）。新增一个普通事件类型不 bump，
+词汇表的增长由每条事件上的 <code>ignorable</code> 兜住。拿不准就 bump。
+一次近似恒等的升级步骤几乎免费，漏一次 bump 会让旧运行时静默读错新日志。
+</p>
+
+<h2><span class="num">§5.3</span>只有三类事件是模型可见的</h2>
+
+<p>
+这个 build 的事件词汇表里有 44 个类型
+（<code class="srcpath">known-event-types.ts</code> 里的 <code>KNOWN_SESSION_EVENT_TYPES</code>，
+由脚本从各插件的 <code>SessionEventMap</code> 声明合并生成）。能进入模型请求的只有 3 个：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">packages/core/session/src/types.ts</span></div>
+<pre><code data-lang="js">export type SurfaceEventType =
+  | 'user/message'
+  | 'assistant/message'
+  | 'tool/result'</code></pre>
+</div>
+
+<p>其余 41 个全是 log-only。挑几个容易被误认为模型可见的：</p>
+
+<table>
+<thead><tr><th>事件</th><th>为什么不给模型看</th></tr></thead>
+<tbody>
+<tr><td><code>tool/call</code></td><td>最反直觉的一个。<code>assistant/message</code> 的 content 里已经带了 <code>tool-call</code> block，模型自己产生的东西不需要再喂回去一遍。<code>tool/call</code> 存在只为了 trace 和配对校验。</td></tr>
+<tr><td><code>assistant/chunk</code></td><td>token 级重放保真度。UI 靠它复现打字机效果，模型只需要组装好的那条 <code>assistant/message</code>。</td></tr>
+<tr><td><code>turn/*</code> <code>step/*</code></td><td>边界标记。回合结构是给日志读者的，不是给模型的。</td></tr>
+<tr><td><code>todo/write</code></td><td>整份列表快照，重放时最后一次写入胜出。UI 从事件渲染，不进派生历史。</td></tr>
+<tr><td><code>plan/mode</code></td><td>log-only、非 surface、整值替换。<code>foldPlanMode</code> 折叠出当前状态，一份没有该事件的日志折叠为 inactive。</td></tr>
+<tr><td><code>request/header</code></td><td>下一次请求的完整 header 快照。最新那条就能重建请求配置，所以它不需要出现在消息里。</td></tr>
+<tr><td><code>approval/asked</code> <code>approval/decided</code></td><td>审批过程。模型看到的只有工具结果，不该看到人类怎么点的那两下。</td></tr>
+</tbody>
+</table>
+
+<div class="note vs">
+  <span class="tag">换成别的 harness</span>
+  <code>plan/mode</code> 这种状态在 dsh 里根本不经过模型：<code>foldPlanMode(events)</code>
+  取最后一条，resume、fork、压缩都从日志直接恢复。<code>todo/write</code> 的账更值得算一遍。
+  <code>todo_write</code> 是个模型可见的工具，所以调用本身在 transcript 里，
+  那是模型自己产生的东西；但它的结果只有一行
+  <code>Updated todo list: 2 pending, 1 in progress, 0 completed.</code>，
+  整份列表快照落在 log-only 的 <code>todo/write</code> 事件上，交给 UI 和重放去读。
+  <br><br>
+  换成一个以消息列表为状态的 harness，这份列表没有别的地方可待。同样改十次，
+  两边都会留下十次调用，差别在结果这一侧：dsh 给模型十行确认，全表快照走事件；
+  而列表本身必须以消息形式存在时，每次改动都把整张表再写进 transcript 一遍，
+  之后永久占位。<code>plan/mode</code> 那一类就更明显，它在 dsh 里连一次调用都不占。
+  <br><br>
+  注意这段话的前提是"以消息列表为状态"。omp 的会话不是那个形态（§5.5 有它的形态），
+  它的 todo 具体落在哪一类 entry 上我没查，所以这一段不覆盖 omp。
+</div>
+
+<p>
+所以"投影"这件事的核心规则，是一个每节点执行一次的纯函数。
+下面这段是我们的 mini 版本，逐条对着真实的 <code>deriveEventMessage</code> 写的：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh · deriveEventMessage() · 页面上运行的就是这段</span></div>
+  <pre><code id="src-derive-event" data-lang="js"></code></pre>
+</div>
+
+<div class="note">
+  <span class="tag">两个刻意为之的细节</span>
+  逐字投影，不加框。<code>user/message</code> 直接返回 <code>event.data</code>，
+  不在这里补 <code>&lt;context&gt;</code> 之类的包装。要框的人自己把框烘进 <code>content</code>
+  （<code>agent-instructions</code> 就是这么写 <code>&lt;system-reminder&gt;</code> 的）。
+  投影必须是纯粹的 pass-through，否则它就不再是"日志能重建请求"的那个函数了。
+  <br><br>
+  空内容的 <code>assistant/message</code> 返回 null。
+  一个撞上 max-tokens 的 step 会留下一条只承载 <code>usage</code> 的空消息，
+  它必须被记录（否则 token 账目丢了），但绝不能给 provider 的对话里塞一个没内容的 assistant 回合。
+</div>
+
+<p>
+下面这个 demo 是本章的第一个双栏视图。左边是完整的只追加日志，右边是
+<code>deriveMessages()</code> 的输出，也就是模型看到的东西的<em>全部</em>。
+每次点按钮都会真的往日志里追加事件，然后重新折叠一遍并重画两栏，没有任何预设内容。
+留意 log-only 的两个按钮：左栏长高，右栏一动不动。
+</p>
+
+<div class="demo" id="d-project">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 5.1</span>双栏投影：日志 → 模型视图</div>
+    <div class="spacer"></div>
+    <button class="btn primary" data-act="user">+ user/message</button>
+    <button class="btn" data-act="assistant">+ assistant + tool-call</button>
+    <button class="btn" data-act="result">+ tool/result</button>
+    <button class="btn" data-act="todo">+ todo/write</button>
+    <button class="btn" data-act="plan">+ plan/mode</button>
+    <button class="btn sm" data-act="reset">重置</button>
+  </div>
+  <div class="demo-body">
+    <div class="counts" id="c-project"></div>
+    <div class="split narrow">
+      <div class="paneside">
+        <div class="pane-label">session log · append-only · 44 类事件</div>
+        <div class="pane" id="log-project"></div>
+      </div>
+      <div class="paneside">
+        <div class="pane-label">deriveMessages() · 模型看到的全部</div>
+        <div class="pane" id="msg-project"></div>
+      </div>
+    </div>
+    <div class="out" id="out-project"></div>
+  </div>
+</div>
+
+<p>
+左栏每行的四列是：<code>seq</code>、事件类型、当前 surface 节点下标（log-only 事件这一列是空的）、
+payload 摘要。蓝色左边框标出 surface 事件。
+右栏最后一列是这条消息来自哪个 <code>seq</code>，这就是被数组结构抹掉的那条审计链。
+</p>
+
+<div class="note">
+  <span class="tag">顺便留意 role 那一列</span>
+  右栏只有 <code>user</code> 和 <code>assistant</code> 两种 role，没有 <code>tool</code>。
+  dsh 的 <code>ToolResultMessage</code> 是 <code>role: 'user'</code> 的消息，
+  内容是一个 <code>tool-result</code> block（带 <code>toolCallId</code> 做配对）。
+  橙色只是我们给它上的颜色，提示这条 user 消息的来源是工具。
+  <code>packages/llm/llm/src/message.ts</code> 里那个 <code>ToolResultMessage extends Message</code>
+  的声明就是这个意思：整个系统只有一种消息表示，role 是它的一个字段，不是三个平行的类。
+</div>
+
+<h2><span class="num">§5.4</span>surfaceOp 折叠</h2>
+
+<p>
+只有三类事件可见，那直接 <code>events.filter(e =&gt; SURFACE_TYPES.has(e.type))</code> 行不行。
+不行，因为压缩产生的摘要检查点自己也是一条 <code>user/message</code>，
+光看类型区分不出"追加到尾部"和"覆盖掉中间一段"。
+</p>
+
+<p>
+dsh 的做法是让写入方在 append 的那一刻就把意图记下来，于是重放变成一次纯折叠：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">packages/core/session/src/types.ts · SurfaceOp</span></div>
+<pre><code data-lang="js">export type SurfaceOp =
+  | 'append'
+  | { op: 'replace'; start: number; end: number }</code></pre>
+</div>
+
+<p>
+<code>start</code> 和 <code>end</code> 是 <strong>seq 值</strong>，而且必须是当前 surface 上
+真实存在的节点，两端都含。<code>start === end</code> 就是替换单个节点。
+被覆盖掉的每一个节点，都必须出现在这条事件的 <code>sourceEventSeqs</code> 里。
+</p>
+
+<p>两个把关函数，它们的错误信息就是这套契约的完整定义：</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh · 准入校验</span></div>
+  <pre><code id="src-guards" data-lang="js"></code></pre>
+</div>
+
+<p>然后折叠本身只有二十来行：</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh · foldSurface() 与 deriveMessages()</span></div>
+  <pre><code id="src-fold" data-lang="js"></code></pre>
+</div>
+
+<div class="diagram">日志（只追加，永不改写）                    surface（模型可见顺序）
+seq  2  user/message       append    ──►   [2]
+seq  6  assistant/message  append    ──►   [2, 6]
+seq  8  tool/result        append    ──►   [2, 6, 8]
+seq  9  step/end           log-only         不动
+seq 12  assistant/message  append    ──►   [2, 6, 8, 12]
+seq 40  user/message   replace 2..12  ──►   [40]      一次 splice：4 个节点变 1 个
+                                            replaceGeneration += 1
+
+deriveMessages() = nodes.map(seq =&gt; deriveEventMessage(log[seq])).filter(非 null)</div>
+
+<div class="note">
+  <span class="tag">一个容易踩的细节</span>
+  <code>nodes</code> 是 <strong>surface 顺序</strong>，不是 seq 顺序。
+  一次 replace 会把新事件那个很大的 seq 用 <code>splice</code> 塞回旧位置，
+  所以折叠之后 <code>nodes</code> 完全可能是 <code>[40, 24, 27, 29, 33]</code> 这种非单调的样子。
+  任何假设"surface 按 seq 排序"的代码都会在第一次压缩后出错。
+  <br><br>
+  <code>replaceGeneration</code> 是位置替换的计数器。真实 <code>Session.deriveMessages()</code>
+  缓存每个节点的投影结果（每个节点只投影一次，一次调用的成本是 O(新增节点)），
+  而 generation 变化就是把缓存整体推倒重建的信号：append 只会让缓存变长，replace 会让它失效。
+</div>
+
+<h2><span class="num">§5.5</span>压缩是一次追加，不是一次删除</h2>
+
+<p>
+现在可以回答 §5.1 第三伤了。dsh 的压缩事务一共五步，其中<strong>四次 append、零次删除</strong>：
+</p>
+
+<blockquote>
+1. appends <code>compaction/start</code> (log-only) — acquires the lock,<br>
+2. summarizes the range,<br>
+3. appends <code>compaction/summary</code> (log-only) with the summary, range, shadowed seqs, token count, and provider/model call envelope,<br>
+4. appends a single <code>user/message</code> with <code>surfaceOp: { op: 'replace', start, end }</code> carrying the summary — <strong>the only surface mutation in this operation</strong>,<br>
+5. appends <code>compaction/end</code> (log-only) — releases the lock.
+<br><span class="pill">packages/compaction/compaction/README.md</span>
+</blockquote>
+
+<p>
+第 4 步是整个事务里<em>唯一</em>触碰 surface 的动作，而它是一次 append。
+原始事件一条都没动，只是不再出现在派生历史里。
+顺带说一句我读了三遍才接受的地方：这对锁标记只表示"谁在压缩"，不表示"这中间不许别人写"。
+摘要还在生成的时候，一个空闲的 <code>inject()</code> 可以往日志里塞不相关的上下文，
+所以手动压缩在提交前只重新校验自己选中的那一段，不要求整个 surface 没变过；
+自动压缩因为跑在自己的 turn 里，才要求整个 surface 相等。
+</p>
+
+<h3>为什么锁的两端是两条日志事件</h3>
+
+<p>
+<code>compaction/start</code> 在摘要开始之前同步落进日志，
+<code>compaction/end</code> 是整个事务的最后一条。
+所以 surface 变更严格发生在锁内，锁绝不会在变更落地前释放。
+在这中间崩溃，留下的是一个可检测的<strong>孤儿锁</strong>：
+一条没有配对 <code>compaction/end</code> 的 <code>compaction/start</code>。
+反过来的设计（先改 surface 再记 end）会留下一条谎称"压缩完成了"的记录，而 surface 其实从未被遮蔽。
+</p>
+
+<p>
+检查点事件的 <code>sourceEventSeqs</code> 是一条完整的因果链，
+真实实现里它长这样（<code class="srcpath">compaction-basic/src/region.ts</code>）：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">packages/compaction/compaction-basic/src/region.ts · commitCompactionBody()</span></div>
+<pre><code data-lang="js">session.append('user/message', checkpointMessage, {
+  surfaceOp: { op: 'replace', start, end },
+  sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...shadowedSeqs],
+})</code></pre>
+</div>
+
+<p>
+一条引用同时指向：哪个事务干的、原始摘要文本在哪、以及被遮蔽的每一个节点。
+拿着这条检查点，你可以在任何时候把被折叠的六条消息原样翻出来做对照。
+落地的替换消息用 <code>&lt;compacted-summary&gt;</code> 标签框住已确立的检查点上下文，
+未加框的原始摘要留在 <code>compaction/summary</code> 事件上，
+后续的自动压缩周期会把上一个检查点合并进新的摘要。
+</p>
+
+<h3>切在哪：selectCompactableRange</h3>
+
+<p>
+范围选择是头部锚定的：从尾部往前累加 token，直到攒够 <code>retainTokens</code> 的"近期尾巴"，
+剩下的头部就是压缩对象。然后有一条硬约束：
+<strong>绝不切开一个 assistant 的 tool-call 和它对应的 tool/result</strong>。
+真实实现的写法是把切点往前挪，直到 <code>toolPairingBalancedBefore()</code> 成立；
+挪到 0 就返回 null，什么都不做。切开的后果是给模型一个悬空的 tool-call，
+大部分 provider 会直接报 400。
+</p>
+
+<div class="note vs">
+  <span class="tag">换成别的 harness</span>
+  这一步的分歧落在动词上：splice、移一个指针、还是 append 一条折叠指令。
+  第一类是把消息列表当状态的：Claude Code、Codex CLI、OpenCode 在模型这一层持有一个可变的
+  <code>Message[]</code>，压缩作用在那个列表上就是原地替换，换掉的回合不再出现在工作记录里。
+  它们各自落盘留不留原文，本章没测，能确认的只是模型这一层的形态。
+  Pi 的落盘格式我也没查，所以它先不进这一格。
+  <br><br>
+  omp 不在这一类里。本章原先那句"压缩是破坏性的"对它不成立，这里改过来。
+  omp 的会话物理上是一份 append-only 的 JSONL，逻辑上索引成一棵 entry 树，
+  压缩是 append 一条 <code>CompactionEntry</code>：带 <code>firstKeptEntryId</code> 这个边界指针、
+  带 <code>summary</code> 和 <code>tokensBefore</code>，磁盘上所有原始 entry 原样保留。
+  它的文档写得很直白：「Only the LLM context resets at the compaction boundary; the scrollback
+  above the divider stays intact, including across session resume.」
+  TUI 把压缩点画成一条细分隔线，上面标着 compacted 和 ctrl+o，按下去展开摘要。
+  <br><br>
+  dsh 这边是 append 一条带 <code>surfaceOp: { op: 'replace', start, end }</code> 的
+  <code>user/message</code>，原始事件留在原来的 seq 上。
+  所以"压缩不删原文"不是 dsh 一家的性质，两边都做到了。区别在机制，下面并排放一遍。
+  <br><span class="pill alt">omp://compaction.md</span>
+</div>
+
+<h3>边界指针与折叠</h3>
+
+<p>
+两种写法都只往文件尾部加东西，读法不一样。omp 重建上下文时
+（<code>buildSessionContext</code>）取活动路径上最后一条压缩 entry，把它变成一条
+<code>compactionSummary</code> 消息，然后从 <code>firstKeptEntryId</code> 一路收到压缩点，
+再接上后面的 entry。dsh 重建时把整份日志折叠一遍，每条 surface 事件按自己带的
+<code>surfaceOp</code> 决定是追加到尾部还是覆盖掉中间一段，折叠完再逐节点投影成消息。
+</p>
+
+<div class="diagram">omp · 边界指针                           dsh · surfaceOp 折叠
+
+JSONL 里的 entry 全部留在文件里          日志里的事件全部留在日志里
+append CompactionEntry                   append user/message
+  firstKeptEntryId = 4                     surfaceOp: replace 2..12
+  summary / tokensBefore                   sourceEventSeqs: [start, summary, 被遮蔽的每一个]
+
+重建 = summary + entry 4 起的连续后缀    重建 = foldSurface(整份日志) 后逐节点投影
+一次压缩一个切点                         replace 可以落在 surface 中间任意一段
+切点之前整段丢，之后整段留               nodes 因此可能非单调，例如 [40, 24, 27]</div>
+
+<p>
+后果落在两个地方。边界指针每次压缩只留一个切点，切点之前整段丢、之后整段留，
+重建出来的上下文永远是一段摘要加一条线性前缀；能出错的地方少，读日志的人不必知道折叠规则。
+折叠这一侧，<code>start</code> 与 <code>end</code> 是 surface 上两个真实存在的节点，
+所以替换可以落在中间任意一段（后面 <code>pruneToolResults()</code> 的头尾裁剪就是这么一次替换），
+而且同一份日志能被不同消费者按不同规则重算：转录稿走 <code>isAppendSurfaceEvent()</code>，
+跟模型视图不是同一次折叠。dsh 能从一份日志派生出十几个投影，出处就在这里。
+</p>
+
+<table class="vsgrid">
+<thead><tr><th></th><th>把消息列表当状态的 harness</th><th>omp · 边界指针树</th><th class="dshcol">dsh</th></tr></thead>
+<tbody>
+<tr><td>会话状态形态</td>
+  <td>可变的 <code>Message[]</code>，它自己就是状态</td>
+  <td>append-only 的 JSONL，索引成一棵 entry 树；entry 类型含 message、compaction、branch_summary、label 等</td>
+  <td class="dshcol">只追加的事件日志，44 类事件；消息列表是它的一个折叠结果</td></tr>
+<tr><td>压缩后能否取回原文</td>
+  <td><span class="n">不能</span>。替换发生在唯一那份状态上，进程里没有第二份可对照</td>
+  <td><span class="y">能</span>。压缩只是 append 一条 entry，边界之前的原始 entry 原样留在文件里</td>
+  <td class="dshcol"><span class="y">能</span>。被遮蔽的事件还在原来的 seq 上，检查点的
+    <code>sourceEventSeqs</code> 直接指过去</td></tr>
+<tr><td>压缩要不要模型调用</td>
+  <td><span class="n">未测</span></td>
+  <td><span class="y">默认不要</span>。默认策略 snapcompact 把丢弃的历史画成位图，不调模型不联网</td>
+  <td class="dshcol"><span class="p">要</span>。五步事务的第 2 步是一次摘要请求</td></tr>
+<tr><td>UI 能否精确重放</td>
+  <td><span class="p">部分</span>。列表里没有 chunk、没有被中断的 turn，界面状态得另存一份</td>
+  <td><span class="y">到 entry 粒度</span>。显示用的 transcript 按时间顺序读整条路径，
+    压缩点只是一条分隔线；是否存到 token 级 chunk 未查到</td>
+  <td class="dshcol"><span class="y">能</span>。<code>assistant/chunk</code> 留着 token 级过程，
+    转录稿走 <code>isAppendSurfaceEvent()</code>，不受 surface 遮蔽影响</td></tr>
+<tr><td>派生视图数量</td>
+  <td>模型历史一份，其余各自另建</td>
+  <td>两个：LLM 上下文与显示用 transcript，同一个 <code>buildSessionContext</code> 的两种模式</td>
+  <td class="dshcol">模型历史、转录稿，加 13 个已注册的 projection 单元
+    （todos、plan、title、token 用量、权限、子 agent 计时……）</td></tr>
+</tbody>
+</table>
+
+<p>
+第一列按架构归类，不等于对某个产品的逐项测评：这几家在模型这一层都是消息列表，
+所以落到同一格。各自具体怎么压缩、落盘留不留原文，得看各自的实现，本章没测。
+<code>flaburgan</code> 在那条 HN 线程里提的正是这件事，同模型同 prompt 的横向质量对比目前没有人做，
+本书也没有。omp 那一列不一样，它每一格都对着 omp 自己的文档写，出处在 §5.8 的清单里。
+</p>
+
+<div class="note vs">
+  <span class="tag">这一格 dsh 落后：snapcompact</span>
+  omp 的默认压缩策略不调模型。被丢弃的那段历史先序列化、压掉空白，
+  然后用内置的公版点阵字体打印到 PNG 帧上，让视觉模型当图片读回去。
+  字形和帧尺寸按当前模型的图像计费公式挑：Claude 是 8x13 字形走 11px 步进
+  （<code>11on16-bw</code>，Opus 4.7 以后的高分辨率线用 1932px 帧，压在 Anthropic 4784 视觉 token 的上限里）；
+  Gemini 是同样字形走 22px 行距、帧宽 2048px，因为 Gemini 3.x 对任意尺寸的图片都按固定 1120 token 计费；
+  GPT 和 Codex 用同一个字形但停在 1568px，它们按面积计费，帧再大换不来更多字符。
+  <br><br>
+  整条路径不碰模型，也不要 API key 和网络，所以上下文溢出恢复的时候它照样能跑。
+  条件是当前模型的 <code>model.input</code> 含 <code>"image"</code>，
+  不支持视觉就退回 context-full 并发一条警告。
+  <br><br>
+  dsh 的五步事务里第 2 步是 <code>summarizes the range</code>，一次真实的模型调用，会花钱也会写错。
+  这一格上 dsh 落后。确定性的本地渲染和一次摘要请求，成本结构不一样。
+  <br><span class="pill alt">omp://compaction.md · Snapcompact strategy</span>
+</div>
+
+<p>
+顺着这条线还有一件 dsh 没有的事：omp 的日志里可以有分支。<code>checkpoint</code>
+在当前 entry 上打一个标记，之后 <code>rewind</code> 在 turn 结束时调
+<code>branchWithSummary(checkpointEntryId, report)</code>，在标记处 append 一条
+<code>branch_summary</code> 并把 leaf 移回去。被放弃的那段探索留在同一个 JSONL 文件里，
+只是离开了活动分支：下次重建上下文时它不进模型请求，而 <code>/tree</code> 还能导航回去。
+dsh 这一侧有 fork 和 resume，一份日志内部没有分支指针，也没有树内导航。
+omp 的这对工具默认是关的（<code>checkpoint.enabled</code> 默认 <code>false</code>）。
+</p>
+
+<div class="note">
+  <span class="tag">这条边界在 dsh 自己的依赖里</span>
+  dsh 的多 provider 适配器 <code class="srcpath">packages/llm/llm-pi-ai</code> 依赖
+  <code>@earendil-works/pi-ai</code>，也就是 Pi 的模型层。<code>toPiContext(options)</code>
+  收到的 <code>options.messages</code> 正是 <code>deriveMessages()</code> 的输出，
+  它把这个数组翻译成 pi-ai 的 <code>{ systemPrompt, messages, tools }</code>。
+  翻译里有两处能说明形态差异：pi-ai 的每条消息都带 <code>timestamp</code>，
+  而 dsh 的时间长在事件上，所以适配器一律填 <code>timestamp: 0</code>；
+  pi-ai 的 <code>role: 'toolResult'</code> 要工具名，dsh 的 tool-result block 只有
+  <code>toolCallId</code>，适配器得回头扫前面的 assistant 消息把名字找回来。
+  <br><br>
+  这条线还连着 omp。omp 是 pi-mono 的下游 fork，上游同步锚点是 2026-03-22 的 commit
+  <code>b21b42d</code>，包 scope 从 <code>@mariozechner/pi-*</code> 映射成
+  <code>@oh-my-pi/pi-*</code>。模型层这一块，dsh、omp、Pi 三家同源。
+</div>
+
+<p>
+下面是本章的核心 demo。日志里已经有一段两个 turn、36 条事件、10 个 surface 节点的会话，
+形状是照真实日志排的。点"压缩"会分五步执行上面那个事务，每一步都真的 append 并重新折叠。
+</p>
+
+<div id="p-compact"></div>
+
+<div class="demo" id="d-compact">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 5.2</span>压缩折叠：右栏塌缩，左栏变长</div>
+    <div class="spacer"></div>
+    <button class="btn primary" data-act="run">压缩（保留最近 4 个节点）</button>
+    <button class="btn" data-act="naive">破坏式压缩对照</button>
+    <button class="btn" data-act="derive">打印 deriveMessages()</button>
+    <button class="btn" data-act="filter">只看 surface 事件</button>
+    <button class="btn sm" data-act="reset">重置日志</button>
+  </div>
+  <div class="demo-body">
+    <div class="counts" id="c-compact"></div>
+    <div class="split narrow">
+      <div class="paneside">
+        <div class="pane-label">session log · 只会变长</div>
+        <div class="pane" id="log-compact"></div>
+      </div>
+      <div class="paneside">
+        <div class="pane-label">deriveMessages() · 会塌缩</div>
+        <div class="pane" id="msg-compact"></div>
+      </div>
+    </div>
+    <div class="out" id="out-compact"></div>
+  </div>
+</div>
+
+<p>
+跑完之后左栏里那六行是划掉的橙色，边上写着"被 seq N 遮蔽"。它们还在日志里，字节一个没少。
+右栏从 10 条消息变成 5 条，第一条是检查点，下面挂着一行
+<code>[已折叠 6 个 surface node · 原始事件仍在 seq 2-19]</code>。
+然后点"破坏式压缩对照"。它在同一份种子日志上跑两遍，一遍 <code>history.splice()</code>，
+一遍 surfaceOp，两边给模型的视图完全一样，然后从两边各取一次原文。一边取到了，一边没有。
+</p>
+
+<div class="note good">
+  <span class="tag">顺手得到的能力</span>
+  给人看的对话记录不能从 surface 读，因为 surface 会遮蔽用户已经看过的对话。
+  dsh 为此导出了 <code>isAppendSurfaceEvent()</code>：只认那些"在自己的日志位置上追加进
+  surface、自身从来不是替换副本"的事件。真实代码里用它的地方不止 UI，
+  <code class="srcpath">client/ui-conversation</code> 用它渲染对话节点，
+  <code class="srcpath">host/apiproxy</code> 用它对外提供历史，
+  <code class="srcpath">feedback/message-feedback</code> 用它定位可以打分的 assistant 消息。
+  这几个消费者读同一份日志，折叠规则各自不同。
+</div>
+
+<h3>工具结果裁剪：不需要模型的那种压缩</h3>
+
+<p>
+在摘要压缩之前，还有一层更便宜的：
+<code class="srcpath">packages/compaction/compaction-tool-result-pruner/</code>。
+它是确定性的、不调模型的，只做一件事：把超预算的工具结果换成
+<strong>头部 + 标记 + 尾部</strong>。默认预算是：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">compaction-tool-result-pruner/src/config.ts</span></div>
+<pre><code data-lang="js">export const PRUNE_MARKER = '\n\n[... tool result middle pruned ...]\n\n'
+
+export const DEFAULTS: ResolvedConfig = deepFreeze({
+  thresholdChars: 8192,
+  headChars: 4096,
+  tailChars: 1024,
+})
+// 配置校验保证 headChars + marker + tailChars &lt;= thresholdChars，
+// 否则"裁剪"可能反而变长。</code></pre>
+</div>
+
+<p>三个不显眼但重要的实现选择：</p>
+
+<ul>
+  <li>按 Unicode code point 切，不按 UTF-16 code unit。用 <code>Array.from(text)</code>
+      取代 <code>text.slice()</code>，所以保留边界不会劈开一个代理对。
+      源码里明说了 grapheme cluster 仍然可能被切开，这是写下来的已知取舍。</li>
+  <li>replace 只允许改 content。<code>assertToolResultRewrite</code> 把原事件和替换事件的
+      content 都置空，然后做结构化深比较：<code>callId</code>、<code>isError</code>、
+      <code>meta</code> 只要有一处不同就拒绝。裁剪不能顺手改掉工具结果的身份。</li>
+  <li><strong>影子定价协议。</strong>每个替换前面紧挨着一条 <code>compaction/prune</code>，
+      记下被遮蔽节点的 token 估价，这样纯函数式的消费者可以直接做减法，不必自己维护每节点状态。</li>
+</ul>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh · pruneBlocks() 与 pruneToolResults()</span></div>
+  <pre><code id="src-prune" data-lang="js"></code></pre>
+</div>
+
+<p>
+下面这个 demo 里预算被缩小了 13 倍（<code>600 / 320 / 120</code>）以便肉眼可见，逻辑与真实实现一致。
+点"裁剪"后看右栏的字符数掉下来，然后点"读出被遮蔽的原文"，
+从日志里把完整原文原样打出来：证明它真的还在。
+</p>
+
+<div class="demo" id="d-prune">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 5.3</span>工具结果裁剪：头部 + 标记 + 尾部</div>
+    <div class="spacer"></div>
+    <button class="btn primary" data-act="run">裁剪超预算的 tool/result</button>
+    <button class="btn" data-act="original">读出被遮蔽的原文</button>
+    <button class="btn sm" data-act="reset">重置日志</button>
+  </div>
+  <div class="demo-body">
+    <div class="counts" id="c-prune"></div>
+    <div class="split narrow">
+      <div class="paneside">
+        <div class="pane-label">session log · 原文一直在</div>
+        <div class="pane" id="log-prune"></div>
+      </div>
+      <div class="paneside">
+        <div class="pane-label">deriveMessages() · 字符数骤降</div>
+        <div class="pane" id="msg-prune"></div>
+      </div>
+    </div>
+    <div class="out" id="out-prune"></div>
+  </div>
+</div>
+
+<h2><span class="num">§5.6</span>铁律：Model-visible ⟺ logged</h2>
+
+<blockquote>
+<strong>Model-visible means logged.</strong> Anything that reaches a model request must be
+reconstructable from the log, and a runtime invariant asserts it. This is why a new
+model-visible input requires a new session event: extend <code>SessionEventMap</code> and
+render from the log.
+<br><span class="pill">docs/architecture.md · Session log</span>
+</blockquote>
+
+<p>
+这条规则有运行时断言撑着。
+<code class="srcpath">packages/core/agent-loop/src/invariant.ts</code> 往
+<code>llm/stream</code> 这个瀑布事件上挂了一个 listener，把每一个由 loop 构造的请求
+和当时的日志对一遍：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">packages/core/agent-loop/src/invariant.ts · 真实实现（节选）</span></div>
+<pre><code data-lang="js">// Prepend prevents a short-circuiting replay listener from silencing the check.
+ctx.on('llm/stream', (options: GenerateOptions, next) =&gt; {
+  if (!isAgentLoopRequest(options)) return next()
+  if (!Object.isFrozen(options)) fail('a loop-built request must be frozen')
+  if (options.sessionId === undefined) fail('a loop-built request must carry a session id')
+  const session = ctx.sessions.get(options.sessionId)
+  if (!Object.isFrozen(options.messages)) {
+    fail('a loop-built request must carry a frozen messages array')
+  }
+
+  const events = session.events
+  if (!events.some(event =&gt; event.type === 'step/start')) {
+    return fail('a loop-built request with no step/start in its session log')
+  }
+  const header = foldRequestHeader(events)
+  if (header === undefined) {
+    return fail('a loop-built request with no request/header event in its session log')
+  }
+  const expected = session.deriveMessages()
+  if (JSON.stringify(options.messages) !== JSON.stringify(expected)) {
+    fail(`llm request for session "..." diverges from the dispatch-time durable
+          derivation (log-reconstruction desync)`)
+  }
+  // ... 再比一遍 model / system / temperature / maxTokens / stop / tools
+  return next()
+}, { global: true, prepend: true })</code></pre>
+</div>
+
+<p>
+注意那个 <code>prepend: true</code>。瀑布事件的 listener 可以不调 <code>next()</code> 直接短路整条链
+（第 4 章的内容），所以校验必须挂在最前面，否则一个重放 listener 就能让不变量哑掉。
+</p>
+
+<p>它带来的直接后果，是一条对日常开发很有约束力的规则：</p>
+
+<div class="note warn">
+  <span class="tag">每一个新的模型可见输入，都必须先有一个 session event</span>
+  想给模型看一段 skill 内容、一条文件变更通知、一份子目录的 AGENTS.md、
+  一个子 agent 的回报、一次 cron 通知？
+  <strong>不能在组装请求的时候临时拼一段字符串进去。</strong>
+  正确路径是：扩展 <code>SessionEventMap</code>，append 一条事件，然后让请求从日志渲染出来。
+  这也解释了为什么 <code>user/message</code> 的 payload 带一个 <code>source</code> 字段：
+  真人提示、<code>agent.inject()</code> 的合成上下文、目标续跑，三者的 <code>content</code>
+  都逐字投影，靠 <code>source</code> 区分。
+</div>
+
+<p>反方向同样成立，而且同样重要：</p>
+
+<blockquote>
+The web layer is pure presentation. Nothing that is "how to draw" (tool-card views, queue
+states) enters the session log; the host computes such data per frame or pushes it live,
+and replay recomputes it.
+<br><span class="pill">packages/client/AGENTS.md</span>
+</blockquote>
+
+<p>
+这个等价关系两边都不能松。左边松了，请求里会出现查不到来源的内容。
+右边松了，日志会被 UI 状态污染，最后长成一个没人敢改的东西。
+</p>
+
+<div class="note warn">
+  <span class="tag">代价，一并写清</span>
+  只追加的日志不是免费的，四笔账。
+  <br><br>
+  第一笔是字节。<code>assistant/chunk</code> 的量最大，所以默认后端
+  <code class="srcpath">session-persistence-jsonl</code> 的 <code>DEFAULT_COMPRESSION</code>
+  直接是 <code>'zstd'</code>。我第一次跑 dsh 就死在这上面：<code>npx</code> 拿到了 Homebrew 的
+  Node v23.6.0，那个版本没有 <code>zlib.createZstdDecompress</code>，
+  <code class="srcpath">zstd-private-decoder.ts</code> 在顶层 import 就抛 SyntaxError，
+  栈埋在插件加载器里，看上去像是 dsh 自己写错了语法。发布的包没有声明 <code>engines</code>，
+  npm 一句提示都没给。换到 Node v25.8.1 之后 474ms 启动。
+  <br><br>
+  第二笔是手续费。想让模型多看一段内容，你得先加一个事件类型：改 <code>SessionEventMap</code>，
+  可能还要配一个 invariant 和一个 projection。这条路堵得很死，是设计意图，
+  也是每次都要付的成本。
+  <br><br>
+  第三笔是词汇表。44 个类型里凡是没标 <code>ignorable</code> 的都是"必须理解"，
+  读者遇到不认识的就拒绝整个会话，
+  而词汇表由插件扩展，这个数字只会涨。<code>SESSION_FORMAT_VERSION</code> 还钉在 0，
+  不兼容的日志直接拒绝，不提供迁移。
+  <br><br>
+  第四笔是断言的强制力，它取决于组装。上面那段检查没有内建在 loop 里，
+  它是 <code>@deepseek-ai/dsh-agent-loop/invariant</code> 这个 companion 插件，
+  由 <code>ctx.invariants</code> 注册（服务默认 <code>enabled: true</code>）。
+  组装方不加载它，或者往 <code>package_blocklist</code> 里写一条正则，检查就消失，
+  而请求照样发得出去。
+</div>
+
+<p>下面这个 demo 把不变量本身跑起来，包括让它失败：</p>
+
+<div class="demo" id="d-invariant">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 5.4</span>不变量：请求必须能从日志重建</div>
+    <div class="spacer"></div>
+    <button class="btn primary" data-act="run">正常请求</button>
+    <button class="btn" data-act="smuggle">插件偷塞一条未记录的消息</button>
+    <button class="btn" data-act="mutate">压缩后重新派生</button>
+  </div>
+  <div class="demo-body">
+    <div class="out" id="out-invariant"></div>
+  </div>
+</div>
+
+<h2><span class="num">§5.7</span>本章的产物</h2>
+
+<p>
+mini-dsh v0.5 的核心是一个只有 <code>append</code> 一个写方法的对象。
+所有校验都堆在 append 处，理由和真实实现一样：日志是持久的事实来源，
+坏事件得在写入点就炸，不能等到某个后端 flush 的时候才发现。
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh v0.5 · createSessionLog()</span></div>
+  <pre><code id="src-log" data-lang="js"></code></pre>
+</div>
+
+<p>本章造出来的全部东西，以及它们分别对应 §5.1 的哪一伤：</p>
+
+<table>
+<thead><tr><th>函数</th><th>作用</th><th>偿还</th></tr></thead>
+<tbody>
+<tr><td><code>createSessionLog()</code></td><td>只追加日志，append 处做全部准入校验</td><td>三伤全部</td></tr>
+<tr><td><code>deriveEventMessage()</code></td><td>单事件 → 消息，或 null</td><td>UI 重放</td></tr>
+<tr><td><code>foldSurface()</code></td><td>重放 surfaceOp，算出当前 surface 与替换史</td><td>压缩摧毁证据</td></tr>
+<tr><td><code>deriveMessages()</code></td><td>surface → 模型消息数组</td><td>请求可重建</td></tr>
+<tr><td><code>compactSurfaceRegion()</code></td><td>五次 append 的压缩事务</td><td>压缩摧毁证据</td></tr>
+<tr><td><code>pruneToolResults()</code></td><td>确定性的头尾裁剪 + 影子定价</td><td>压缩摧毁证据</td></tr>
+<tr><td><code>assertRequestReconstructable()</code></td><td>铁律的运行时断言</td><td>审计链丢失</td></tr>
+</tbody>
+</table>
+
+<div class="note good">
+  <span class="tag">下一章预告</span>
+  现在谁拿到 <code>log</code> 都能直接写 <code>tool/result</code>：没有权限、没有审批、没有并发模型。
+  第 6 章把工具执行做成一条流水线，<code>tool/call</code> 和 <code>tool/result</code>
+  只能由 <code>ctx.tools.execute()</code> 产生；同时 <code>SessionLog</code> 会从一个裸对象
+  变成 <code>ctx.sessions</code> 这个 Service，从而拿到 Service Definition / Provider / Consumer
+  这套能力接缝：换一个 provider，bash、PTY、LSP 一起换到远端沙箱里去。
+</div>
+
+<h2><span class="num">§5.8</span>回到真实的 dsh</h2>
+
+<p>真实实现的对应签名，逐个对照我们写的东西：</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">packages/core/session/src/index.ts · Session（真实签名，节选）</span></div>
+<pre><code data-lang="js">class Session {
+  /** 下一条事件的 seq，永远等于日志长度（seq = log.length 契约） */
+  get seq(): number
+
+  /** 冻结的日志快照；surface 事件必须带 SurfaceIntent，非 surface 事件带了编译不过 */
+  append&lt;T extends SessionEventType&gt;(
+    type: T,
+    data: SessionEventMap[T],
+    ...opts: T extends SurfaceEventType ? [opts: SurfaceIntent] : []
+  ): SessionEvent&lt;T&gt;
+
+  /** 增量维护的有序 surface 视图：nodes + replaceGeneration */
+  readonly surface: SessionSurface
+
+  /** 每个节点只投影一次；generation 变化则整体重建 */
+  deriveMessages(): Message[]
+
+  /** 最新 request/header 折叠出的请求配置 */
+  requestHeader(): EpochHeader | undefined
+
+  /** 构造 seed 结束的位置：这个位置之前的事件来自 resume / fork / replay */
+  readonly firstLiveSeq: number
+}</code></pre>
+</div>
+
+<p>几个真实实现里存在、我们刻意省掉的东西：</p>
+
+<ul>
+  <li><code>SurfaceManager.validateNext(event)</code> 是增量校验。我们的 <code>append</code>
+      每次把整份日志重折一遍（O(n²)，40 条事件无所谓）；真实实现先在不改状态的前提下
+      把这次转换"计划"出来（<code>planSurfaceEvent</code>），验证通过再原子提交
+      （<code>applySurfacePlan</code>）。一条坏事件因此留不下半个状态。</li>
+  <li><code>deriveMessages()</code> 返回的数组每次都是新的，后来的 append 不会长进调用方
+      已经持有的那个数组。但里面的 <code>Message</code> 对象是共享且深冻结的，
+      它们复用日志里已经冻结的 event data，所以缓存不必做第二次深拷贝，
+      消费者也改不动日志。</li>
+  <li><code class="srcpath">chunk-rows.ts</code> 的 <code>packChunkRuns</code> 把连续的
+      <code>assistant/chunk</code> 打包成行，因为它是数量最大的事件类型。
+      打包之后 <code>seq</code> 的连续性契约保持不变。</li>
+  <li><code class="srcpath">repair.ts</code> 的 <code>interruptedTurnClosers</code>
+      为进程崩溃时没关掉的 turn 合成缺失的 <code>step/end</code> 与 <code>turn/end</code>，
+      并用 <code>TOOL_NOT_STARTED</code> / <code>TOOL_OUTCOME_UNKNOWN</code>
+      补上没有结果的工具调用。顺序有讲究：step 的边界必须在 turn 的边界之前合成。</li>
+  <li><code>@deepseek-ai/dsh-session/invariant</code> 才检查 seq 单调、turn/step 闭合、
+      同 step 内 tool call/result 配对，加载时会重放已有会话。存储校验、快照、冻结、
+      被引用的源事件校验和 surface 准入，是根包永远开启的责任。
+      每个插件自己拥有它 merge 进来的事件的关系不变量：<code>todo/write</code> 的校验在
+      <code class="srcpath">tool-todo/src/invariant.ts</code>，<code>plan/mode</code> 的在
+      <code class="srcpath">plan-mode/src/invariant.ts</code>。</li>
+  <li>surface 之外还有 projection。todo 列表、plan 状态这类 UI 状态是从日志<em>另外</em>
+      折叠出来的单元（<code>ctx.sessionProjections</code>）：todo 的规则是"最新一次整表写入，
+      被下一个 <code>turn/start</code> 清空"，plan 的是"最后一条 <code>plan/mode</code> 胜出"。
+      这个 build 里一共注册了 13 个这样的单元，同一份日志，互不干扰。</li>
+</ul>
+
+<div class="note src">
+  <span class="tag">自己去读</span>
+  <code class="srcpath">packages/core/session/src/types.ts</code> — <code>SessionEvent</code> 信封、<code>SessionEventMap</code> 事件目录、<code>SurfaceOp</code>、<code>SESSION_FORMAT_VERSION</code><br>
+  <code class="srcpath">packages/core/session/src/surface.ts</code> — <code>foldSurface</code>、<code>deriveEventMessage</code>、<code>SurfaceManager</code>、四个类型守卫<br>
+  <code class="srcpath">packages/core/session/src/index.ts</code> — <code>Session.append</code>、<code>deriveMessages</code>、<code>requestHeader</code><br>
+  <code class="srcpath">packages/core/session/src/known-event-types.ts</code> — 全部 44 个事件类型的生成目录<br>
+  <code class="srcpath">packages/core/session/src/repair.ts</code> — 中断会话的边界合成<br>
+  <code class="srcpath">packages/core/agent-loop/src/invariant.ts</code> — "模型可见即已记录"的运行时断言<br>
+  <code class="srcpath">packages/compaction/compaction/README.md</code> — 五步压缩事务与日志锁<br>
+  <code class="srcpath">packages/compaction/compaction-basic/src/region.ts</code> — <code>selectCompactableRange</code>、<code>commitCompactionBody</code><br>
+  <code class="srcpath">packages/compaction/compaction-tool-result-pruner/src/</code> — 确定性裁剪与影子定价<br>
+  <code class="srcpath">docs/architecture.md</code> 的 "Session log" 一节 — 两段官方原话都在这里
+  <br><br>omp 侧对照着读两篇（内部 <code>omp://</code> 文档）：
+  <code class="srcpath">omp://compaction.md</code>（边界指针、五种压缩策略、snapcompact 的字形表）、
+  <code class="srcpath">omp://tools/rewind.md</code>（<code>branchWithSummary</code> 的落盘细节）
+</div>
+
+</main>
+<aside id="dsh-toc"></aside>
+</div>
+
+<script>
+'use strict';
+
+// ===================================================================
+// mini-dsh v0.5 · 会话日志
+// 页面上所有 demo 跑的都是这一份实现，下面几个 showSource 打印的也是它。
+// ===================================================================
+
+var SESSION_FORMAT_VERSION = 0;
+
+// 44 个事件类型里，只有这三个能进入模型请求。
+var SURFACE_EVENT_TYPES = ['user/message', 'assistant/message', 'tool/result'];
+
+function isSurfaceEligibleType(type) {
+  return SURFACE_EVENT_TYPES.indexOf(type) >= 0;
+}
+
+// -------------------------------------------------------------------
+// 准入校验：两个把关函数，错误信息就是契约本身
+// -------------------------------------------------------------------
+
+function surfaceOpOf(event) {
+  if (!isSurfaceEligibleType(event.type)) {
+    // log-only 事件带 surface 元数据是结构性错误，不是"忽略掉就行"
+    if (event.surfaceOp !== undefined) {
+      throw new Error(event.type + ' 不是 surface-eligible，不能携带 surfaceOp');
+    }
+    if (event.sourceEventSeqs !== undefined) {
+      throw new Error(event.type + ' 不是 surface-eligible，不能携带 sourceEventSeqs');
+    }
+    return undefined;                       // 对 surface 没有任何影响
+  }
+  if (event.surfaceOp === undefined) {
+    throw new Error(event.type + ' 是 surface-eligible，必须声明 surfaceOp');
+  }
+  return event.surfaceOp;
+}
+
+function assertProvenance(event, shadowedSeqs) {
+  var cited = event.sourceEventSeqs;
+  var sources = {};
+  if (cited !== undefined) {
+    if (!Array.isArray(cited)) throw new Error('sourceEventSeqs 必须是数组');
+    if (cited.length === 0 && event.type !== 'assistant/message') {
+      throw new Error('只有 assistant/message 允许空的 sourceEventSeqs（provider 返回了空流）');
+    }
+    cited.forEach(function (seq) {
+      if (sources[seq]) throw new Error('sourceEventSeqs 不能有重复：' + seq);
+      if (seq >= event.seq) {
+        throw new Error('sourceEventSeqs 只能引用更早的事件：' + seq + ' >= ' + event.seq);
+      }
+      sources[seq] = true;
+    });
+  }
+  // replace 的铁则：被遮蔽的每一个节点都必须被引用，否则来源链会断
+  var missing = shadowedSeqs.filter(function (seq) { return !sources[seq]; });
+  if (missing.length) {
+    throw new Error('replace 必须引用每一个被遮蔽的节点，缺少：' + missing.join(', '));
+  }
+}
+
+function assertToolResultRewrite(event, shadowedSeqs, events) {
+  if (event.type !== 'tool/result') return;
+  if (shadowedSeqs.length !== 1) {
+    throw new Error('tool/result 的 replace 只能改写当前的一个节点');
+  }
+  var original = events[shadowedSeqs[0]];
+  if (!original || original.type !== 'tool/result') {
+    throw new Error('tool/result 的 replace 只能指向一个当前的 tool/result');
+  }
+  // 除 content 之外的一切必须逐字相同：裁剪不能顺手改掉结果的身份
+  // （真实实现用 isDeepEqualJson 做结构化深比较，不依赖键顺序）
+  if (contentBlanked(original.data) !== contentBlanked(event.data)) {
+    throw new Error('tool/result 的 replace 只允许改动 content');
+  }
+}
+
+function contentBlanked(data) {
+  var block = data.message.content[0];
+  return JSON.stringify(Object.assign({}, data, {
+    message: Object.assign({}, data.message, {
+      content: [Object.assign({}, block, { content: null })]
+    })
+  }));
+}
+
+// -------------------------------------------------------------------
+// 单事件投影：这是"模型能看到什么"的唯一规则
+// -------------------------------------------------------------------
+
+function deriveEventMessage(event) {
+  switch (event.type) {
+    // 真人提示、inject 的合成上下文、目标续跑，三者都逐字投影，靠 source 区分。
+    // 不在这里补 <context> 之类的框：要框的人自己把框烘进 content。
+    case 'user/message':
+      return event.data;
+
+    case 'assistant/message':
+      // 空内容的那条只承载 max-tokens step 的 usage，
+      // 绝不能给 provider 塞一个没内容的 assistant 回合。
+      if (event.data.message.content.length === 0) return null;
+      return event.data.message;
+
+    case 'tool/result':
+      return event.data.message;
+
+    default:
+      // turn/* step/* assistant/chunk tool/call todo/write plan/mode
+      // request/header approval/* compaction/* ... 全部投影为无消息。
+      // 词汇表可以被插件扩展，所以这里不做穷尽性检查。
+      return null;
+  }
+}
+
+// -------------------------------------------------------------------
+// 折叠：把日志里的 surfaceOp 重放成当前的模型可见顺序
+// -------------------------------------------------------------------
+
+function foldSurface(events) {
+  var nodes = [];                 // 当前 surface：一串 seq，按模型可见顺序（不是 seq 顺序）
+  var replacements = [];          // 替换史，按事件顺序
+  var replaceGeneration = 0;      // 位置替换的计数器，派生缓存靠它失效
+
+  events.forEach(function (event, index) {
+    if (event.seq !== index) {
+      throw new Error('seq 不连续：' + event.seq + '，期望 ' + index);
+    }
+    var op = surfaceOpOf(event);
+    if (op === undefined) return;                       // log-only：surface 不动
+
+    if (op === 'append') {
+      assertProvenance(event, []);
+      nodes.push(event.seq);
+      return;
+    }
+
+    // replace：两端必须是当前 surface 上真实存在的节点，两端都含
+    var startIdx = nodes.indexOf(op.start);
+    if (startIdx === -1) throw new Error('replace 的 start seq ' + op.start + ' 不在当前 surface 上');
+    var endIdx = nodes.indexOf(op.end);
+    if (endIdx === -1) throw new Error('replace 的 end seq ' + op.end + ' 不在当前 surface 上');
+    if (startIdx > endIdx) throw new Error('replace 的 start 在 end 之后');
+
+    var shadowedSeqs = nodes.slice(startIdx, endIdx + 1);
+    assertProvenance(event, shadowedSeqs);
+    assertToolResultRewrite(event, shadowedSeqs, events);
+
+    // 唯一的"删除"动作，而且删的是投影里的位置，不是日志里的字节
+    nodes.splice(startIdx, endIdx - startIdx + 1, event.seq);
+    replaceGeneration += 1;
+    replacements.push({ seq: event.seq, start: op.start, end: op.end, shadowedSeqs: shadowedSeqs });
+  });
+
+  return { nodes: nodes, replacements: replacements, replaceGeneration: replaceGeneration };
+}
+
+function deriveMessages(events) {
+  var messages = [];
+  foldSurface(events).nodes.forEach(function (seq) {
+    var message = deriveEventMessage(events[seq]);
+    if (message) messages.push(message);          // 空内容的 assistant/message 在这里被丢掉
+  });
+  return messages;
+}
+
+// -------------------------------------------------------------------
+// 日志本体：只有 append 一个写方法
+// -------------------------------------------------------------------
+
+function createSessionLog() {
+  var log = [];
+  var TIME_BASE = 1770000000000;
+
+  return {
+    version: SESSION_FORMAT_VERSION,
+    events: log,
+    // seq = log.length 是契约，持久化层因此可以逐字存储整份日志
+    get seq() { return log.length; },
+
+    append: function (type, data, intent) {
+      var eligible = isSurfaceEligibleType(type);
+      if (eligible && !intent) throw new Error(type + ' 必须声明 surfaceOp');
+      if (!eligible && intent) throw new Error(type + ' 不能携带 surfaceOp');
+
+      // 快照 + 冻结：调用方之后改自己那个对象，日志不受影响；
+      // 反过来消费者也改不动日志。真实实现用 snapshotJsonValue 一次递归
+      // 完成"校验 + 拷贝"，所以有状态的 getter 骗不了它。
+      var snapshot = JSON.parse(JSON.stringify(data));
+      if (snapshot === undefined) throw new Error(type + ' 的 data 不是无损 JSON');
+
+      var event = Object.freeze(Object.assign({
+        type: type,
+        seq: log.length,
+        time: TIME_BASE + log.length * 1000,
+        data: snapshot
+      }, intent || {}));
+
+      // 先验证再入库：坏事件在 append 处就炸，不会拖到某个后端 flush 的时候。
+      // （真实实现是 SurfaceManager.validateNext()，只验证这一条新事件；
+      //   这里为了短，整份重放一遍。）
+      foldSurface(log.concat([event]));
+
+      log.push(event);
+      return event;
+    }
+  };
+}
+
+// -------------------------------------------------------------------
+// 压缩：五次 append，零次删除
+// -------------------------------------------------------------------
+
+function selectCompactableRange(events, keepNodes) {
+  // 真实实现按 token 预算从尾部往前累加；这里按节点数，结构一样：
+  // 先定住要保留的近期尾巴，再把切点往前挪到一个不切开 tool 配对的位置。
+  var nodes = foldSurface(events).nodes;
+  var keepFrom = Math.max(0, nodes.length - keepNodes);
+  while (keepFrom > 0 && !toolPairingBalancedBefore(events, nodes, keepFrom)) keepFrom -= 1;
+  if (keepFrom === 0) return null;                   // 没有可压缩的头部，什么都不写
+  return { start: nodes[0], end: nodes[keepFrom - 1] };
+}
+
+function toolPairingBalancedBefore(events, nodes, idx) {
+  // 切点之前的每个 tool-call 都必须已经有对应的 tool/result，
+  // 否则模型会收到一个悬空调用，多数 provider 直接 400。
+  var owed = {};
+  nodes.slice(0, idx).forEach(function (seq) {
+    var event = events[seq];
+    if (event.type === 'assistant/message') {
+      event.data.message.content.forEach(function (block) {
+        if (block.type === 'tool-call') owed[block.id] = true;
+      });
+    } else if (event.type === 'tool/result') {
+      delete owed[event.data.message.content[0].toolCallId];
+    }
+  });
+  return Object.keys(owed).length === 0;
+}
+
+async function compactSurfaceRegion(log, range, summarize, onStep) {
+  var id = 'c-' + log.seq;
+
+  // 1. compaction/start 在摘要开始前同步落地：它就是那把持久锁
+  var startEvent = log.append('compaction/start', { compactionId: id, turn: null });
+  await onStep('compaction/start', startEvent, '获取压缩锁');
+
+  // 2. 摘要。真实实现在这里发一次 llm/stream，逐字重放系统提示词、工具
+  //    和被遮蔽区域的消息，所以它复用 provider 的热前缀 cache。
+  var fold = foldSurface(log.events);
+  var from = fold.nodes.indexOf(range.start);
+  var to = fold.nodes.indexOf(range.end);
+  var shadowedSeqs = fold.nodes.slice(from, to + 1);
+  var regionMessages = shadowedSeqs
+    .map(function (seq) { return deriveEventMessage(log.events[seq]); })
+    .filter(function (m) { return m !== null; });
+  var summary = await summarize(regionMessages);
+
+  // 3. compaction/summary：原始摘要文本留在这里，仅日志，没有 surfaceOp
+  var summaryEvent = log.append('compaction/summary', {
+    compactionId: id,
+    summary: summary,
+    shadowedRange: { start: range.start, end: range.end },
+    shadowedSeqs: shadowedSeqs,
+    shadowedTokenCount: estimateTokens(regionMessages)
+  });
+  await onStep('compaction/summary', summaryEvent, '摘要落库，surface 还没动');
+
+  // 4. 整个事务里唯一的 surface 变更，而它是一次 append
+  var checkpoint = log.append('user/message', {
+    role: 'user',
+    content: [{ type: 'text', text: '<compacted-summary>\n' + summary + '\n</compacted-summary>' }],
+    source: { kind: 'compaction-checkpoint', compactionId: id }
+  }, {
+    surfaceOp: { op: 'replace', start: range.start, end: range.end },
+    sourceEventSeqs: [startEvent.seq, summaryEvent.seq].concat(shadowedSeqs)
+  });
+  await onStep('user/message', checkpoint, '替换落地：右栏塌缩');
+
+  // 5. compaction/end 是最后一条，所以锁绝不会在变更落地前释放。
+  //    崩在这中间留下的是可检测的孤儿锁；反过来的顺序会留下一条谎称完成的记录。
+  var endEvent = log.append('compaction/end', { compactionId: id, turn: null });
+  await onStep('compaction/end', endEvent, '释放压缩锁');
+
+  return {
+    compactionId: id, startSeq: startEvent.seq, summarySeq: summaryEvent.seq,
+    checkpointSeq: checkpoint.seq, endSeq: endEvent.seq, shadowedSeqs: shadowedSeqs
+  };
+}
+
+// -------------------------------------------------------------------
+// 工具结果裁剪：确定性、不调模型
+// -------------------------------------------------------------------
+
+var PRUNE_MARKER = '\n\n[... tool result middle pruned ...]\n\n';
+
+function measureBlocks(blocks) {
+  return blocks.reduce(function (n, b) {
+    // 非文本块（图片等）不计费也不裁剪
+    return n + (b.type === 'text' ? Array.from(b.text).length : 0);
+  }, 0);
+}
+
+function pruneBlocks(blocks, budget) {
+  var total = measureBlocks(blocks);
+  if (total <= budget.thresholdChars) return null;      // 在预算内：不写任何东西
+
+  var removedStart = budget.headChars;
+  var removedEnd = total - budget.tailChars;
+  var out = [], consumed = 0, markerInserted = false;
+
+  blocks.forEach(function (block) {
+    if (block.type !== 'text') { out.push(block); return; }   // 富块原样保留，顺序不变
+
+    // 按 Unicode code point 切，不按 UTF-16 code unit：保留边界不会劈开代理对
+    // （grapheme cluster 仍可能被切开，这是写在源码里的已知取舍）
+    var points = Array.from(block.text);
+    var blockStart = consumed, blockEnd = blockStart + points.length;
+    var headEnd = Math.min(points.length, Math.max(0, removedStart - blockStart));
+    var tailStart = Math.min(points.length, Math.max(0, removedEnd - blockStart));
+    var hits = blockStart < removedEnd && blockEnd > removedStart;
+    var marker = hits && !markerInserted ? PRUNE_MARKER : '';
+    if (marker) markerInserted = true;
+
+    var text = points.slice(0, headEnd).join('') + marker + points.slice(tailStart).join('');
+    if (text.length) out.push({ type: 'text', text: text });
+    consumed = blockEnd;
+  });
+
+  if (!markerInserted) throw new Error('裁剪失败：没有定位到要删掉的那一段');
+  var after = measureBlocks(out);
+  if (after > budget.thresholdChars || after >= total) {
+    throw new Error('裁剪结果必须更小且在预算内');
+  }
+  return out;
+}
+
+function pruneToolResults(log, budget) {
+  var pruned = [], charsRemoved = 0;
+
+  // 先对当前 surface 拍一张快照，再在快照上逐个替换
+  foldSurface(log.events).nodes.forEach(function (seq) {
+    var event = log.events[seq];
+    if (event.type !== 'tool/result') return;
+    var block = event.data.message.content[0];
+    var content = pruneBlocks(block.content, budget);
+    if (content === null) return;
+
+    var before = measureBlocks(block.content);
+    var after = measureBlocks(content);
+
+    // 影子定价协议：定价事件与它的替换同步紧邻追加，
+    // 纯函数式的消费者因此可以直接做减法，不必维护每节点状态。
+    log.append('compaction/prune', {
+      shadowedRange: { start: seq, end: seq },
+      shadowedSeqs: [seq],
+      shadowedTokenCount: Math.ceil(before / 4)
+    });
+
+    var replacement = log.append('tool/result', Object.assign({}, event.data, {
+      message: Object.assign({}, event.data.message, {
+        content: [Object.assign({}, block, { content: content })]
+      })
+    }), {
+      surfaceOp: { op: 'replace', start: seq, end: seq },
+      sourceEventSeqs: [seq]
+    });
+
+    pruned.push({ originalSeq: seq, replacementSeq: replacement.seq, before: before, after: after });
+    charsRemoved += before - after;
+  });
+
+  return { pruned: pruned, charsRemoved: charsRemoved };
+}
+
+// -------------------------------------------------------------------
+// 铁律：模型可见 <=> 已记录
+// -------------------------------------------------------------------
+
+function buildRequest(log, system, tools, messages) {
+  // 请求在构造完的那一刻就冻结：模型看到的东西之后不能再变
+  return Object.freeze({
+    kind: 'agent-loop',
+    sessionId: 'demo',
+    system: system,
+    tools: Object.freeze(tools),
+    messages: Object.freeze(messages || deriveMessages(log.events))
+  });
+}
+
+function assertRequestReconstructable(request, log) {
+  var checks = [];
+  function require_(ok, label) {
+    checks.push({ ok: ok, label: label });
+    if (!ok) throw Object.assign(new Error(label), { checks: checks });
+  }
+
+  require_(Object.isFrozen(request), 'loop 构造的请求必须是冻结的');
+  require_(Object.isFrozen(request.messages), 'messages 数组必须是冻结的');
+  require_(request.sessionId !== undefined, '请求必须带 session id');
+  require_(log.events.some(function (e) { return e.type === 'step/start'; }),
+    '会话日志里必须有 step/start');
+  require_(log.events.some(function (e) { return e.type === 'request/header'; }),
+    '会话日志里必须有 request/header');
+
+  // 核心那一条：请求里的消息必须逐字等于此刻从日志派生出来的消息
+  var expected = deriveMessages(log.events);
+  require_(JSON.stringify(request.messages) === JSON.stringify(expected),
+    '请求与派生历史必须逐字相等（log-reconstruction desync）');
+
+  return checks;
+}
+
+function estimateTokens(messages) {
+  return Math.ceil(JSON.stringify(messages).length / 4);
+}
+
+// ===================================================================
+// 页面上的代码清单，全部来自上面这些真实函数
+// ===================================================================
+DSH.showSource('src-derive-event', deriveEventMessage);
+DSH.showSource('src-guards', [surfaceOpOf, assertProvenance]);
+DSH.showSource('src-fold', [foldSurface, deriveMessages]);
+DSH.showSource('src-prune', [pruneBlocks, pruneToolResults]);
+DSH.showSource('src-log', createSessionLog);
+
+// ===================================================================
+// 事件构造助手：payload 形状严格照抄真实的 SessionEventMap
+// ===================================================================
+
+function appendUser(log, text, source) {
+  return log.append('user/message', {
+    role: 'user',
+    content: [{ type: 'text', text: text }],
+    source: source || { kind: 'user' }
+  }, { surfaceOp: 'append' });
+}
+
+function appendAssistant(log, turn, step, text, calls, chunkSeqs) {
+  var content = [];
+  if (text) content.push({ type: 'text', text: text });
+  (calls || []).forEach(function (c) {
+    content.push({ type: 'tool-call', id: c.id, name: c.name, arguments: c.arguments });
+  });
+  return log.append('assistant/message', {
+    turn: turn, step: step,
+    message: {
+      role: 'assistant', content: content,
+      source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' }
+    },
+    usage: { input: 1200 + step * 300, output: 90 }
+  }, { surfaceOp: 'append', sourceEventSeqs: chunkSeqs || [] });
+}
+
+function appendToolResult(log, turn, step, callId, text) {
+  return log.append('tool/result', {
+    turn: turn, step: step,
+    message: {
+      role: 'user',
+      content: [{ type: 'tool-result', toolCallId: callId, content: [{ type: 'text', text: text }] }],
+      source: { kind: 'tool', callId: callId }
+    }
+  }, { surfaceOp: 'append' });
+}
+
+function appendChunk(log, turn, step, text) {
+  return log.append('assistant/chunk', {
+    turn: turn, step: step, chunk: { type: 'text-delta', index: 0, text: text }
+  });
+}
+
+function appendHeader(log, reason) {
+  return log.append('request/header', {
+    header: {
+      config: { provider: 'deepseek', model: 'deepseek-chat', temperature: 0, maxTokens: 8192 },
+      system: '你是 dsh 的编码 agent。',
+      tools: [{ name: 'read' }, { name: 'edit' }, { name: 'bash' }]
+    },
+    reason: reason
+  });
+}
+
+// ===================================================================
+// 双栏渲染。每次调用都真的重新折叠一遍日志，两栏都不存在预设内容。
+// ===================================================================
+
+function eventPreview(event) {
+  var d = event.data;
+  switch (event.type) {
+    case 'user/message':
+      return textOf(d.content) + (d.source.kind === 'user' ? '' : ' [' + d.source.kind + ']');
+    case 'assistant/message': {
+      var calls = d.message.content.filter(function (b) { return b.type === 'tool-call'; })
+        .map(function (b) { return b.name + '()'; });
+      var text = textOf(d.message.content);
+      return (text ? text + ' ' : '') + (calls.length ? '→ ' + calls.join(' ') : '');
+    }
+    case 'tool/result': {
+      var block = d.message.content[0];
+      return block.toolCallId + ' · ' + measureBlocks(block.content) + ' chars';
+    }
+    case 'assistant/chunk': return JSON.stringify(d.chunk.text);
+    case 'tool/call': return d.name + ' ' + d.arguments;
+    case 'turn/start': return 'turn=' + d.turn;
+    case 'turn/end': return 'turn=' + d.turn + ' reason=' + d.reason.kind;
+    case 'step/start': case 'step/end': return 'turn=' + d.turn + ' step=' + d.step;
+    case 'todo/write': return d.todos.length + ' 项：' + d.todos[0].content;
+    case 'plan/mode': return 'active=' + d.active;
+    case 'request/header': return 'reason=' + d.reason + ' · ' + d.header.config.model;
+    case 'compaction/start': case 'compaction/end': return d.compactionId + ' turn=' + d.turn;
+    case 'compaction/summary': return '遮蔽 ' + d.shadowedSeqs.length + ' 节点 / ' + d.shadowedTokenCount + ' tok';
+    case 'compaction/prune': return 'seq ' + d.shadowedSeqs[0] + ' / ' + d.shadowedTokenCount + ' tok';
+    default: return '';
+  }
+}
+
+function textOf(blocks) {
+  return blocks.filter(function (b) { return b.type === 'text'; })
+    .map(function (b) { return b.text; }).join(' ').replace(/\n/g, ' ⏎ ');
+}
+
+// 真实的 role：tool/result 在 dsh 里是 **user 角色**的消息，
+// 内容是一个 tool-result block。这里显示真 role，只用颜色区分来源。
+function messageRole(event) {
+  return event.type === 'assistant/message' ? 'assistant' : 'user';
+}
+
+function messageRoleClass(event) {
+  return event.type === 'tool/result' ? 'tool' : messageRole(event);
+}
+
+function messagePreview(event) {
+  if (event.type === 'tool/result') {
+    var block = event.data.message.content[0];
+    return '[tool-result ' + block.toolCallId + '] ' + textOf(block.content);
+  }
+  if (event.type === 'assistant/message') return eventPreview(event);
+  return textOf(event.data.content);
+}
+
+function messageChars(event) {
+  if (event.type === 'tool/result') return measureBlocks(event.data.message.content[0].content);
+  var blocks = event.type === 'assistant/message' ? event.data.message.content : event.data.content;
+  return measureBlocks(blocks);
+}
+
+function pad2(n) { return (n < 10 ? '0' : '') + n; }
+
+/**
+ * 从日志重算两栏视图。opts: { fresh, flash, notes, onlySurface }
+ * @returns {{fold: object, messages: array}} 这次折叠的结果，供调用方叙述
+ */
+function renderPanes(view, log, opts) {
+  opts = opts || {};
+  var events = log.events;
+  var fold = foldSurface(events);                       // 真的重新折叠
+  var messages = deriveMessages(events);
+  var fresh = opts.fresh || [], flash = opts.flash || [], notes = opts.notes || {};
+
+  var shadowedBy = {};
+  fold.replacements.forEach(function (r) {
+    r.shadowedSeqs.forEach(function (s) { shadowedBy[s] = r.seq; });
+  });
+
+  var rows = events.map(function (event) {
+    var idx = fold.nodes.indexOf(event.seq);
+    var surf = isSurfaceEligibleType(event.type);
+    var shadow = shadowedBy[event.seq] !== undefined;
+    var cls = 'lrow ' + (surf ? 'surf' : 'only');
+    if (shadow) cls += ' shadow';
+    if (fresh.indexOf(event.seq) >= 0) cls += ' fresh';
+    if (flash.indexOf(event.seq) >= 0) cls += ' flash';
+    if (opts.onlySurface && !surf) cls += ' hidden';
+
+    var nd = idx >= 0 ? '#' + idx : (shadow ? '×' : '');
+    var preview = eventPreview(event);
+    var shown = shadow ? '被 seq ' + shadowedBy[event.seq] + ' 遮蔽' : preview;
+    return '<div class="' + cls + '" data-seq="' + event.seq + '" title="'
+      + DSH.esc(event.type + '  ' + preview) + '">'
+      + '<span class="sq">' + pad2(event.seq) + '</span>'
+      + '<span class="ty">' + DSH.esc(event.type) + '</span>'
+      + '<span class="nd">' + DSH.esc(nd) + '</span>'
+      + '<span class="tx">' + DSH.esc(shown) + '</span></div>';
+  });
+
+  var mrows = [], mi = 0;
+  fold.nodes.forEach(function (seq) {
+    var event = events[seq];
+    if (!deriveEventMessage(event)) {
+      mrows.push('<div class="dropped">seq ' + seq + ' 投影为 null（空内容，只承载 usage）</div>');
+      return;
+    }
+    var role = messageRole(event);
+    var cls = 'mrow' + (fresh.indexOf(seq) >= 0 ? ' fresh' : '');
+    mrows.push('<div class="' + cls + '" title="' + DSH.esc(messagePreview(event)) + '">'
+      + '<span class="mi">' + (mi++) + '</span>'
+      + '<span class="ro ' + messageRoleClass(event) + '">' + role + '</span>'
+      + '<span class="tx">' + DSH.esc(messagePreview(event)) + '</span>'
+      + '<span class="sz">seq ' + seq + '</span></div>');
+    if (notes[seq]) mrows.push('<div class="mnote">' + DSH.esc(notes[seq]) + '</div>');
+  });
+  if (mi !== messages.length) throw new Error('渲染与 deriveMessages 不一致');
+
+  view.logEl.innerHTML = rows.join('');
+  view.msgEl.innerHTML = mrows.join('');
+
+  var chars = 0;
+  fold.nodes.forEach(function (seq) { chars += messageChars(events[seq]); });
+  var pills = [
+    ['', 'events ' + events.length],
+    ['acc', 'surface nodes ' + fold.nodes.length],
+    ['ok', 'messages ' + messages.length],
+    ['warn', 'replaceGeneration ' + fold.replaceGeneration],
+    ['', 'model-visible ' + chars + ' chars']
+  ];
+  view.countEl.innerHTML = pills.map(function (p) {
+    return '<span class="pill ' + p[0] + '">' + DSH.esc(p[1]) + '</span>';
+  }).join('');
+
+  return { fold: fold, messages: messages, chars: chars };
+}
+
+function paneView(logId, msgId, countId) {
+  return {
+    logEl: document.getElementById(logId),
+    msgEl: document.getElementById(msgId),
+    countEl: document.getElementById(countId)
+  };
+}
+
+function scrollToSeq(view, seq) {
+  var row = view.logEl.querySelector('[data-seq="' + seq + '"]');
+  if (row) view.logEl.scrollTop = Math.max(0, row.offsetTop - view.logEl.clientHeight / 2);
+}
+
+// ===================================================================
+// Demo 5.1 · 双栏投影
+// ===================================================================
+(function () {
+  var view = paneView('log-project', 'msg-project', 'c-project');
+  var log, turn, step, stepOpen, pending, out;
+
+  function reset(o) {
+    log = createSessionLog();
+    turn = 0; step = 0; stepOpen = false; pending = [];
+    if (o) o.clear();
+    renderPanes(view, log);
+  }
+
+  function narrate(o, label, before, after, seqs) {
+    var kind = seqs.length === 1 ? '追加 1 个事件' : '追加 ' + seqs.length + ' 个事件';
+    var line = '+ ' + label + '  seq=' + seqs.join(',') + '  ' + kind
+      + '   nodes ' + before.fold.nodes.length + '→' + after.fold.nodes.length
+      + '   messages ' + before.messages.length + '→' + after.messages.length;
+    if (after.messages.length === before.messages.length) o.dim(line + '   （右栏不动）');
+    else o.acc(line);
+  }
+
+  // turn 和 step 的边界：第一条事件懒开一个 turn，每个 step 只开一次
+  function ensureStep(seqs) {
+    if (turn === 0) {
+      turn = 1; step = 0;
+      seqs.push(log.append('turn/start', { turn: turn }).seq);
+    }
+    if (!stepOpen) {
+      seqs.push(log.append('step/start', { turn: turn, step: step }).seq);
+      stepOpen = true;
+    }
+  }
+
+  DSH.demo('d-project', {
+    init: function (o) { out = o; reset(o); },
+    reset: function (o) { reset(o); o.dim('日志已清空。'); },
+
+    user: function (o) {
+      var before = renderPanes(view, log), seqs = [];
+      ensureStep(seqs);
+      seqs.push(appendUser(log, '把 auth 模块的重复校验合并掉').seq);
+      seqs.push(appendHeader(log, log.events.length > 4 ? 'change' : 'initial').seq);
+      narrate(o, 'user/message + turn/step 边界 + request/header', before, renderPanes(view, log, { fresh: seqs }), seqs);
+    },
+
+    assistant: function (o) {
+      if (pending.length) { o.warn('上一个 assistant 还有 ' + pending.length + ' 个工具调用没回结果。'); return; }
+      var before = renderPanes(view, log), seqs = [];
+      ensureStep(seqs);
+      var chunks = ['先看', '一下', '现状。'].map(function (t) {
+        return appendChunk(log, turn, step, t).seq;
+      });
+      chunks.forEach(function (s) { seqs.push(s); });
+      var callId = 'call-' + log.seq;
+      seqs.push(appendAssistant(log, turn, step, '先看一下现状。',
+        [{ id: callId, name: 'read', arguments: '{"path":"src/auth.ts"}' }], chunks).seq);
+      seqs.push(log.append('tool/call', {
+        turn: turn, step: step, callId: callId, name: 'read', arguments: '{"path":"src/auth.ts"}'
+      }).seq);
+      pending.push(callId);
+      narrate(o, 'assistant/message（3 个 chunk + 1 个 tool/call 都是 log-only）',
+        before, renderPanes(view, log, { fresh: seqs }), seqs);
+    },
+
+    result: function (o) {
+      if (!pending.length) { o.warn('没有待回的工具调用。先点一次 assistant。'); return; }
+      var before = renderPanes(view, log), seqs = [];
+      var callId = pending.shift();
+      seqs.push(appendToolResult(log, turn, step, callId, 'src/auth.ts · 214 行\nverifyToken() 出现 3 次').seq);
+      if (!pending.length) {
+        seqs.push(log.append('step/end', { turn: turn, step: step }).seq);
+        stepOpen = false;
+        step += 1;
+      }
+      narrate(o, 'tool/result', before, renderPanes(view, log, { fresh: seqs }), seqs);
+    },
+
+    todo: function (o) {
+      var before = renderPanes(view, log);
+      var seq = log.append('todo/write', {
+        todos: [
+          { content: '合并 verifyToken 的三处实现', status: 'in_progress' },
+          { content: '补一个回归测试', status: 'pending' }
+        ]
+      }).seq;
+      narrate(o, 'todo/write（log-only）', before, renderPanes(view, log, { fresh: [seq] }), [seq]);
+    },
+
+    plan: function (o) {
+      var before = renderPanes(view, log);
+      var active = !log.events.filter(function (e) { return e.type === 'plan/mode'; })
+        .map(function (e) { return e.data.active; }).pop();
+      var seq = log.append('plan/mode', { active: active }).seq;
+      narrate(o, 'plan/mode active=' + active + '（log-only，整值替换，最后一条胜出）',
+        before, renderPanes(view, log, { fresh: [seq] }), [seq]);
+    }
+  });
+})();
+
+// ===================================================================
+// 共用的种子会话：2 个 turn，36 条事件，10 个 surface 节点
+// ===================================================================
+
+function bigToolOutput(head, n, line) {
+  var out = [head];
+  for (var i = 1; i <= n; i++) out.push(String(i).padStart(3, ' ') + ' | ' + line(i));
+  return out.join('\n');
+}
+
+function seedConversation(big) {
+  var log = createSessionLog();
+  var readOut = big
+    ? bigToolOutput('src/auth.ts · 214 行', 28, function (i) {
+        return 'export function verifyToken' + i + '(token: string): boolean {';
+      })
+    : ['src/auth.ts · 214 行 · 6.1 KB',
+       '  12 | export function verifyToken(token: string): boolean {',
+       '  48 | function verifyTokenLegacy(token: string): boolean {',
+       ' 173 | const verifyTokenCached = memo(verifyToken)',
+       '（其余 210 行省略）'].join('\n');
+  var grepOut = big
+    ? bigToolOutput('rg "verifyToken" -n', 22, function (i) {
+        return 'packages/core/session/src/index.ts:' + (120 + i * 7) + ': verifyToken(raw)';
+      })
+    : ['rg "verifyToken" -n',
+       'packages/core/session/src/index.ts:317: if (!verifyToken(raw)) return null',
+       'packages/api/gateway/src/auth.ts:44:    const ok = verifyTokenLegacy(header)',
+       'packages/bundle/web-app/src/session.ts:88: verifyTokenCached(token)',
+       '3 matches in 3 files'].join('\n');
+
+  // ---- turn 1 ----
+  log.append('turn/start', { turn: 1 });
+  log.append('step/start', { turn: 1, step: 0 });
+  appendUser(log, '重构 auth 模块，先看现状');
+  appendHeader(log, 'initial');
+  var c1 = [appendChunk(log, 1, 0, '先读').seq, appendChunk(log, 1, 0, ' auth.ts。').seq];
+  appendAssistant(log, 1, 0, '先读 auth.ts。',
+    [{ id: 'call-a', name: 'read', arguments: '{"path":"src/auth.ts"}' }], c1);
+  log.append('tool/call', { turn: 1, step: 0, callId: 'call-a', name: 'read', arguments: '{"path":"src/auth.ts"}' });
+  appendToolResult(log, 1, 0, 'call-a', readOut);
+  log.append('step/end', { turn: 1, step: 0 });
+
+  log.append('step/start', { turn: 1, step: 1 });
+  var c2 = [appendChunk(log, 1, 1, '再搜调用点。').seq];
+  appendAssistant(log, 1, 1, '再搜调用点。',
+    [{ id: 'call-b', name: 'bash', arguments: '{"command":"rg verifyToken -n"}' }], c2);
+  log.append('tool/call', { turn: 1, step: 1, callId: 'call-b', name: 'bash', arguments: '{"command":"rg verifyToken -n"}' });
+  appendToolResult(log, 1, 1, 'call-b', grepOut);
+  log.append('step/end', { turn: 1, step: 1 });
+
+  log.append('step/start', { turn: 1, step: 2 });
+  log.append('todo/write', {
+    todos: [
+      { content: '合并 verifyToken 的三处实现', status: 'in_progress' },
+      { content: '补一个回归测试', status: 'pending' }
+    ]
+  });
+  var c3 = [appendChunk(log, 1, 2, '现状清楚了。').seq];
+  appendAssistant(log, 1, 2, '现状清楚了：三处调用点，两处可以合并。', [], c3);
+  log.append('step/end', { turn: 1, step: 2 });
+  log.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
+
+  // ---- turn 2 ----
+  log.append('turn/start', { turn: 2 });
+  log.append('step/start', { turn: 2, step: 0 });
+  appendUser(log, '开始改');
+  log.append('plan/mode', { active: false });
+  var c4 = [appendChunk(log, 2, 0, '改 session.ts。').seq];
+  appendAssistant(log, 2, 0, '改 session.ts。',
+    [{ id: 'call-c', name: 'edit', arguments: '{"file_path":"src/auth.ts"}' }], c4);
+  log.append('tool/call', { turn: 2, step: 0, callId: 'call-c', name: 'edit', arguments: '{"file_path":"src/auth.ts"}' });
+  appendToolResult(log, 2, 0, 'call-c', '已在 src/auth.ts 替换 3 处');
+  log.append('step/end', { turn: 2, step: 0 });
+
+  log.append('step/start', { turn: 2, step: 1 });
+  var c5 = [appendChunk(log, 2, 1, '改完了。').seq];
+  appendAssistant(log, 2, 1, '改完了，三处合并成一个 verifyToken。', [], c5);
+  log.append('step/end', { turn: 2, step: 1 });
+  log.append('turn/end', { turn: 2, reason: { kind: 'completed' } });
+
+  return log;
+}
+
+// ===================================================================
+// Demo 5.2 · 压缩折叠（本章核心）
+// ===================================================================
+(function () {
+  var view = paneView('log-compact', 'msg-compact', 'c-compact');
+  var log, notes, onlySurface = false, done = false;
+
+  function paint(opts) {
+    opts = opts || {};
+    opts.notes = notes;
+    opts.onlySurface = onlySurface;
+    return renderPanes(view, log, opts);
+  }
+
+  function reset() {
+    log = seedConversation(false);
+    notes = {};
+    done = false;
+    return paint();
+  }
+
+  // 先猜再跑：事件总数的方向，是本章唯一真正反直觉的数字
+  DSH.predict('p-compact', {
+    q: '压缩之后，会话日志里的事件总数会怎么变？',
+    options: [
+      { label: '变少', why: '那是 history.splice() 的结果，dsh 这条路上没有删除这一步。' },
+      { label: '不变', why: '摘要总得有地方待着。' },
+      { label: '变多', ok: true, why: '五步事务里有四次 append，一条都不删，所以 36 → 40。' }
+    ],
+    explain: '下面的 demo 每一步都会把 events / nodes / messages 三个数字打出来。'
+  });
+
+  // 一个消息数组里，有哪些 tool-result 找不到自己的 tool-call。
+  // 这正是 splice 切开工具配对之后 provider 看到的东西。
+  function danglingToolResults(messages) {
+    var seen = {}, dangling = [];
+    messages.forEach(function (m) {
+      m.content.forEach(function (b) {
+        if (b.type === 'tool-call') seen[b.id] = true;
+        if (b.type === 'tool-result' && !seen[b.toolCallId]) dangling.push(b.toolCallId);
+      });
+    });
+    return dangling;
+  }
+
+  DSH.demo('d-compact', {
+    init: function () { reset(); },
+
+    reset: function (o) {
+      var s = reset();
+      o.clear();
+      o.dim('日志已重建：' + log.events.length + ' 条事件，' + s.fold.nodes.length
+        + ' 个 surface 节点，' + s.messages.length + ' 条模型消息。');
+    },
+
+    // 同一份种子日志，两种写法跑一遍，然后各取一次原文
+    naive: async function (o) {
+      o.clear();
+      var probe = 'verifyTokenLegacy';        // 只出现在会被折叠的那一段里
+      var summary = { role: 'user', content: [{ type: 'text',
+        text: '<compacted-summary>已完成：读了 auth.ts，rg 找到 3 处调用点。</compacted-summary>' }] };
+
+      // ---- A：history.splice()，几乎每个 harness 的第一版 ----
+      var seed = seedConversation(false);
+      var history = deriveMessages(seed.events);
+      var naive = history.slice();
+      naive.splice(0, 6, summary);
+      o.raw('<span class="hd">A · history.splice(0, 6, summary)</span>');
+      o.log('  消息 ' + history.length + ' → ' + naive.length);
+      o.dim('  在这类 harness 里 history 就是全部状态，splice 之后进程里没有第二份。');
+
+      // ---- B：append 一条带 surfaceOp 的检查点 ----
+      var log2 = seedConversation(false);
+      var eventsBefore = log2.events.length;
+      var range = selectCompactableRange(log2.events, 4);
+      await compactSurfaceRegion(log2, range, function () {
+        return Promise.resolve('已完成：读了 auth.ts，rg 找到 3 处调用点。');
+      }, function () { return Promise.resolve(); });
+      var after = deriveMessages(log2.events);
+      o.raw('<span class="hd">B · append user/message  { op: \'replace\', start: '
+        + range.start + ', end: ' + range.end + ' }</span>');
+      o.log('  消息 ' + history.length + ' → ' + after.length
+        + '    事件 ' + eventsBefore + ' → ' + log2.events.length);
+      o.dim('  给模型的视图和 A 一模一样，两边都是 ' + after.length + ' 条。');
+      o.dim('  第三条路是 omp：append 一条带 firstKeptEntryId 的 CompactionEntry，');
+      o.dim('  原始 entry 留在 JSONL 里，所以下面这次取原文它也取得到。');
+
+      // ---- 取原文 ----
+      o.rule();
+      o.head('从两边各取一次 "' + probe + '" 的原文');
+      var hitA = JSON.stringify(naive).indexOf(probe) >= 0;
+      if (hitA) o.ok('  A 找到了');
+      else o.bad('  A 找不到。剩下 ' + naive.length + ' 条消息里没有这个字符串，也没有别的地方可查。');
+      var hitsB = log2.events.filter(function (e) {
+        return JSON.stringify(e.data).indexOf(probe) >= 0;
+      });
+      o.ok('  B 找到 ' + hitsB.length + ' 处：seq '
+        + hitsB.map(function (e) { return e.seq; }).join(', ') + '（都是被遮蔽的节点）');
+      hitsB.forEach(function (e) {
+        if (e.type !== 'tool/result') return;
+        textOf(e.data.message.content[0].content).split(' ⏎ ').forEach(function (line) {
+          if (line.indexOf(probe) >= 0) o.dim('    seq ' + e.seq + '  ' + line.trim());
+        });
+      });
+
+      // ---- splice 独有的第二种失败：切开工具配对 ----
+      o.rule();
+      o.head('还有一种失败只属于 splice：把 tool-call 和它的结果切开');
+      var naive2 = history.slice();
+      naive2.splice(0, 8, summary);
+      var dangling = danglingToolResults(naive2);
+      o.log('  A · splice(0, 8, summary)，只保留最近 2 条消息');
+      o.bad('    悬空的 tool-result：' + dangling.join(', ')
+        + '。对应的 tool-call 被 splice 掉了，多数 provider 直接 400。');
+      var strict = selectCompactableRange(seed.events, 2);
+      var nodes = foldSurface(seed.events).nodes;
+      o.log('  B · selectCompactableRange(events, keepNodes=2)');
+      o.ok('    → { start: ' + strict.start + ', end: ' + strict.end + ' }，实际保留 '
+        + (nodes.length - nodes.indexOf(strict.end) - 1) + ' 个节点，不是 2 个');
+      o.dim('    toolPairingBalancedBefore() 不成立时切点往前挪一格，宁可多留一个节点。');
+      o.dim('    悬空的 tool-result：' + danglingToolResults(
+        nodes.slice(nodes.indexOf(strict.end) + 1).map(function (s) {
+          return deriveEventMessage(seed.events[s]);
+        })).length + ' 个。');
+    },
+
+    filter: function (o) {
+      onlySurface = !onlySurface;
+      paint();
+      o.dim(onlySurface
+        ? '左栏已过滤：只显示 3 类 surface 事件（其余 log-only 行被隐藏，但它们仍在日志里）。'
+        : '左栏恢复：显示全部事件。');
+    },
+
+    derive: function (o) {
+      o.clear();
+      var messages = deriveMessages(log.events);
+      o.head('deriveMessages() → ' + messages.length + ' 条消息');
+      messages.forEach(function (m, i) {
+        var body = m.content.map(function (b) {
+          if (b.type === 'text') return b.text;
+          if (b.type === 'tool-call') return '[tool-call ' + b.name + ' ' + b.arguments + ']';
+          if (b.type === 'tool-result') return '[tool-result ' + b.toolCallId + '] '
+            + textOf(b.content);
+          return '[' + b.type + ']';
+        }).join(' ');
+        o.raw('<span class="' + (m.role === 'assistant' ? 'acc' : 'ok') + '">'
+          + DSH.esc(i + '  ' + m.role + '  ' + body.slice(0, 150)) + '</span>');
+      });
+    },
+
+    run: async function (o) {
+      if (done) { o.warn('这份日志已经压缩过一次了，先点"重置日志"。'); return; }
+      var before = paint();
+      var eventsBefore = log.events.length;
+
+      var range = selectCompactableRange(log.events, 4);
+      if (!range) { o.bad('selectCompactableRange 返回 null：没有可压缩的头部。'); return; }
+
+      var fold = before.fold;
+      var from = fold.nodes.indexOf(range.start), to = fold.nodes.indexOf(range.end);
+      var target = fold.nodes.slice(from, to + 1);
+
+      o.head('selectCompactableRange(events, keepNodes=4)');
+      o.log('  → { start: ' + range.start + ', end: ' + range.end + ' }');
+      o.dim('  选中 ' + target.length + ' 个 surface 节点：seq ' + target.join(', '));
+      o.dim('  切点前的 tool-call 都已配对（toolPairingBalancedBefore 通过），不会留下悬空调用');
+
+      // 先把要被折叠的那一段闪一下，让眼睛跟得上
+      paint({ flash: target });
+      scrollToSeq(view, range.start);
+      await DSH.wait(700);
+
+      var steps = [];
+      var result = await compactSurfaceRegion(log, range, async function (messages) {
+        await DSH.wait(420);
+        o.warn('  summarize(' + messages.length + ' 条消息 · ' + estimateTokens(messages)
+          + ' tok) → 一段检查点文本');
+        return '已完成：读了 src/auth.ts（214 行），rg 找到 3 处 verifyToken 调用点，'
+          + '结论是其中两处可以合并。尚未修改任何文件。';
+      }, async function (type, event, why) {
+        steps.push(event.seq);
+        var snap = paint({ fresh: [event.seq], flash: target });
+        scrollToSeq(view, event.seq);
+        o.raw('<span class="hd">  append seq ' + event.seq + '  ' + DSH.esc(type)
+          + '</span>  <span class="dim">' + DSH.esc(why) + '</span>');
+        o.dim('    events=' + log.events.length + '  nodes=' + snap.fold.nodes.length
+          + '  messages=' + snap.messages.length + '  generation=' + snap.fold.replaceGeneration);
+        await DSH.wait(620);
+      });
+
+      notes[result.checkpointSeq] = '[已折叠 ' + result.shadowedSeqs.length
+        + ' 个 surface node · 原始事件仍在 seq ' + result.shadowedSeqs[0]
+        + '-' + result.shadowedSeqs[result.shadowedSeqs.length - 1] + ']';
+      var after = paint({ fresh: [result.checkpointSeq] });
+      done = true;
+
+      o.rule();
+      o.ok('事件数 ' + eventsBefore + ' → ' + log.events.length
+        + '（+' + steps.length + '，只追加，零删除）');
+      o.ok('surface 节点 ' + before.fold.nodes.length + ' → ' + after.fold.nodes.length
+        + '   模型消息 ' + before.messages.length + ' → ' + after.messages.length);
+      o.ok('模型可见字符 ' + before.chars + ' → ' + after.chars
+        + '（省下 ' + (before.chars - after.chars) + '）');
+      o.dim('sourceEventSeqs = [' + [result.startSeq, result.summarySeq]
+        .concat(result.shadowedSeqs).join(', ') + ']');
+      o.dim('  = 事务开始 + 原始摘要 + 被遮蔽的每一个节点。因果链完整，随时可以翻出原文对照。');
+      o.warn('左栏那 ' + result.shadowedSeqs.length + ' 行是划掉的橙色：字节一个没少，只是不再参与投影。');
+    }
+  });
+})();
+
+// ===================================================================
+// Demo 5.3 · 工具结果裁剪
+// ===================================================================
+(function () {
+  var view = paneView('log-prune', 'msg-prune', 'c-prune');
+  // 真实默认是 8192 / 4096 / 1024；这里缩小 13 倍以便肉眼可见，逻辑一致
+  var BUDGET = { thresholdChars: 600, headChars: 320, tailChars: 120 };
+  var log, notes, last;
+
+  function paint(opts) {
+    opts = opts || {};
+    opts.notes = notes;
+    return renderPanes(view, log, opts);
+  }
+
+  function reset() {
+    log = seedConversation(true);
+    notes = {};
+    last = null;
+    return paint();
+  }
+
+  DSH.demo('d-prune', {
+    init: function () { reset(); },
+
+    reset: function (o) {
+      var s = reset();
+      o.clear();
+      o.dim('日志已重建：' + s.chars + ' 个模型可见字符，其中两条 tool/result 超出 '
+        + BUDGET.thresholdChars + ' 字符预算。');
+    },
+
+    run: function (o) {
+      if (last) { o.warn('已经裁过了，先点"重置日志"。'); return; }
+      var before = paint();
+      var eventsBefore = log.events.length;
+      o.head('pruneToolResults(log, { thresholdChars: ' + BUDGET.thresholdChars
+        + ', headChars: ' + BUDGET.headChars + ', tailChars: ' + BUDGET.tailChars + ' })');
+      o.dim('  头部 + 标记 + 尾部 = ' + BUDGET.headChars + ' + '
+        + Array.from(PRUNE_MARKER).length + ' + ' + BUDGET.tailChars
+        + ' = ' + (BUDGET.headChars + Array.from(PRUNE_MARKER).length + BUDGET.tailChars)
+        + ' ≤ ' + BUDGET.thresholdChars + '（配置校验保证这一点）');
+
+      var result = pruneToolResults(log, BUDGET);
+      last = result;
+      if (!result.pruned.length) { o.warn('没有超预算的 tool/result。'); return; }
+
+      var fresh = [];
+      result.pruned.forEach(function (entry) {
+        fresh.push(entry.replacementSeq, entry.replacementSeq - 1);
+        notes[entry.replacementSeq] = '[裁剪 ' + entry.before + ' → ' + entry.after
+          + ' chars · 原文仍在 seq ' + entry.originalSeq + ']';
+        o.raw('<span class="hd">  seq ' + entry.originalSeq + ' → seq ' + entry.replacementSeq
+          + '</span>  <span class="ok">' + entry.before + ' → ' + entry.after + ' chars</span>');
+        o.dim('    先 append compaction/prune（影子定价 ' + Math.ceil(entry.before / 4)
+          + ' tok），再紧邻 append 替换用的 tool/result');
+      });
+
+      var after = paint({ fresh: fresh });
+      o.rule();
+      o.ok('事件数 ' + eventsBefore + ' → ' + log.events.length
+        + '（+' + (log.events.length - eventsBefore) + '）');
+      o.ok('surface 节点数不变：' + before.fold.nodes.length + ' → ' + after.fold.nodes.length
+        + '（replace 是一换一，不是删除）');
+      o.ok('模型可见字符 ' + before.chars + ' → ' + after.chars
+        + '，省下 ' + result.charsRemoved + '（≈ ' + Math.ceil(result.charsRemoved / 4) + ' tok）');
+      o.dim('replaceGeneration ' + before.fold.replaceGeneration + ' → '
+        + after.fold.replaceGeneration + '：派生缓存整体失效，下次 deriveMessages 重建。');
+    },
+
+    original: function (o) {
+      o.clear();
+      if (!last) { o.warn('先点一次"裁剪"。'); return; }
+      last.pruned.forEach(function (entry) {
+        var original = log.events[entry.originalSeq];
+        var blocks = original.data.message.content[0].content;
+        var lines = textOf(blocks).split(' ⏎ ');
+        o.head('seq ' + entry.originalSeq + ' 的原文（已被 seq ' + entry.replacementSeq
+          + ' 遮蔽，但字节一个没少：' + measureBlocks(blocks) + ' chars / ' + lines.length + ' 行）');
+        lines.slice(0, 8).forEach(function (line) { o.dim('  ' + line); });
+        o.dim('  …');
+        var replacement = log.events[entry.replacementSeq];
+        o.ok('模型现在看到的是 '
+          + measureBlocks(replacement.data.message.content[0].content)
+          + ' chars，中间那段被替换成：');
+        o.warn('  ' + PRUNE_MARKER.trim());
+      });
+      o.rule();
+      o.dim('这就是"压缩是一次追加"的全部含义：证据一直在，只是不再花 token。');
+    }
+  });
+})();
+
+// ===================================================================
+// Demo 5.4 · 不变量
+// ===================================================================
+(function () {
+  var log = null;
+
+  function ensure() {
+    if (!log) log = seedConversation(false);
+    return log;
+  }
+
+  function report(o, checks) {
+    checks.forEach(function (c) {
+      if (c.ok) o.ok('  ✓ ' + c.label);
+      else o.bad('  ✗ ' + c.label);
+    });
+  }
+
+  function attempt(o, request) {
+    try {
+      report(o, assertRequestReconstructable(request, log));
+      o.acc('  invariant 通过：这个请求的每一个字节都能从日志重建。');
+      return true;
+    } catch (err) {
+      report(o, err.checks || []);
+      o.bad('  invariant 失败：' + err.message);
+      return false;
+    }
+  }
+
+  DSH.demo('d-invariant', {
+    run: function (o) {
+      ensure();
+      o.head('agent loop 正常构造请求');
+      var request = buildRequest(log, '你是 dsh 的编码 agent。', ['read', 'edit', 'bash']);
+      o.dim('  messages 来自 deriveMessages(log.events)，共 ' + request.messages.length + ' 条');
+      attempt(o, request);
+    },
+
+    smuggle: function (o) {
+      o.clear();
+      ensure();
+      o.head('一个"图方便"的插件：在组装请求时直接拼一条消息进去');
+      var messages = deriveMessages(log.events).concat([{
+        role: 'user',
+        content: [{ type: 'text', text: '[skill] 提交前必须跑 pnpm test' }],
+        source: { kind: 'plugin', plugin: 'my-skill-loader' }
+      }]);
+      o.dim('  它没有 append 任何 session event，只是往 messages 数组末尾加了一条');
+      o.dim('  请求里 ' + messages.length + ' 条消息，日志派生出 '
+        + deriveMessages(log.events).length + ' 条');
+      attempt(o, buildRequest(log, '你是 dsh 的编码 agent。', ['read'], messages));
+      o.rule();
+      o.warn('正确做法：扩展 SessionEventMap，append 一条事件（比如带 source.kind=plugin 的');
+      o.warn('user/message），然后让请求照常从日志渲染。模型可见即已记录，没有例外。');
+    },
+
+    mutate: async function (o) {
+      o.clear();
+      ensure();
+      o.head('压缩之后，同一份请求构造代码必须自动跟上');
+      var stale = buildRequest(log, '你是 dsh 的编码 agent。', ['read']);
+      o.dim('  压缩前构造的请求：' + stale.messages.length + ' 条消息');
+
+      var range = selectCompactableRange(log.events, 4);
+      await compactSurfaceRegion(log, range, function () {
+        return Promise.resolve('已完成：读了 auth.ts，找到 3 处调用点，两处可合并。');
+      }, function () { return Promise.resolve(); });
+      o.dim('  压缩完成：日志 ' + log.events.length + ' 条事件，派生历史 '
+        + deriveMessages(log.events).length + ' 条消息');
+
+      o.log('用压缩前那份冻结的请求再跑一次 invariant：');
+      attempt(o, stale);
+      o.log('重新从日志派生：');
+      attempt(o, buildRequest(log, '你是 dsh 的编码 agent。', ['read']));
+      o.rule();
+      o.dim('这就是为什么请求必须在 dispatch 的那一刻从日志派生。缓存下来复用会出错：');
+      o.dim('surface 可以在两次 step 之间被压缩改写，而 replaceGeneration 是唯一可靠的信号。');
+      log = null;
+    }
+  });
+})();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,1255 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · Context 与 Service — DeepSeek Harness from Scratch</title>
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/site.js"></script>
+</head>
+<body>
+
+<div class="wrap">
+<main>
+
+<header class="masthead">
+  <div class="kicker">第 02 章</div>
+  <h1>Context 与 Service</h1>
+  <p class="standfirst">
+    第 1 章的 <code>miniLoop(deps)</code> 把 model、tools、log 当参数传进去。
+    参数在函数被调用的那一刻就冻住了。你没法在运行时把 <code>fs</code> 从本地实现换成沙箱实现，
+    也没法让两个会话同时各用一份自己的 <code>fs</code>。本章把名字变成第一公民：
+    能力登记在一张表上，谁要用就报名字。
+  </p>
+  <div class="meta"><span>本章造出 Context / Service</span><span>3 个 demo</span><span>约 22 分钟</span></div>
+</header>
+
+<h2><span class="num">§2.1</span>参数传递到不了的地方</h2>
+
+<p>
+先把痛点说具体。第 1 章的循环需要一个文件系统能力，于是它出现在 <code>deps</code> 里：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">ch01 的做法：能力从最外层一路传进去</span></div>
+<pre><code data-lang="js">const fs    = createLocalFs('/repo');
+const tools = createTools({ fs });                 // 每个工具都需要 fs
+const deps  = { model, tools, inbox, log, history, signal };
+
+await miniLoop(deps);</code></pre>
+</div>
+
+<p>
+现在提三个真实需求。
+</p>
+
+<p>
+第一个：会话 A 用本地 fs，会话 B 用沙箱 fs，同一个进程里同时跑。
+这个靠加参数还能扛。<code>createTools({ fs })</code> 多一个入参，<code>miniLoop</code> 多一个入参，
+每个调用点跟着改一遍，丑，但能用。
+</p>
+
+<p>
+第二个：用户在会话跑到一半的时候打开了沙箱开关，<code>fs</code> 必须当场换掉。
+到这里就扛不住了。<code>deps</code> 在进入循环时已经被读进闭包，换掉外面那个变量，循环里的人毫无感觉。
+</p>
+
+<p>
+第三个：一个第三方插件想接管 fs。它不在你的代码里，改不了 <code>createTools</code> 的签名。
+无解。参数列表是<em>你</em>的私有约定，外人拿不到那个位置。
+</p>
+
+<p>
+问题的根不在参数太多，在于调用方必须知道被调用方需要什么。
+把这层知识翻过来，让需求方自己按名字去要，链条就断开了：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">依赖注入的做法：只约定名字</span></div>
+<pre><code data-lang="js">// 提供方：把一份实现登记到名字 "fs" 上，谁提供的、什么时候提供的，消费方都不需要知道
+ctx.provide('fs', createLocalFs('/repo'));
+
+// 消费方：声明"我需要 fs"，然后直接读 ctx.fs
+ctx.plugin({
+  name: 'reader',
+  inject: ['fs'],
+  apply(ctx) { ctx.fs.read('README.md'); },
+});</code></pre>
+</div>
+
+<p>
+这段代码换来的不只是"解耦"两个字。参数传递做不到的事，它一次给了四件：
+</p>
+
+<table>
+<thead><tr><th>能力</th><th>参数传递</th><th>服务注册表</th></tr></thead>
+<tbody>
+<tr><td>晚绑定：provider 可以比 consumer 后出现</td><td>不行，调用时必须齐</td><td>可以，consumer 排队等</td></tr>
+<tr><td>热替换：运行时换掉一份实现</td><td>不行，闭包已冻结</td><td>可以，consumer 重跑</td></tr>
+<tr><td>撤销：provider 消失时依赖它的人一起停</td><td>没有这个概念</td><td>有，注册是有生命周期的</td></tr>
+<tr><td>同名多份：两个会话两份 <code>fs</code></td><td>只能靠两套参数</td><td>靠 isolate realm</td></tr>
+</tbody>
+</table>
+
+<p>
+dsh 的官方 primer 用两句话概括了同一件事：
+</p>
+
+<blockquote>
+A context is a repository of services. A service claims a stable <code>ctx.&lt;key&gt;</code> such as
+<code>ctx.tools</code>, <code>ctx.llm</code>, or <code>ctx.sessions</code> from a context; other plugins find services
+via key instead of importing a concrete implementation.<br><br>
+Declare service dependency via <code>inject</code>. A plugin that names required services waits until
+those services exist, so load order is expressed through service requirements rather than manual
+boot sequencing.
+</blockquote>
+
+<div class="note">
+  <span class="tag">出处</span>
+  <code class="srcpath">docs/cordis-primer.md</code> 的 "Cordis In Five Ideas"。
+  Cordis 是 dsh 内置的插件框架，源码 vendor 在 <code class="srcpath">vendor/cordis/</code>。
+  本章造的东西就是它最内层的两块：Context 和 Service。
+</div>
+
+<div class="note vs">
+  <span class="tag">换成别的 harness</span>
+  Pi 和 dsh 表面上是同一类东西，都是"用 TypeScript 扩展、不用 fork"的 harness。落点却不一样。
+  Pi 的 extension 往一个固定的核心里注册：内建工具就是 read / write / edit / bash 四件，
+  extension 加工具、加命令、加 hook，核心是被扩展的那一方，它自己不动。
+  dsh 的服务表里没有特权住户。<code>ctx.fs</code> 由 <code>dsh-fs-local</code> 这一行插件提供，
+  换成 <code>dsh-fs-sandbox</code> 就是配置里改一个包名（两个包分别导出
+  <code>LocalFileSystem</code> 和 <code>SandboxedFileSystem</code>，都 <code>super(ctx, 'fs')</code>）；
+  <code>ctx.tools</code> 由 <code>ToolRuntime</code> 提供，而 <code>ToolRuntime</code> 自己也只是一行。
+  能被换掉的东西里包括工具注册表本身。
+  Claude Code 那一侧连"进程内服务"这个概念都没有。MCP server 是另一个进程，隔着 wire protocol 说话，
+  买到了真隔离，代价是能加不能换：一个跑在别的进程里的 server 没有办法顶替宿主内部的某个实现。
+</div>
+
+<table class="vsgrid">
+<thead><tr>
+  <th></th><th class="dshcol">dsh</th><th>Pi</th><th>Claude Code</th><th>Codex CLI</th><th>OpenCode</th>
+</tr></thead>
+<tbody>
+<tr>
+  <td>扩展代码住在哪</td>
+  <td class="dshcol">宿主进程，配置树里的一行</td>
+  <td>宿主进程，TypeScript extension</td>
+  <td>MCP 在子进程；hook / Agent Skill / subagent 在宿主侧</td>
+  <td>MCP 在子进程；宿主侧靠 config profile</td>
+  <td>Go 服务端进程，客户端另开</td>
+</tr>
+<tr>
+  <td>扩展抓着的把手</td>
+  <td class="dshcol">服务名。可以占一个 <code>ctx.&lt;key&gt;</code>，也可以顶掉别人占的那个</td>
+  <td>核心给出的注册点</td>
+  <td>约 15 个固定内建工具，外加几个扩展面</td>
+  <td>固定内建工具，外加 MCP 与 approval mode</td>
+  <td>OpenAPI 3.1 端点</td>
+</tr>
+<tr>
+  <td>一个进程里同名能力存两份</td>
+  <td class="dshcol"><span class="y">有</span>，isolate realm</td>
+  <td><span class="n">未见</span></td>
+  <td><span class="n">未见</span></td>
+  <td><span class="n">未见</span></td>
+  <td><span class="p">另一种切法</span>，见 §2.5</td>
+</tr>
+</tbody>
+</table>
+
+<div class="note warn">
+  <span class="tag">这套架构挨的批评</span>
+  开源当天 HN 那条主线程（item 49285244，545 分 234 条评论，2026-08-13）里，
+  反对声很少落在 Proxy 或 realm 上。挨批的是"一切皆插件"本身。
+  <code>invaliduser</code> 说的是插件疲劳：
+  "Every product relying on community plugins works fine the 6 first months,
+  then it's a nightmare of incompatible, deprecated plugins, with no consistency and no governance."
+  <code>bdcravens</code> 往下推了一层：厂商为了把生态点起来总要自己先写一大批插件，
+  用户又倾向于只信"官方"那批，于是得到的是 "a mono-vendor ecosystem with extra steps"。
+  这两条落在治理上，架构反驳不了。
+  能给的只有一个当下的观察：dsh 自己的 <code class="srcpath">packages/extensions/tool-cordis</code>
+  在 <code>src/index.ts</code> 里注册了 7 个工具，同目录的 README 只列了 5 个。
+  一个包、一个厂商、发布当天，文档就已经落后于代码。
+</div>
+
+<h2><span class="num">§2.2</span>Context 是一个 Proxy</h2>
+
+<p>
+<code>ctx.fs</code> 这个写法有点反常。它看起来是读一个普通属性，可 <code>fs</code> 是运行时才被登记进来的，
+而且不同的 <code>ctx</code> 读同一个名字可能拿到不同的东西。普通属性做不到这个。
+真实实现直接把整个 Context 包成了 Proxy，而且是在构造函数里包的，返回的不是 <code>this</code>：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">vendor/cordis/src/context.ts · 构造函数（节选）</span></div>
+<pre><code data-lang="js">constructor() {
+  this[symbols.isolate] = Object.create(null)
+  this[symbols.intercept] = Object.create(null)
+  const self = new Proxy&lt;this&gt;(this, ReflectService.handler)   // ← 关键这一行
+  this.root = self
+  this.fiber = new Fiber(self, {}, Object.create(null), null, () =&gt; [])
+  this.reflect = new ReflectService(self)
+  this.registry = new RegistryService(self)
+  this.events = new EventsService(self)
+  this.logger = new LoggerService(self)
+  return self                                                  // ← 你拿到的永远是 Proxy
+}</code></pre>
+</div>
+
+<p>
+所有子 context 都是这个 Proxy 的<strong>原型后代</strong>。<code>ctx.extend(meta)</code> 做的是
+<code>Object.create(proxy)</code>，然后把 <code>meta</code> 定义成自有属性。
+Proxy 当原型用的时候，后代对象上<em>找不到</em>的属性读取依然会触发 Proxy 的 <code>get</code> trap，
+而且 <code>receiver</code> 是那个后代对象。一份 trap 代码因此同时服务于成千上万个子 context，
+每次都知道是谁在读。
+</p>
+
+<p>
+trap 里的分派规则是这样的：
+</p>
+
+<div class="diagram">ctx.fs
+  │
+  ├─ prop 是 symbol / "then" / "prototype" / 数字串 / _开头 ──► Reflect.get，当普通属性
+  ├─ target 上本来就有这个属性（root / fiber / reflect ...）──► Reflect.get，当普通属性
+  │
+  └─ 否则进入服务解析
+       ├─ 插件 ctx  (fiber.runtime != null)
+       │    ├─ inject 里声明过 ──► fiber.store["fs"].value   ← 激活那一刻冻结的那份实现
+       │    └─ 没声明过        ──► throw  cannot get property "fs" without inject
+       │
+       └─ 根 ctx    (fiber.runtime == null)
+            └─ reflect.store[ ctx[isolate].fs ]?.value       ← 查不到就是 undefined</div>
+
+<p>
+把 <code>then</code> 排除掉不是洁癖：如果 <code>ctx.then</code> 被当成服务解析，
+任何人 <code>await ctx</code> 都会炸。真实实现里这条规则叫 <code>isSpecialProperty</code>，
+拒绝 symbol、<code>prototype</code>、<code>then</code>、纯数字字符串和下划线前缀。
+</p>
+
+<p>
+另一半机制在存储层。服务表按<strong>隔离符号</strong>存，名字只用来查符号：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">vendor/cordis/src/reflect.ts · ReflectService.provide 的核心（节选）</span></div>
+<pre><code data-lang="js">// 名字的"根 realm 符号"，只铸一次
+this.ctx.root[symbols.isolate][name] ??= Symbol(name)
+// 当前 ctx 所在 realm 的符号，两者可以不同
+const key = this.ctx[symbols.isolate][name]
+const impl: Impl = { name, value, fiber: this.ctx.fiber, check }
+if (this.store[key]) {
+  throw new Error(`service "${name}" has been registered at &lt;${this.store[key].fiber.name}&gt;`)
+}
+this.store[key] = impl
+this.ctx.fiber.store![name] = impl</code></pre>
+</div>
+
+<p>
+<code>store</code> 的类型是 <code>Dict&lt;Impl, symbol&gt;</code>，键是 symbol。
+一个名字对应几个 symbol，就能同时存在几份实现，§2.5 全靠这一点。
+<code>Impl</code> 里还记了 <code>fiber</code>，也就是说谁登记的，这份实现的寿命就跟谁一样长。
+</p>
+
+<p>下面是我们自己的版本。三个 trap，三十行，页面上跑的就是它：</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-cordis · createHandler() · 页面上运行的就是这段代码</span></div>
+  <pre><code id="src-handler" data-lang="js"></code></pre>
+</div>
+
+<div class="note warn">
+  <span class="tag">我们简化掉的一处</span>
+  真实的 get trap 在插件 ctx 里解析不到时会沿 fiber 链向上爬，
+  一边爬一边比较 <code>fiber.parent[isolate][prop]</code> 和根 realm 符号，realm 一变就停下来报错。
+  我们直接只查 <code>fiber.store</code>，也就是激活时冻结的那份快照。
+  对已经 inject 过的服务，两者结果一致，差别只在没声明的名字能不能从祖先那里偶然读到。
+  §2.7 附了真实那段的原文。
+</div>
+
+<div class="demo" id="d-proxy">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 2.1</span>Proxy 反射：注册、读取、卸载</div>
+    <div class="spacer"></div>
+    <button class="btn primary" data-act="run">运行</button>
+    <button class="btn" data-act="provide">注册 fs</button>
+    <button class="btn" data-act="revoke">卸载 fs</button>
+    <button class="btn" data-act="peek">打印 store</button>
+  </div>
+  <div class="demo-body">
+    <div class="out" id="out-proxy"></div>
+  </div>
+</div>
+
+<p>
+"运行"跑完整的六步序列，跑完之后三个手动按钮还能继续在同一个 root 上折腾。
+第 6 步值得多看一眼：<code>fs</code> 已经被卸载了，<code>ctx.fs</code> 是 <code>undefined</code>，
+可 <code>'fs' in ctx</code> 仍然是 <code>true</code>。<code>props</code> 表记的是"这个名字被声明过"，
+<code>store</code> 记的是"这个名字现在有实现"，provide 的 disposer 只清后者。
+这个区别在类型系统里也成立：<code>Context</code> 接口被声明合并扩了字段，不代表运行时一定有值。
+</p>
+
+<h2><span class="num">§2.3</span>Service 是自注册的</h2>
+
+<p>
+上面用的是裸的 <code>ctx.provide(name, value)</code>。真实的 dsh 服务几乎不这么写，
+它们继承 <code>Service</code>，注册动作藏在 <code>super()</code> 里：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">vendor/cordis/src/service.ts · 构造函数（节选）</span></div>
+<pre><code data-lang="js">constructor(protected ctx: Context, name: string) {
+  name ??= this.constructor['provide'] as string
+  let self = this
+  const tracker: Tracker = { associate: name, property: 'ctx' }
+  if (self[symbols.invoke]) {
+    // 带 invoke 体的服务会变成可调用对象，比如 ctx.logger('agent')
+    const proto = joinPrototype(Object.getPrototypeOf(this), Function.prototype)
+    self = createCallable(name, proto, tracker)
+  }
+  self.ctx = ctx
+  self.name = name
+  defineProperty(self, symbols.tracker, tracker)
+
+  self.ctx.reflect.provide(name, self, this[symbols.check])    // ← 注册就是这一行
+  return self
+}</code></pre>
+</div>
+
+<p>
+一个真实的例子，dsh 的工具运行时：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">packages/core/tools/src/index.ts:787 · ToolRuntime（节选）</span></div>
+<pre><code data-lang="js">export class ToolRuntime extends Service {
+  static inject = ['systemPrompt']
+
+  constructor(ctx: Context, config: Config = {}) {
+    super(ctx, 'tools')                                    // 从这一行起，ctx.tools 就是它
+    this.defaultMode = config.mode ?? 'native'
+    this.maxParallelSubCalls = resolveMaxParallelSubCalls(config.maxParallelSubCalls)
+    ctx.systemPrompt.tools(context =&gt; this.wireSchemas(context.scope))   // 直接用，不判空
+    ...
+  }
+}</code></pre>
+</div>
+
+<p>
+这几行里有三个点。
+</p>
+
+<p>
+第一，类本身就是插件。没有 <code>register()</code>，没有 <code>init()</code>，
+<code>ctx.plugin(ToolRuntime)</code> 就是挂载，构造完成即可用。
+</p>
+
+<p>
+第二，<code>static inject = ['systemPrompt']</code> 是构造函数敢直接写
+<code>ctx.systemPrompt.tools(...)</code> 的全部理由。它不判空、不 try、不轮询，
+因为 inject 已经保证了这个类<em>根本不会</em>在 <code>systemPrompt</code> 缺席时被构造。
+依赖注入最实际的收益就在这儿：删掉防御性代码。
+</p>
+
+<p>
+第三，注册的所有权属于挂载它的 fiber。<code>provide</code> 整个包在
+<code>this.ctx.fiber.effect(...)</code> 里，fiber 卸载时 disposer 反序执行，
+<code>ctx.tools</code> 自动从 store 里消失，依赖它的插件跟着停。没有人需要手写 <code>unregister()</code>。
+</p>
+
+<p>
+顺着"注册"这条线，有件事放在这里说正好。dsh 的多 provider 适配器
+<code class="srcpath">packages/llm/llm-pi-ai</code> 依赖 <code>@earendil-works/pi-ai@^0.82.1</code>，
+也就是 Pi 的模型层。极繁的这个 harness 直接拿极简那个 harness 的模型库来用。
+而它接进来的方式，就是本节讲的这一套：<code>export const inject = ['llm']</code>，
+然后在 <code>apply()</code> 里 <code>ctx.llm.registerAdapter(routes, adapter)</code>。
+pi-ai 本身是一个被 <code>import</code> 进来的普通库，
+它能在运行时被换掉，靠的是外面这层十几行的插件壳。
+</p>
+
+<p>我们的 <code>Service</code> 只留骨架，而骨架就是它的全部意思：</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-cordis · Service · 页面上运行的就是这段代码</span></div>
+  <pre><code id="src-service" data-lang="js"></code></pre>
+</div>
+
+<div class="note">
+  <span class="tag">顺序陷阱</span>
+  <code>super(ctx, name)</code> 在子类字段赋值<em>之前</em>执行，也就是说服务被登记进 store 的那一刻，
+  它自己的字段还没初始化完。真实 cordis 为此留了 <code>Service[Service.init]</code>：
+  一个构造完成后才跑的实例方法。同步的消费方读不到半成品，是因为
+  provide 的通知发生在同一个同步块里，而 consumer 的 <code>apply</code> 会等到它自己被激活时才执行。
+</div>
+
+<h2><span class="num">§2.4</span>inject：加载顺序从依赖里长出来</h2>
+
+<p>
+现在回答一个很多插件系统答错的问题。consumer 先挂载，provider 后挂载，怎么办？
+</p>
+
+<p>
+错答案有几种。按配置文件顺序加载，那等于手写启动序列。让 consumer 自己轮询等待，
+那每个插件都得写一遍等待逻辑。报错、要求用户排好顺序，这个最省事，
+代价是"第三方插件接管 fs"永远做不到。
+</p>
+
+<p>
+Cordis 的做法是让 consumer 挂载后停在 <code>PENDING</code>，<code>apply</code> 一次都不跑。
+provider 出现时，<code>reflect.notify(['fs'])</code> 扫一遍所有 fiber，
+把 inject 了 <code>fs</code> 的那些重新算一次依赖状态，够条件的当场激活。
+判断依赖状态变没变，用的是一个字符串，叫 <strong>epoch</strong>：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">vendor/cordis/src/fiber.ts:611 · _refresh 的 epoch 计算（节选）</span></div>
+<pre><code data-lang="js">_refresh() {
+  let epoch: string | boolean = false
+  epoch = ''
+  for (const name of Object.keys(this.inject)) {
+    const impl = this._store[name]
+    if (!impl) {
+      epoch = INACTIVE        // 少一个依赖 -> 整体不可用
+      break
+    }
+    epoch += ':' + impl.fiber.uid     // 拼的是"提供方 fiber 的身份"，不是服务的值
+  }
+  ...
+}</code></pre>
+</div>
+
+<p>
+拼的是 <code>impl.fiber.uid</code>，不是服务的值。这一个选择决定了四种行为：
+</p>
+
+<ul>
+  <li>依赖齐了，epoch 从 <code>INACTIVE</code> 变成字符串，加载。</li>
+  <li>依赖没了，epoch 变回 <code>INACTIVE</code>，卸载，而且是级联的。</li>
+  <li>依赖<em>换人</em>了。名字没变，值可能长得一样，可 uid 变了，epoch 也就变了，先卸载再加载。</li>
+  <li>依赖没动，epoch 相同，什么都不做。热重载时这一条最要紧，它避免了无谓的重启风暴。</li>
+</ul>
+
+<p>
+第三条是"运行时换 provider"能成立的全部原因。它也带来一个必须接受的后果：
+一个插件的 <code>apply</code> 可能被执行多次，所以它做的每件事都必须可撤销。
+第 3 章的 <code>ctx.effect()</code> 就是为这个而生的。
+</p>
+
+<div id="p-inject"></div>
+
+<div class="demo" id="d-inject">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 2.2</span>inject 驱动激活：consumer 先挂，provider 后到</div>
+    <div class="spacer"></div>
+    <button class="btn primary" data-act="run">运行</button>
+    <button class="btn" data-act="strip">把 inject 声明删掉</button>
+    <button class="btn" data-act="reset">清空</button>
+  </div>
+  <div class="demo-body">
+    <div class="out" id="out-inject"></div>
+  </div>
+</div>
+
+<p>
+"运行"是四幕：consumer 先挂着不动；本地 provider 到场，consumer 自动激活；
+provider 换成沙箱实现，consumer 卸载后再次激活；provider 全部撤走，consumer 掉回 pending。
+全程没有一行代码在协调加载顺序，<code>inject: ['fs']</code> 就是全部的协调。
+旁边那个按钮把这一行删掉，你会看到它买的到底是什么。
+</p>
+
+<h2><span class="num">§2.5</span>isolate realm：同一个名字，两份实现</h2>
+
+<p>
+最后一个问题最有 harness 特色。<code>ctx.fs</code> 这个名字是全局约定，
+所有工具、所有插件都写 <code>ctx.fs.read(...)</code>。
+可两个会话可能需要两份完全不同的 fs，一个在 <code>/work/session-1</code>，一个在沙箱里。
+名字不能改，改了工具全废。实现必须不同。
+</p>
+
+<p>
+按名字存的表办不到这件事。按 symbol 存的表可以：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">vendor/cordis/src/context.ts:121 · isolate</span></div>
+<pre><code data-lang="js">isolate(name: string, label?: symbol) {
+  const shadow = Object.create(this[symbols.isolate])   // 原型链继承父 ctx 的 realm 映射
+  shadow[name] = label ?? Symbol(name)                  // 只改一个名字的去向
+  return this.extend({ [symbols.isolate]: shadow })
+}</code></pre>
+</div>
+
+<p>
+isolate 映射本身是一条原型链：子 ctx 只覆盖它关心的那个名字，其余全部沿用父 ctx 的符号。
+所以"给会话一份自己的 fs"这件事的代价，是一个新 symbol 加一个新对象。
+</p>
+
+<div class="diagram">root[isolate]              = { fs: Symbol(fs) }        ← provide 无条件铸的根符号
+  ├─ s1[isolate] ─proto─►    { fs: Symbol(fs) }        s1 自己的符号
+  └─ s2[isolate] ─proto─►    { fs: Symbol(fs) }        s2 自己的符号
+
+reflect.store = {
+  [ s1 的符号 ]: { name: "fs", value: LocalFs("/work/session-1"), fiber: &lt;fs@s1&gt; },
+  [ s2 的符号 ]: { name: "fs", value: LocalFs("/work/session-2"), fiber: &lt;fs@s2&gt; },
+  [ 根 符 号  ]: 不存在   ← 根 realm 解析不出 fs，所以两个会话永远撞不上
+}</div>
+
+<p>
+这里有个反直觉的细节。<code>provide</code> 会无条件地为名字铸出根 realm 符号
+（<code>this.ctx.root[symbols.isolate][name] ??= Symbol(name)</code>），
+所以"名字在根 realm 里"这半句是<em>真的</em>。可根符号下面没有任何实现，
+所以"根 realm 能解析出这个服务"这半句是<em>假的</em>。dsh 的测试专门把这两半都钉住了：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">packages/boot/app-boot/tests/config-reload.spec.ts:417 · 原文注释与断言</span></div>
+<pre><code data-lang="js">// `provide` mints the root symbol unconditionally (cordis `reflect.ts`),
+// so the name IS in the root realm — pinned here because it is the half
+// that looks like the claim and is not. The claim is the other half: no
+// implementation is stored under that symbol, so the root realm cannot
+// resolve the service and a second composition mounting the same rows
+// cannot collide with this one.
+const rootKey = ctx.root[Context.isolate].demoRealmSvc
+expect(rootKey).toBeDefined()
+expect(ctx.reflect.store[rootKey!]).toBeUndefined()</code></pre>
+</div>
+
+<p>
+在 YAML 组合层（第 7 章），realm 是一个配置字段。<code>cordis:group</code> 行可以给一组行
+（一个 provider 加它的若干 consumer）分配同一个 realm：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">packages/boot/app-boot/tests/config-reload.spec.ts:397 · 真实的 group 配置</span></div>
+<pre><code data-lang="yaml">- id: realm
+  name: cordis:group
+  isolate:
+    # true = entry-local realm；写字符串 = 具名 realm，可跨 entry 共享
+    demoRealmSvc: true
+  config:
+    - id: provider
+      name: ./provider.mjs
+    - id: consumer
+      name: ./consumer.mjs</code></pre>
+</div>
+
+<p>
+<code>true</code> 对应 <code>LocalRealm</code>（后缀 <code>#entryId</code>），字符串标签对应
+<code>GlobalRealm</code>（后缀 <code>@label</code>），实现都在
+<code class="srcpath">vendor/loader/src/config/isolate.ts</code>。
+标签没人引用时 realm 会被回收，这是那个文件里 <code>loader/partial-dispose</code> 钩子干的事。
+</p>
+
+<div class="note warn">
+  <span class="tag">这在 dsh 里不是可选项</span>
+  agent preset 的 <code>mount()</code> 会主动拒绝三种结果，其中一种是"把服务发布到 root realm 的行"。原文：
+  "Such a service is process-global, so the second preset publishing the same name collides with the
+  first, and a host reader would resolve one preset's instance for every session."
+  这条规则不是启动时审计一次就完事：
+  "The package invariant re-checks that last rule on every service notification"，
+  因为定时器或异步续延里的 <code>provide</code> 会绕过一次性审计。
+  出处 <code class="srcpath">packages/preset/agent-presets/README.md</code> 的 "What a mount rejects"。
+</div>
+
+<div class="note vs">
+  <span class="tag">换成别的 harness</span>
+  per-session 的服务实例，是"一个进程同时服务多个能力集不同的会话"的前提。
+  会话 A 的 <code>ctx.fs</code> 落在沙箱里，会话 B 的落在工作区，两边的工具代码一个字都不用改，
+  它们读的名字一样，realm 不一样。agent preset 的 README 把这层复用说得更直白：entry-local realm
+  "keep two presets' same-named services apart exactly as they once kept two sessions' apart"。
+  OpenCode 的 client/server 拆分解决的是另一个方向。
+  Go 服务端持有执行生命周期，对外开 OpenAPI 3.1，于是 CLI、桌面、网页、脚本可以同时贴到<em>同一个</em>会话上。
+  那是多客户端对一个会话，这里是一个进程里多个组装方式不同的会话。
+</div>
+
+<div class="demo" id="d-realm">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 2.3</span>isolate realm：两个会话，一个名字</div>
+    <div class="spacer"></div>
+    <button class="btn primary" data-act="run">运行（两个 realm）</button>
+    <button class="btn" data-act="collide">对照：都留在 root realm</button>
+  </div>
+  <div class="demo-body">
+    <div class="out" id="out-realm"></div>
+  </div>
+</div>
+
+<p>
+"运行"里两个会话各自 <code>isolate('fs')</code> 之后挂载自己的 <code>LocalFs</code>，
+两个 consumer 各读到自己那份，末尾把根 realm 的两半事实都打出来。
+"对照"按钮把两个 provider 都留在根 realm，第二个 fiber 以 <code>failed</code> 收场，
+错误消息里带着先注册者的 fiber 名字。preset 审计要拦的就是这个。
+</p>
+
+<h2><span class="num">§2.6</span>本章的产物</h2>
+
+<p>
+三段东西：三个 Proxy trap、一个 root context、一个 <code>Service</code> 基类，
+去掉注释一百五十行出头。它有 Proxy 反射、有按 symbol 隔离的 store、有 inject 驱动的激活、
+有 epoch 比较，够我们把后面几章的东西挂上去了。
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh v0.2 · createHandler() + createRoot() + Service · 页面上三个 demo 跑的都是它</span></div>
+  <pre><code id="src-mini" data-lang="js"></code></pre>
+</div>
+
+<p>
+和第 1 章的 <code>miniLoop(deps)</code> 接上：<code>deps</code> 里的每一项现在都可以是一个服务。
+<code>miniLoop</code> 自己也可以变成一个插件，声明 <code>inject: ['model', 'tools', 'sessions']</code>，
+然后由运行时决定它什么时候开始跑。
+</p>
+
+<div class="note good">
+  <span class="tag">下一章预告</span>
+  这版有三个地方明显在硬撑。<code>fiber.disposers</code> 是我手搓的数组，插件自己往里塞东西要越过封装；
+  <code>refresh</code> 是同步的，真实的加载必须异步（provider 的 <code>apply</code> 里可能有
+  <code>await</code>），一异步就有"过期加载"问题；<code>state</code> 我只用了
+  <code>pending / active / failed / disposed</code> 四个值，缺了 <code>LOADING</code> 和
+  <code>UNLOADING</code> 这两个"正在切换"的中间态。
+  第 3 章把这个 fiber 记录换成真正的状态机，并且引入 <code>ctx.effect()</code>：
+  每一次注册都返回 disposer，卸载时反序回收。
+  那一章还要正面接一条 HN 上的技术质疑，<code>OutOfHere</code> 的
+  "Using memory to track inverses does not scale."
+</div>
+
+<h2><span class="num">§2.7</span>回到真实的 dsh</h2>
+
+<p>
+本章对应的真实代码在 <code class="srcpath">vendor/cordis/src/</code>。
+最该读的是 get trap 里那段循环，它比我们的版本多做了一件事：沿 fiber 链向上找，
+并在 realm 边界处停下来。
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">vendor/cordis/src/reflect.ts:153 · get trap 的核心（原文）</span></div>
+<pre><code data-lang="js">return ctx.events.waterfall('internal/get', ctx, prop, error, () =&gt; {
+  const key = target[symbols.isolate][prop]
+  let fiber = (ctx[symbols.shadow] ?? ctx).fiber
+  while (true) {
+    const impl = fiber.store?.[prop]
+    if (impl) return getTraceable(ctx, impl.value)
+    if (prop in fiber.inject) {
+      error.message = `cannot get required service "${prop}" in inactive context`
+      throw error
+    }
+    if (!fiber.runtime) throw error
+    if (fiber.parent[symbols.isolate][prop] !== key) throw error
+    fiber = fiber.parent.fiber
+  }
+})</code></pre>
+</div>
+
+<p>
+注意第一行：整个解析过程本身是一个 <code>waterfall</code> 事件（<code>internal/get</code>）。
+也就是说"读一个服务"这件事是可拦截的扩展点，不只是一次查表。第 4 章会专门讲 waterfall。
+还有一处容易漏掉的事实：<code>ctx</code> 上一半的方法根本不是 <code>Context</code> 类的成员，
+而是 <code>ReflectService</code> 构造时 mixin 上去的：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">vendor/cordis/src/reflect.ts:219 · ctx 的方法从哪来</span></div>
+<pre><code data-lang="js">this.mixin('reflect', ['get', 'set', 'provide', 'accessor', 'mixin'])
+this.mixin('fiber', ['runtime', 'effect'])
+this.mixin('registry', ['inject', 'plugin'])
+this.mixin('events', ['on', 'once', 'parallel', 'emit', 'serial', 'bail', 'waterfall'])</code></pre>
+</div>
+
+<p>
+所以 <code>ctx.provide</code> 其实是 <code>ctx.reflect.provide</code>，
+<code>ctx.plugin</code> 是 <code>ctx.registry.plugin</code>，<code>ctx.on</code> 是 <code>ctx.events.on</code>，
+<code>ctx.effect</code> 是 <code>ctx.fiber.effect</code>。每个 mixin 都是一个 accessor，
+随 fiber 卸载而消失。
+</p>
+
+<p>几个我们刻意省掉的真实细节：</p>
+
+<ul>
+  <li><code>getTraceable</code>。服务从 store 里取出来时会被
+  <code>getTraceable(ctx, impl.value)</code> 包一层 Proxy，让服务内部读到的
+  <code>this.ctx</code> 是<em>调用方</em>的 context，而不是注册方的。
+  所以 <code>ctx.reflect.provide()</code> 从子 ctx 调用时会登记到子 ctx 的 realm：
+  <code>reflect.ctx</code> 是动态的。实现在
+  <code class="srcpath">vendor/cordis/src/utils.ts</code> 的 <code>createTraceable</code>。</li>
+  <li><code>check</code> 谓词。<code>provide(name, value, check)</code> 的第三个参数是一个可用性判断。
+  实现存在但 <code>check()</code> 返回 false，依赖方照样进不了 active（见 <code>Fiber._checkImpl</code>）。
+  <code>Service</code> 子类通过 <code>this[Service.check]</code> 提供它。</li>
+  <li>卸载是异步且有序的。provide 的 disposer 先删 store、再 notify，
+  然后 <code>await Promise.allSettled(fibers.map(fiber =&gt; fiber.await()))</code>，
+  最后才删 <code>fiber.store[name]</code>。源码注释写着
+  "ensure self access before dependencies cleanup"，意思是依赖方在自己的清理代码里还能读到这个服务。
+  我们的 disposer 是同步的，没有这个保证。</li>
+  <li><code>intercept</code>。<code>ctx.intercept(name, config)</code> 沿原型链累积 per-service 配置，
+  <code>Service[symbols.resolveConfig]</code> 合并时祖先在前、<code>head</code> 优先级最高。
+  同一个服务可以被不同子树看到不同配置。</li>
+  <li><code>ctx.accessor()</code> 与 <code>props</code> 表。除了 <code>'service'</code>，
+  一个名字还可以被声明成 <code>'accessor'</code>（带 get/set 钩子的计算属性），两种声明互斥，
+  抢同一个名字会抛 <code>property "x" is already declared as ...</code>。</li>
+  <li><code>Context.is()</code> 用全局 symbol 做品牌（<code>Symbol.for('cordis.is')</code>），
+  不用 <code>instanceof</code>，这样跨 realm、跨多份 cordis 拷贝都能认出 context。</li>
+</ul>
+
+<div class="note src">
+  <span class="tag">自己去读</span>
+  <code class="srcpath">vendor/cordis/src/context.ts</code> — Context 类；构造函数里的 <code>new Proxy</code>；<code>extend</code> / <code>isolate</code> / <code>intercept</code><br>
+  <code class="srcpath">vendor/cordis/src/reflect.ts</code> — <code>ReflectService.handler</code> 的 get/set/has 三个 trap；<code>store</code> / <code>props</code>；<code>provide</code> / <code>notify</code> / <code>accessor</code> / <code>mixin</code><br>
+  <code class="srcpath">vendor/cordis/src/service.ts</code> — <code>Service</code> 基类，构造函数里的自注册与 <code>resolveConfig</code><br>
+  <code class="srcpath">vendor/cordis/src/registry.ts</code> — <code>RegistryService.plugin()</code> / <code>inject()</code>；<code>Inject.resolve()</code>；插件的三种形态<br>
+  <code class="srcpath">vendor/cordis/src/fiber.ts</code> — <code>FiberState</code> 六个状态；<code>_checkImpl</code> / <code>_refresh</code> 的 epoch 比较（第 3 章的主角）<br>
+  <code class="srcpath">vendor/loader/src/config/isolate.ts</code> — <code>Realm</code> / <code>LocalRealm</code> / <code>GlobalRealm</code>，YAML 里的 <code>isolate</code> 字段怎么变成 symbol<br>
+  <code class="srcpath">docs/cordis-primer.md</code> — 官方的五点概括与 dispatch mode 表<br>
+  <code class="srcpath">packages/preset/agent-presets/README.md</code> 的 "What a mount rejects" — 为什么 preset 里的 service 必须待在 isolate realm
+</div>
+
+</main>
+<aside id="dsh-toc"></aside>
+</div>
+
+<script>
+// ===================================================================
+// mini-dsh v0.2 - Context, service registry, inject-driven activation.
+// The listings on this page are rendered from these very functions.
+// ===================================================================
+
+// 与真实 cordis 用的是同一个 key（vendor/cordis/src/utils.ts 的 symbols.isolate）
+var ISOLATE = Symbol.for('cordis.isolate');
+
+/** ctx 上普通属性读写的三个 trap：服务解析全部发生在这里。 */
+function createHandler(reflect) {
+  // symbol / then / 下划线开头：内部字段，永远不当服务看
+  const isSpecial = (prop) =>
+    typeof prop === 'symbol' || prop === 'then' || prop[0] === '_';
+
+  return {
+    get(target, prop, ctx) {
+      // 内部字段、以及 target 上本来就有的属性：当普通属性处理
+      if (isSpecial(prop) || Reflect.has(target, prop)) {
+        return Reflect.get(target, prop, ctx);
+      }
+      const fiber = ctx.fiber;
+      if (fiber.runtime) {
+        // 插件 ctx：只能读 inject 过的名字，读到的是激活那一刻冻结的那份实现
+        if (fiber.store && prop in fiber.store) return fiber.store[prop].value;
+        throw new Error('cannot get property "' + prop + '" without inject');
+      }
+      // 根 ctx：直接查 store，没有实现就是 undefined
+      const impl = reflect.store[ctx[ISOLATE][prop]];
+      return impl && impl.value;
+    },
+
+    set(target, prop, value, ctx) {
+      if (isSpecial(prop) || Reflect.has(target, prop)) {
+        return Reflect.set(target, prop, value, ctx);
+      }
+      const impl = reflect.store[ctx[ISOLATE][prop]];
+      if (!impl) {
+        throw new Error('cannot set property "' + prop + '" without provide');
+      }
+      if (impl.fiber !== ctx.fiber) {
+        // 只有登记者本人能改这个名字下的值
+        throw new Error('cannot set property "' + prop + '" in multiple fibers');
+      }
+      impl.value = value;
+      return true;
+    },
+
+    // 名字被声明过就算存在，哪怕当前没有实现
+    has(target, prop) {
+      return Reflect.has(target, prop) || (!isSpecial(prop) && !!reflect.props[prop]);
+    },
+  };
+}
+
+/** 造一个 root context：服务表 + 插件表 + 依赖驱动的激活。 */
+function createRoot(trace) {
+  trace = trace || function () {};
+  const reflect = { store: Object.create(null), props: Object.create(null) };
+  const registry = [];        // 所有挂载过的 fiber
+  let uid = 0;
+
+  function status(fiber, state) {
+    if (fiber.state === state) return;
+    fiber.state = state;
+    trace('internal/status', { fiber: fiber.name, state: state });
+  }
+
+  // ---- 依赖状态变了：重算 epoch，决定卸载 / 激活 / 什么都不做 ----------
+  function refresh(fiber) {
+    const snapshot = Object.create(null);
+    let epoch = '';
+    for (const name of fiber.inject) {
+      const impl = reflect.store[fiber.ctx[ISOLATE][name]];
+      if (!impl || impl.fiber.state !== 'active') { epoch = null; break; }
+      snapshot[name] = impl;
+      epoch += ':' + impl.fiber.uid;      // 拼的是提供方 fiber 的身份：换人就要重跑
+    }
+    if (epoch === fiber.epoch) return;    // 依赖没动，什么都不做
+    if (fiber.state === 'active') unload(fiber);
+    fiber.epoch = epoch;
+    if (epoch === null) return status(fiber, 'pending');
+    fiber.store = snapshot;
+    status(fiber, 'active');
+    try {
+      fiber.apply(fiber.ctx);
+    } catch (err) {
+      fiber.error = err;
+      fiber.epoch = null;
+      status(fiber, 'failed');
+    }
+  }
+
+  function unload(fiber) {
+    fiber.disposers.splice(0).reverse().forEach((dispose) => dispose());
+    fiber.store = null;
+    status(fiber, 'pending');
+  }
+
+  // ---- 一个名字变了：所有 inject 了它的 fiber 重新算一次 ---------------
+  function notify(names) {
+    for (const fiber of registry.slice()) {
+      if (fiber.state === 'disposed') continue;
+      if (names.some((name) => fiber.inject.includes(name))) refresh(fiber);
+    }
+    names.forEach((name) => trace('internal/service', { name: name }));
+  }
+
+  const target = {
+    reflect: reflect,
+    registry: registry,
+    fiber: { name: 'root', uid: 0, runtime: null, inject: [], state: 'active',
+             store: Object.create(null), disposers: [] },
+    [ISOLATE]: Object.create(null),
+
+    /** 派生子 ctx：原型继承，父 ctx 不被修改。 */
+    extend(meta) {
+      const self = Object.create(this);
+      for (const key of Reflect.ownKeys(meta)) {
+        Object.defineProperty(self, key, { value: meta[key] });
+      }
+      return self;
+    },
+
+    /** 给一个名字换 realm：往下的 provide / inject 都在新符号下解析。 */
+    isolate(name, label) {
+      const shadow = Object.create(this[ISOLATE]);
+      shadow[name] = label || Symbol(name);
+      return this.extend({ [ISOLATE]: shadow });
+    },
+
+    /** 非严格读取：绕过 inject 要求，没有就是 undefined。 */
+    get(name) {
+      const impl = reflect.store[this[ISOLATE][name]];
+      return impl && impl.value;
+    },
+
+    /** 登记一份实现。所有权属于当前 fiber，fiber 走了它也走。 */
+    provide(name, value) {
+      reflect.props[name] = 'service';
+      if (!this.root[ISOLATE][name]) this.root[ISOLATE][name] = Symbol(name);
+      const key = this[ISOLATE][name];
+      if (reflect.store[key]) {
+        const owner = reflect.store[key].fiber.name;
+        throw new Error('service "' + name + '" has been registered at <' + owner + '>');
+      }
+      const fiber = this.fiber;
+      const impl = reflect.store[key] = { name: name, value: value, fiber: fiber };
+      fiber.store[name] = impl;
+      const dispose = () => {
+        if (reflect.store[key] !== impl) return;
+        delete reflect.store[key];
+        delete fiber.store[name];
+        notify([name]);
+      };
+      fiber.disposers.push(dispose);
+      notify([name]);
+      return dispose;
+    },
+
+    /** 挂载插件 { name, inject, apply }。依赖不全就停在 pending，apply 一次都不跑。 */
+    plugin(spec) {
+      const fiber = {
+        // 没名字的插件沿用最近的有名祖先，跟真实 Fiber.name 的规则一致
+        name: spec.name || this.fiber.name, uid: ++uid,
+        runtime: spec, apply: spec.apply,
+        inject: spec.inject || [], parent: this, state: 'pending',
+        epoch: undefined, store: null, disposers: [],
+      };
+      fiber.ctx = this.extend({ fiber: fiber });
+      fiber.dispose = () => { unload(fiber); status(fiber, 'disposed'); };
+      registry.push(fiber);
+      trace('internal/plugin', { fiber: fiber.name, inject: fiber.inject });
+      refresh(fiber);
+      return fiber;
+    },
+
+    /** ctx.plugin 的糖：先声明依赖，再给一段函数体。 */
+    inject(names, apply) {
+      return this.plugin({ name: apply.name, inject: names, apply: apply });
+    },
+  };
+
+  const root = new Proxy(target, createHandler(reflect));
+  target.root = root;
+  return root;
+}
+
+/** 服务基类：构造即注册，所有权属于挂载它的 fiber。 */
+class Service {
+  constructor(ctx, name) {
+    this.ctx = ctx;
+    this.name = name;
+    ctx.provide(name, this);
+  }
+}
+
+DSH.showSource('src-handler', createHandler);
+DSH.showSource('src-service', Service);
+DSH.showSource('src-mini', [createHandler, createRoot, Service]);
+
+// ===================================================================
+// Shared demo helpers.
+// ===================================================================
+
+/** 把内部事件打成日志，替代真实 cordis 的 internal/* 事件总线（第 4 章）。 */
+function mkTrace(o) {
+  return function (event, info) {
+    if (event === 'internal/status') {
+      o.dim('     · ' + event + '   <' + info.fiber + '>  ->  ' + info.state);
+    } else if (event === 'internal/service') {
+      o.dim('     · ' + event + '  name=' + info.name);
+    } else {
+      o.dim('     · ' + event + '   <' + info.fiber + '>  inject=[' + info.inject.join(', ') + ']');
+    }
+  };
+}
+
+function dumpStore(o, ctx) {
+  var store = ctx.reflect.store;
+  var keys = Reflect.ownKeys(store);
+  if (!keys.length) { o.dim('     reflect.store = {}   (空)'); return; }
+  keys.forEach(function (key) {
+    var impl = store[key];
+    o.log('     reflect.store[' + String(key) + '] = { name: "' + impl.name +
+          '", fiber: <' + impl.fiber.name + '> }');
+  });
+}
+
+function dumpFibers(o, ctx) {
+  if (!ctx.registry.length) { o.dim('     registry = []'); return; }
+  ctx.registry.forEach(function (f) {
+    var line = '     fiber <' + f.name + '>  uid=' + f.uid + '  state=' + f.state +
+               '  epoch=' + (f.epoch === null ? 'null' : JSON.stringify(f.epoch)) +
+               '  inject=[' + f.inject.join(', ') + ']';
+    if (f.state === 'active') o.ok(line);
+    else if (f.state === 'failed') o.bad(line);
+    else o.warn(line);
+  });
+}
+
+/** Demo 2.3 用的真实形态服务：继承 Service，构造即注册。 */
+class LocalFs extends Service {
+  constructor(ctx, cwd) {
+    super(ctx, 'fs');       // 注册发生在这里，此时 this.cwd 还没赋值
+    this.cwd = cwd;
+  }
+  read(path) { return 'read ' + this.cwd + '/' + path + '  -> 42 行'; }
+}
+
+// ===================================================================
+// Demo 2.1 - the proxy, the store, and the lifetime of one registration.
+// ===================================================================
+(function () {
+  var live = null;
+
+  function fsImpl(tag) {
+    return { tag: tag, read: function (p) { return '[' + tag + '] read ' + p + ' -> 42 行'; } };
+  }
+
+  function ensure(o) {
+    if (!live) {
+      o.dim('（没有活着的 root，先造一个）');
+      live = { ctx: createRoot(mkTrace(o)), dispose: null };
+    }
+    return live;
+  }
+
+  DSH.demo('d-proxy', {
+    init: function (o) {
+      o.dim('点“运行”跑完整序列，跑完之后三个手动按钮可以继续在同一个 root 上折腾。');
+    },
+
+    run: function (o) {
+      var t = mkTrace(o);
+      var ctx = createRoot(t);
+      live = { ctx: ctx, dispose: null };
+
+      o.head('1. 造一个 root context');
+      o.dim('   ctx = new Proxy(target, createHandler(reflect))，读属性会掉进 get trap');
+      o.log('     ctx.root === ctx  ->  ' + (ctx.root === ctx));
+      o.log("     'fs' in ctx  ->  " + ('fs' in ctx) + '   (还没人声明过这个名字)');
+      dumpStore(o, ctx);
+
+      o.head('2. ctx.provide("fs", localFs)');
+      live.dispose = ctx.provide('fs', fsImpl('local'));
+      dumpStore(o, ctx);
+      o.log('     ctx[isolate].fs  ->  ' + String(ctx[ISOLATE].fs) + '   (store 的键就是它)');
+      o.acc('     ctx.fs.read("README.md")  ->  ' + ctx.fs.read('README.md'));
+
+      o.head('3. 同一个 realm 里再注册一次同名 service');
+      try {
+        ctx.provide('fs', fsImpl('sandbox'));
+        o.bad('     居然成功了，这是 bug');
+      } catch (err) {
+        o.bad('     throw  ' + err.message);
+      }
+      o.dim('   一个 realm 一个名字只能有一份实现。想要两份，见 §2.5。');
+
+      o.head('4. set trap：没 provide 过的名字不能写');
+      try {
+        ctx.tools = {};
+        o.bad('     居然成功了，这是 bug');
+      } catch (err) {
+        o.bad('     throw  ' + err.message);
+      }
+
+      o.head('5. 插件 ctx 里裸读一个没 inject 的服务');
+      var peeker = ctx.plugin({
+        name: 'peeker',
+        apply: function (c) { c.fs.read('a.ts'); },     // 没写 inject: ['fs']
+      });
+      o.bad('     fiber <peeker> state=' + peeker.state + '   ' + peeker.error.message);
+      o.dim('   插件 ctx 的规则比根 ctx 严：没声明就读不到，哪怕实现明明在 store 里。');
+
+      o.head('6. dispose()：注册跟着 fiber 一起消失');
+      live.dispose();
+      live.dispose = null;
+      dumpStore(o, ctx);
+      o.log('     ctx.fs  ->  ' + ctx.fs);
+      o.log("     'fs' in ctx  ->  " + ('fs' in ctx) + '   ← 声明还在，实现没了');
+      o.dim('   props 表记"这个名字被声明过"，store 记"现在有实现"。');
+      o.dim('   disposer 只清 store，所以类型上有 ctx.fs 不等于运行时有值。');
+    },
+
+    provide: function (o) {
+      var w = ensure(o);
+      if (w.dispose) { o.warn('  fs 已经注册过了，先卸载。'); return; }
+      w.dispose = w.ctx.provide('fs', fsImpl('local'));
+      o.ok('  provide("fs") 成功。ctx.fs.tag = ' + w.ctx.fs.tag);
+    },
+
+    revoke: function (o) {
+      var w = ensure(o);
+      if (!w.dispose) { o.warn('  当前没有 fs 可卸。'); return; }
+      w.dispose();
+      w.dispose = null;
+      o.warn('  disposer 已执行。ctx.fs -> ' + w.ctx.fs);
+    },
+
+    peek: function (o) {
+      var w = ensure(o);
+      o.head('reflect.store 快照');
+      dumpStore(o, w.ctx);
+      dumpFibers(o, w.ctx);
+    },
+  });
+})();
+
+// ===================================================================
+// Demo 2.2 - activation is driven by inject, not by mount order.
+// The "strip inject" toggle shows what that one declaration buys.
+// ===================================================================
+(function () {
+  var stripped = false;
+
+  DSH.predict('p-inject', {
+    q: '下面这个 demo 里，provider 会被换掉一次。consumer 的 apply 一共成功跑几次？',
+    options: [
+      { label: '1 次', why: '服务名没变，值也可能长得一样，直觉上不该重跑。' },
+      { label: '2 次', ok: true, why: 'provider 的 fiber uid 换了，epoch 跟着变，consumer 先卸载再重新激活。' },
+      { label: '3 次' },
+      { label: '0 次，它一直在 pending' },
+    ],
+    explain: '第四幕会把计数打出来。',
+  });
+
+  function provider(name, tag, cwd) {
+    return {
+      name: name,
+      apply: function (c) {
+        c.provide('fs', {
+          tag: tag, cwd: cwd,
+          read: function (p) { return '[' + tag + '] read ' + cwd + '/' + p; },
+        });
+      },
+    };
+  }
+
+  /** consumer 插件。inject 做成参数，因为这个 demo 的问题就是"少了它会怎样"。 */
+  function makeReader(o, inject, count) {
+    return {
+      name: 'reader',
+      inject: inject,
+      apply: function (c) {
+        count.n++;
+        o.acc('     [reader] 第 ' + count.n + ' 次运行 apply：ctx.fs.tag = ' + c.fs.tag +
+              '，cwd = ' + c.fs.cwd);
+        o.acc('              ' + c.fs.read('README.md'));
+      },
+    };
+  }
+
+  async function whole(o) {
+    var ctx = createRoot(mkTrace(o));
+    var count = { n: 0 };
+
+    o.head('第一幕：consumer 先挂载，fs 还不存在');
+    ctx.plugin(makeReader(o, ['fs'], count));
+    dumpFibers(o, ctx);
+    o.dim('   apply 一次都没跑。这不是"启动失败"，是"还没轮到它"。');
+    o.dim('   epoch=null 就是 cordis 里的 INACTIVE。');
+    await DSH.wait(900);
+
+    o.head('第二幕：本地 provider 到场');
+    var p1 = ctx.plugin(provider('fs-local', 'local', '/repo'));
+    dumpFibers(o, ctx);
+    o.dim('   provide 触发 notify(["fs"])，reader 的 epoch 从 null 变成 ":' + p1.uid +
+          '"，于是激活。没有任何代码在协调顺序。');
+    o.dim('   provider 自己没有 inject，它的 epoch 是空串：没有依赖，所以永远算"依赖已齐"。');
+    await DSH.wait(900);
+
+    o.head('第三幕：换 provider');
+    o.dim('   先卸掉 fs-local。provide 的 disposer 挂在它的 fiber 上，跟着一起消失。');
+    p1.dispose();
+    dumpFibers(o, ctx);
+    o.dim('   reader 掉回 pending：依赖没了，它就不该继续活着。');
+    await DSH.wait(700);
+    o.dim('   再挂沙箱 provider。');
+    var p2 = ctx.plugin(provider('fs-sandbox', 'sandbox', '/tmp/box-7'));
+    dumpFibers(o, ctx);
+    o.dim('   epoch 变成 ":' + p2.uid + '"（provider 的 fiber uid 换了），reader 第二次运行 apply。');
+    o.dim('   服务名没变、consumer 代码没改、也没人重启进程。');
+    await DSH.wait(900);
+
+    o.head('第四幕：provider 全部撤走');
+    p2.dispose();
+    dumpFibers(o, ctx);
+    o.rule();
+    o.log('reader 的 apply 一共跑了 ' + count.n + ' 次。');
+    o.warn('这就是第 3 章的入口：apply 会被反复执行，所以它做的每件事都必须可撤销。');
+  }
+
+  /** 同一段代码，inject: ['fs'] 换成 inject: []。 */
+  async function broken(o) {
+    var ctx = createRoot(mkTrace(o));
+    var count = { n: 0 };
+
+    o.head('第一幕：consumer 挂载，inject 那一行被删了');
+    var r = ctx.plugin(makeReader(o, [], count));
+    dumpFibers(o, ctx);
+    o.bad('     fiber <reader> 抛的是：' + (r.error ? r.error.message : '(没报错，这是 bug)'));
+    o.dim('   没有依赖要等，epoch 直接算成空串，于是它当场被激活、当场跑 apply。');
+    o.dim('   apply 里读 ctx.fs，插件 ctx 的 get trap 去查 fiber.store，查不到，抛。');
+    o.dim('   这条错误消息和真实 cordis 一字不差，见 vendor/cordis/src/reflect.ts:144。');
+    await DSH.wait(900);
+
+    o.head('第二幕：本地 provider 到场');
+    ctx.plugin(provider('fs-local', 'local', '/repo'));
+    dumpFibers(o, ctx);
+    o.dim('   fs 现在真的在 store 里了，reader 还是 failed。');
+    o.dim('   notify(["fs"]) 只找 inject 里写了 fs 的 fiber。reader 的 inject 是空的，它不在名单上。');
+    o.rule();
+    o.log('reader 的 apply 被调用了 ' + count.n + ' 次，成功 0 次。');
+    o.warn('inject 那一行买到的是"等"。删掉它，插件就不等了，死在第一次读取上，而且没有第二次机会。');
+  }
+
+  DSH.demo('d-inject', {
+    init: function (o) {
+      o.dim('“运行”看正常路径。“把 inject 声明删掉”看同一段代码少了那一行会怎样。');
+    },
+    reset: function (o) { o.clear(); },
+    run: function (o) { return stripped ? broken(o) : whole(o); },
+    strip: function (o, api) {
+      stripped = !stripped;
+      var btn = api.$('[data-act="strip"]');
+      btn.textContent = stripped ? '把 inject 声明加回来' : '把 inject 声明删掉';
+      btn.classList.toggle('primary', stripped);
+      o.clear();
+      return stripped ? broken(o) : whole(o);
+    },
+  });
+})();
+
+// ===================================================================
+// Demo 2.3 - two sessions, one service name, two realms.
+// ===================================================================
+(function () {
+  function mountSession(o, sctx, label, cwd) {
+    sctx.plugin({
+      name: 'fs@' + label,
+      apply: function (c) { new LocalFs(c, cwd); },      // Service 子类，构造即注册
+    });
+    sctx.plugin({
+      name: 'reader@' + label,
+      inject: ['fs'],
+      apply: function (c) {
+        o.acc('     [reader@' + label + '] ctx.fs.cwd = ' + c.fs.cwd +
+              '   ' + c.fs.read('a.ts'));
+      },
+    });
+  }
+
+  DSH.demo('d-realm', {
+    run: function (o) {
+      var ctx = createRoot(mkTrace(o));
+      // 标签形如 fs#s1：真实 loader 的 LocalRealm 就是用 '#' + entry.options.id 做后缀的
+      var s1 = ctx.isolate('fs', Symbol('fs#s1'));
+      var s2 = ctx.isolate('fs', Symbol('fs#s2'));
+
+      o.head('1. 两个 session ctx，各自把 "fs" 换到自己的 realm');
+      o.log('     s1[isolate].fs  ->  ' + String(s1[ISOLATE].fs));
+      o.log('     s2[isolate].fs  ->  ' + String(s2[ISOLATE].fs));
+      o.log('     两个符号相同吗  ->  ' + (s1[ISOLATE].fs === s2[ISOLATE].fs));
+      o.dim('   名字一样，realm 不一样。isolate 映射是原型链，只覆盖 fs 这一个名字，');
+      o.dim('   其余名字（llm、tools、sessions ...）仍然沿用父 ctx 的符号，两个会话共用。');
+
+      o.head('2. 每个 session 挂自己的 provider + consumer');
+      mountSession(o, s1, 's1', '/work/session-1');
+      mountSession(o, s2, 's2', '/work/session-2');
+      o.dim('   两个 consumer 的 inject 都写着 "fs"，各自解析到自己 realm 里那一份。');
+
+      o.head('3. store 里同时存在两份 "fs"');
+      dumpStore(o, ctx);
+      dumpFibers(o, ctx);
+
+      o.head('4. 根 realm 的两半事实');
+      var rootKey = ctx[ISOLATE].fs;
+      o.log('     root[isolate].fs            ->  ' + String(rootKey));
+      o.dim('     provide 无条件铸出了它，所以"名字在根 realm 里"是真的');
+      o.log('     reflect.store[root 的符号]  ->  ' + ctx.reflect.store[rootKey]);
+      o.log("     ctx.get('fs')               ->  " + ctx.get('fs'));
+      o.dim('     根符号下面没有实现，所以"根 realm 能解析出 fs"是假的');
+      o.ok('   两半都成立，两个 session 才既隔离又不互相碰撞。');
+      o.dim('   dsh 把这两条断言钉在 packages/boot/app-boot/tests/config-reload.spec.ts 里。');
+    },
+
+    collide: function (o) {
+      o.rule();
+      o.head('对照：两个 provider 都留在 root realm');
+      var ctx = createRoot(mkTrace(o));
+      var a = ctx.plugin({ name: 'fs-a', apply: function (c) { new LocalFs(c, '/work/session-1'); } });
+      var b = ctx.plugin({ name: 'fs-b', apply: function (c) { new LocalFs(c, '/work/session-2'); } });
+      dumpFibers(o, ctx);
+      o.bad('     fs-b 的错误：' + (b.error ? b.error.message : '(没有报错，这是 bug)'));
+      o.log('     ctx.get("fs").cwd  ->  ' + ctx.get('fs').cwd + '   (先到者赢)');
+      o.warn('   这正是 agent preset 的 mount() 要拒绝的第三种结果：');
+      o.warn('   发布到 root realm 的服务是 process-global 的，第二个 preset 必然撞上第一个。');
+      o.dim('   而且这条规则会在每次 service notification 时重新检查，');
+      o.dim('   因为定时器或异步续延里的 provide 会绕过一次性审计。');
+      void a;
+    },
+  });
+})();
+</script>
+
+</body>
+</html>

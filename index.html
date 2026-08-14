@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeepSeek Harness from Scratch</title>
+<meta name="description" content="在浏览器里从零手搓一个 agent harness。九章可交互电子书，对照 DeepSeek Harness 真实源码，并横向对比 Pi、Claude Code、Codex、OpenCode。">
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/site.js"></script>
+</head>
+<body>
+
+<div class="wrap">
+<main>
+
+<header class="masthead">
+  <div class="kicker">Interactive Book · 可交互电子书</div>
+  <h1>DeepSeek Harness<br>from Scratch</h1>
+  <p class="standfirst">
+    2026 年 8 月 13 日，DeepSeek 开源了 <code>dsh</code>。
+    我当天把它 clone 下来，第一次运行失败，第二次跑起来花了 474 毫秒。
+    然后花了一整天读它的两百个包，最后决定：与其继续读，不如在浏览器里把它重造一遍。
+    这就是那本书。
+  </p>
+  <div class="meta">
+    <span>九章 + 一个横向对照附录</span>
+    <span>不需要 API key</span>
+    <span>不需要装任何东西</span>
+    <span>纯静态 HTML</span>
+  </div>
+</header>
+
+<h2><span class="num">§0.1</span>先看成品</h2>
+
+<p>
+下面这个方块里跑的，是本书结束时你会得到的东西：一个能工作的 mini-dsh。
+它有插件树、事件瀑布、只追加的会话日志、带守卫的工具流水线。
+模型是脚本化的假模型，所以每次跑出来一模一样。除了模型，其余每一行都是真的在执行。
+</p>
+
+<div class="demo" id="preview">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">成品预览</span>mini-dsh 执行一个任务</div>
+    <div class="spacer"></div>
+    <button class="btn primary" data-act="run">运行</button>
+    <button class="btn" data-act="reset">清空</button>
+  </div>
+  <div class="demo-body">
+    <div class="out" id="preview-out"></div>
+  </div>
+</div>
+
+<p>
+注意输出的层次。<code>turn/start</code> 开一个回合，回合里有若干个 step，
+每个 step 是一次模型请求加上它触发的工具调用。工具结果回流之后模型欠一次新请求，于是下一个 step 开始。
+没有更多要做的事，回合关闭。这个两层结构是 dsh 的骨架，第 1 章就会把它建起来。
+</p>
+
+<h2><span class="num">§0.2</span>为什么是这个 harness</h2>
+
+<p>
+市面上的 harness 长得都差不多。一个固定的内核，一张写死的工具表，靠 MCP 或者插件 API 往外挂东西。
+你想改 agent loop 就得 fork，你想让两个会话用不同的工具集，通常改不了。
+</p>
+
+<p>
+dsh 的做法是把整个产品拆成约两百个插件包，用一个叫
+<a href="https://github.com/cordiverse/cordis">Cordis</a> 的依赖注入内核串起来。
+模型适配器是插件，工具注册表是插件，会话日志是插件。agent loop 自己也是插件。
+它的架构文档里有一句挺硬的话：
+</p>
+
+<blockquote>
+There is no privileged core to patch: you extend dsh by mounting a plugin beside the others,
+and registrations are effects that unwind when their plugin unloads.
+</blockquote>
+
+<p>
+读到这句我的第一反应是"营销词"。等我自己实现过 <code>ctx.effect()</code> 的反序回收，
+实现过 waterfall 事件不调 <code>next()</code> 就连内置行为一起否决，
+实现过 <code>surfaceOp</code> 折叠出来的模型视图，才觉得这句话是字面意思。
+这本书的全部目的就是让你也走一遍这个过程。
+</p>
+
+<p>
+这个架构值不值它的复杂度，我到现在也没想清楚。两百个包不是小数目，
+isolate realm 那一段我每次读都要想三遍。所以下一节先把发布之后的真实反应放上来，
+免得这本书读起来像软文。
+</p>
+
+<div class="note src">
+  <span class="tag">对照真实源码</span>
+  每章末尾有"回到真实的 dsh"，列出对应的真实文件路径。
+  <code class="srcpath">git clone https://github.com/deepseek-ai/deepseek-harness.git</code>
+  然后逐个对照。写作时对照的版本是 <code>0.1.0-rc.6</code>，提交 <code>47f943859b</code>。
+</div>
+
+<h2><span class="num">§0.3</span>发布之后，大家在吵什么</h2>
+
+<p>
+HN 上的主贴（<a href="https://news.ycombinator.com/item?id=49285244">item 49285244</a>）
+545 分，234 条评论。整体基调是怀疑，不是叫好。票数最高的那条只有一行：
+</p>
+
+<blockquote>
+if it's not better than omp im not trying it
+<br><span class="pill">217</span>
+</blockquote>
+
+<p>
+omp 是 <a href="https://github.com/can1357/oh-my-pi">oh-my-pi</a>，Pi 的一个下游 fork，
+也是我平时用的那个 harness。这条评论定了整个讨论的调子：问题不是 dsh 做得好不好，
+是它凭什么让人换。附录那一页就是照这个标准写的，六个 harness 逐条对照。
+</p>
+
+<p>其余几条有代表性的，我原样搬过来：</p>
+
+<blockquote>
+But like, what is it? Odd that this reached #1 on HN. The README is pretty bare outside of
+installation instructions and a link to "Cordis", which is "A Meta-Framework of Spatiotemporal
+Composability."
+<br><span class="pill">rco8786</span>
+</blockquote>
+
+<blockquote>
+I have developped over the year a plugin fatigue. Every product relying on "community plugins"
+for their features implies it works fine the 6 first months, then it's a nightmare of
+incompatible, deprecated plugins, with no consistency and no governance.
+<br><span class="pill">invaliduser</span>
+</blockquote>
+
+<blockquote>
+Most vendors that create a plugin-based system end up creating a large library of plugins to
+kickstart the ecosystem, which many users end up trusting more because they're "official",
+so they essentially created a mono-vendor ecosystem with extra steps.
+<br><span class="pill">bdcravens</span>
+</blockquote>
+
+<p>
+还有一条来自读过 Cordis 论文的人，分量最重：
+</p>
+
+<blockquote>
+I have read the underlying paper, and found it may be useful, but not that useful. […]
+it adds hot-reload and dynamic enable/dispose capabilities to a plugin system, like the one
+in Pi agents, though they push the boundaries further, to the UI components and so on.
+<br><span class="pill">lxdlam</span>
+</blockquote>
+
+<p>
+这句话直接把"新颖"打了个折：热重载和动态装卸不是 dsh 发明的，Pi 已经有类似的东西，
+dsh 的区别是推得更远，一直推到 UI 组件。
+</p>
+
+<p>
+好评也有，而且集中在同一个点上。<span class="pill">kamranjon</span> 和
+<span class="pill">bmurphy1976</span> 都是冲着 Every Run is Traceable 去的：
+系统提示、推理、工具调用、子 agent 调度、每一次上下文注入，全部落进一条只追加的事件流，
+resume、fork、search、replay 都在这条流上跑。
+<span class="pill">JonChesterfield</span> 则说它的工具调用 JSON schema 比 codex 严格得多，
+同时抱怨 git 藏在 bash 后面，只能靠 hope 或者沙箱兜着。
+</p>
+
+<p>
+我的判断和这些人大体重合。第 5 章的会话日志是真东西，我会花最多篇幅在那一章。
+"一切皆插件"是不是值这个价，我倾向于对研究和平台场景值，对"我只想要个能用的编码助手"不值。
+书里两边都写。
+</p>
+
+<p>
+HN 只是这件事的一小半。按一份覆盖发布后 48 小时的舆情检索，中文这边知乎单个问题就有
+215 万浏览、366 条回答，B 站一条讲解视频接近 19.4 万播放；英文这边能对上的，是
+r/LocalLLaMA 一条 258 赞的主帖，加 <a href="https://thenewstack.io/deepseek-harness-open-source-plugins/">The New Stack</a>
+一篇记者稿。同一个仓库，两边讨论的量级不在同一个刻度上。
+</p>
+
+<p>
+真跑过的人的说法比架构争论有用，但它们没有指向同一个结论。X 上的 <span class="pill">@teortaxesTex</span>
+是西方少数几个连着做实测的账号，他先说 dsh 省 token："I think this would have already been a
+600-700K tokens project in OMP or Reasonix"，几个小时后又补了一条，说它在长项目里 "slows to a crawl"，
+token 流慢到他只能杀掉窗口重开。知乎那条置顶实测同一天写的是另一头：源码装了 27 分钟，
+让 DeepSeek Flash 写一个小插件，"洗个澡回来发现死循环了"，收尾是 "没有特别让我眼前一亮的地方"。
+</p>
+
+<p>
+两边缺的是同一样东西。48 小时里没有一个人把 dsh 和 Claude Code、Codex、Pi、omp、OpenCode
+放在同一个模型、同一个 prompt 上跑一遍可复现的对照。知乎一条 642 赞的评论就在要这个："我想知道你们精心考虑的测试
+benchmark"。这本书也给不出，附录 §A.7 把这件事写进了标题：那一页比的是架构，不是效果。
+</p>
+
+<p>
+还有一条线在社交媒体上几乎没露头：发布不到一天，GitHub Discussions 里落了两份独立的插件安全审计，
+<span class="pill">Fz0x00</span> 的 #454 和 <span class="pill">xiejin77</span> 的 #587，钉的正是本书对照的
+<code>0.1.0-rc.6</code> 和同一个提交。两份的结论都分成两半：面向模型那一半被评为 production-grade，
+面向插件那一半按审计自己的说法目前没有安全设计；两份也都写明这条路要用户自己去
+<code>dsh plugin add</code>，不是零点击远程 RCE。附录 §A.6.4 逐条展开。
+</p>
+
+<h2><span class="num">§0.4</span>你会亲手造出什么</h2>
+
+<p>每一章往 mini-dsh 里加一块能跑的东西，不是加一段说明文字：</p>
+
+<div class="toclist" id="toclist"></div>
+
+<h2><span class="num">§0.5</span>怎么读</h2>
+
+<p>
+按顺序。每章都依赖前一章的产物。第 5 章的会话日志要用第 4 章的事件系统，
+第 9 章让模型现场挂插件，用的是第 3 章的 fiber 生命周期。
+</p>
+
+<p>
+demo 可以反复跑，很多里面的代码框能直接改了再跑。改坏它比读懂它快。
+把 <code>next()</code> 删掉看瀑布怎么断，把 disposer 注释掉看卸载之后残留了什么。
+书里有好几处专门放了"把它弄坏"的按钮。
+</p>
+
+<p>
+遇到 <span class="pill alt">先猜再跑</span> 的方框，先选一个再往下看。
+选错的地方就是这个机制真正在教你东西的地方。
+</p>
+
+<p>
+预备知识：会读 JavaScript，知道 <code>async/await</code>，用过任意一个 agent 编码工具。
+不需要懂依赖注入，不需要懂事件溯源，这两样第 2 章和第 5 章从零讲。
+</p>
+
+<h2><span class="num">§0.6</span>关于真实的 dsh</h2>
+
+<p>为了让你知道我们在仿造什么量级的东西：</p>
+
+<table>
+<thead><tr><th>项</th><th>值</th></tr></thead>
+<tbody>
+<tr><td>开源时间</td><td>2026-08-13 11:56 UTC，MIT，developer preview</td></tr>
+<tr><td>开发周期</td><td>2026-06-10 起，64 天</td></tr>
+<tr><td>提交量</td><td>12,293 commits / 984 merged PRs，约每天 192 个提交</td></tr>
+<tr><td>工作区包数</td><td>约 200 个 <code>@deepseek-ai/dsh-*</code></td></tr>
+<tr><td>模型面工具数</td><td>49 个（Claude Code 大约 15 个）</td></tr>
+<tr><td>目标模型</td><td><code>deepseek-v4-flash</code>，也支持 OpenAI、Anthropic、任意兼容网关</td></tr>
+<tr><td>覆盖率门槛</td><td>per-file 100%，CI 强制</td></tr>
+<tr><td>开源 24 小时后</td><td>43,437 star，3,404 fork，master 零新提交</td></tr>
+</tbody>
+</table>
+
+<p>
+最后一行是我写这本书期间反复刷新看到的。代码一行没动，star 涨了四万三。
+但同一天 HN 主贴下面 234 条评论里，问得最多的是"这到底是个啥"。
+star 数衡量的是好奇心，不是口碑，这两件事在这个项目上分得很开。
+</p>
+
+<div class="note warn">
+  <span class="tag">先看这个再动手</span>
+  如果你机器上有多个 Node，<code>npx</code> 很可能抓到不对的那个。
+  我第一次跑就是这样：Homebrew 的 Node v23.6.0，没有 <code>zlib.createZstdDecompress</code>，
+  会话日志压缩包在插件树加载阶段直接 import 失败，报一个看起来毫不相干的 <code>SyntaxError</code>。
+  发布的 npm 包没声明 <code>engines</code>，所以 npm 连个警告都不给。
+  要求是 <code>^22.19 || &gt;=24</code>。先 <code>node -v</code>。
+</div>
+
+<p class="footernote">
+本书是第三方学习材料，与 DeepSeek AI 无关。源码引用基于公开仓库
+<code>deepseek-ai/deepseek-harness</code>。mini-dsh 为教学大幅简化，不要用于生产。
+</p>
+
+</main>
+<aside id="dsh-toc"></aside>
+</div>
+
+<script>
+// ---------------------------------------------------------------
+// Chapter list plus the appendix, both from the shared book structure.
+// ---------------------------------------------------------------
+(function () {
+  var box = document.getElementById('toclist');
+  DSH.chapters.concat(DSH.appendix).forEach(function (c) {
+    var a = DSH.el('a', { href: c.id + '.html' });
+    a.appendChild(DSH.el('div', { class: 'n', text: c.n }));
+    var right = DSH.el('div');
+    right.appendChild(DSH.el('div', { class: 't', text: c.title }));
+    right.appendChild(DSH.el('div', { class: 'd', text: c.desc }));
+    right.appendChild(DSH.el('div', { class: 'build',
+      html: '本章造出 <b>' + DSH.esc(c.build) + '</b>' }));
+    a.appendChild(right);
+    box.appendChild(a);
+  });
+})();
+
+// ---------------------------------------------------------------
+// Finished-product preview: a scripted mini-dsh run.
+// Everything except the model is the real (simplified) machinery.
+// ---------------------------------------------------------------
+(function () {
+  var script = [
+    { text: '我先看一下项目结构。', toolCalls: [{ name: 'bash', args: { command: 'ls packages' } }] },
+    { text: '有 tools 和 session 两个包，读一下入口。',
+      toolCalls: [{ name: 'read', args: { path: 'packages/tools/index.ts' } },
+                  { name: 'read', args: { path: 'packages/session/index.ts' } }] },
+    { text: 'tools 的注册函数没有返回 disposer，我来补。',
+      toolCalls: [{ name: 'edit', args: { path: 'packages/tools/index.ts', find: 'register(t) {' } }] },
+    { text: '改完了。register() 现在返回 disposer，卸载时会自动反注册。', toolCalls: [] }
+  ];
+
+  var TOOLS = {
+    bash: function () { return 'tools/\nsession/\nagent-loop/'; },
+    read: function (a) { return a.path + ': 42 行'; },
+    edit: function (a) { return '已替换 1 处 -> ' + a.path; }
+  };
+
+  DSH.demo('preview', {
+    reset: function (o) { o.clear(); },
+    run: async function (o) {
+      var seq = 0;
+      function ev(type, detail, cls) {
+        o.raw('<span style="opacity:.4">' + String(seq++).padStart(3, '0') + '</span>  ' +
+              '<span class="' + (cls || '') + '">' + DSH.esc(type) + '</span>' +
+              (detail ? '  <span style="opacity:.72">' + DSH.esc(detail) + '</span>' : ''));
+      }
+
+      o.dim('mini-dsh · 4 个插件 · 3 个工具 · 脚本化模型');
+      o.rule();
+      await DSH.wait(140);
+
+      ev('turn/start', '', 'acc');
+      for (var i = 0; i < script.length; i++) {
+        var step = script[i];
+        await DSH.wait(180);
+        ev('step/start', 'step=' + i);
+        await DSH.wait(160);
+        ev('agent/request', 'messages=' + (i * 2 + 1) + '  tools=3');
+        await DSH.wait(220);
+        ev('assistant/message', step.text);
+
+        for (var j = 0; j < step.toolCalls.length; j++) {
+          var call = step.toolCalls[j];
+          await DSH.wait(150);
+          ev('tool/call', call.name + ' ' + JSON.stringify(call.args));
+          await DSH.wait(180);
+          ev('tool/result', TOOLS[call.name](call.args), 'ok');
+        }
+        ev('step/end', step.toolCalls.length ? 'owes another request' : 'no tool calls');
+        if (!step.toolCalls.length) break;
+      }
+      await DSH.wait(160);
+      ev('turn/end', 'reason=completed', 'acc');
+      o.rule();
+      o.ok('会话日志共 ' + seq + ' 条事件，模型实际看到 ' + (script.length * 2 - 1) + ' 条消息。');
+      o.dim('这两个数字为什么不一样，是第 5 章的内容。');
+    }
+  });
+})();
+</script>
+
+</body>
+</html>

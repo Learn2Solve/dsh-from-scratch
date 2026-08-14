@@ -1,0 +1,1995 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · YAML 组合：profile、bundle、patch、preset — DeepSeek Harness from Scratch</title>
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/site.js"></script>
+<style>
+/* 本章自带的几个渲染件：配置树、三栏补丁面板。site.css 里没有对应组件。 */
+.c7-panes { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+@media (max-width: 980px) { .c7-panes { grid-template-columns: 1fr; } }
+.c7-panes textarea.edit { min-height: 330px; }
+.c7-panes > div, #d-preset .split > div { min-width: 0; }
+.c7-tree {
+  font-family: var(--mono); font-size: 12.5px; line-height: 1.6;
+  background: var(--code-bg); border: 1px solid var(--rule); border-radius: 8px;
+  padding: 12px 14px; margin-top: 14px; max-height: 480px; overflow: auto;
+}
+.c7-row { display: block; white-space: pre; }
+.c7-id { font-weight: 640; }
+.c7-name { color: var(--ink-3); }
+.c7-off { text-decoration: line-through; opacity: .5; }
+.c7-tag {
+  font-size: 10px; letter-spacing: .06em; padding: 0 5px; margin-left: 8px;
+  border-radius: 4px; border: 1px solid var(--rule); text-decoration: none;
+  display: inline-block;
+}
+.c7-new { color: var(--good); border-color: var(--good); }
+.c7-rep { color: var(--warn); border-color: var(--warn); }
+.c7-grp { color: var(--accent); border-color: var(--accent); }
+.c7-js { color: var(--accent); }
+.c7-val { color: var(--good); }
+.c7-key { color: var(--ink-2); }
+.c7-err { color: var(--danger); font-family: var(--mono); font-size: 12px; white-space: pre-wrap; }
+.c7-legend { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); margin-top: 10px; }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+<main>
+
+<header class="masthead">
+  <div class="kicker">第 07 章</div>
+  <h1>YAML 组合：profile、bundle、patch、preset</h1>
+  <p class="standfirst">
+    前六章造的东西全是在 JavaScript 里手工接线的。谁先挂、挂什么配置、哪个不要，都写在代码里。
+    本章把这些接线搬进 YAML，让它变成一份能被逐层打补丁的数据，
+    再给每个会话挂一棵属于它自己的子树。
+  </p>
+  <div class="meta"><span>本章造出 composeLayers() / mountPreset()</span><span>3 个 demo · 1 次预测</span><span>约 26 分钟</span></div>
+</header>
+
+<h2><span class="num">§7.1</span>一行配置就是一个插件实例</h2>
+
+<p>
+我们手上现在有 <code>miniLoop</code>、<code>Context</code> 与 <code>Service</code>、
+<code>Fiber</code> 与 <code>ctx.effect()</code>、五种事件模式、<code>SessionLog</code>、<code>ctx.tools</code>。
+都能跑。但要改变产品形态，你得改 JS：注释掉一个 <code>ctx.plugin(...)</code>，
+把一个常量从 <code>'native'</code> 改成 <code>'code'</code>，给某个插件多传一个字段。
+</p>
+
+<p>
+真实 dsh 里这些动作全部发生在 YAML 里。一个正在运行的 dsh 就是一棵插件树，
+树上每个节点是一行配置，Loader 把它变成一个活着的插件实例。这一行的类型是
+<code>EntryOptions</code>，字段少得可以背下来：
+</p>
+
+<table>
+<thead><tr><th>字段</th><th>类型</th><th>含义</th></tr></thead>
+<tbody>
+<tr><td><code>id</code></td><td><code>string</code></td><td>在所属 entry tree 里稳定的标识。补丁按它寻址</td></tr>
+<tr><td><code>name</code></td><td><code>string</code></td><td>entry tree 要 import 的 module specifier</td></tr>
+<tr><td><code>config</code></td><td><code>any</code></td><td>传给插件的配置。<code>group</code> 行的 config 是子行列表</td></tr>
+<tr><td><code>group</code></td><td><code>boolean \| null</code></td><td>标记这一行是嵌套 group</td></tr>
+<tr><td><code>disabled</code></td><td><code>boolean \| null</code></td><td>阻止这一行及其后代运行</td></tr>
+<tr><td><code>inject</code></td><td><code>Inject \| null</code></td><td>这一行需要的 service，或 service intercept 配置</td></tr>
+</tbody>
+</table>
+
+<p>
+另外两个字段由 <code>isolate.ts</code> 用 <code>declare module</code> 挂到同一个接口上，
+因为它们是 Loader 的可选能力，不算 entry 的固有属性：
+<code>intercept?: Dict | null</code> 和 <code>isolate?: Dict&lt;true | string&gt; | null</code>。
+<code>isolate</code> 是 §7.4 的主角。
+</p>
+
+<p>下面是 <code class="srcpath">packages/bundle/base/cordis.patch.yml</code> 里真实的一行：</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">packages/bundle/base/cordis.patch.yml · 沙箱策略那一行</span></div>
+<pre><code data-lang="yaml">- id: sandbox-policy
+  name: '@deepseek-ai/dsh-sandbox-policy'
+  config:
+    mode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'
+    workspaceRoot: !!js process.cwd()</code></pre>
+</div>
+
+<p>
+这一行说了四件事。它的 id 是 <code>sandbox-policy</code>，所以别的层能按这个名字找到它；
+它挂 <code>@deepseek-ai/dsh-sandbox-policy</code>；沙箱模式读环境变量，没设就是
+<code>workspace-write</code>；工作区根取进程 cwd。接线本身没有一行 JavaScript。
+</p>
+
+<div class="note">
+  <span class="tag">Entry.update() 的两条路</span>
+  改一行配置不一定意味着重启插件。<code>Entry.update()</code> 先算出新旧 options 的
+  <code>diff</code>，然后判断
+  <code>const replace = diff.some(key =&gt; key === 'name' || key === 'inject' || key === 'group')</code>。
+  只有这三个键变了才重新 import 模块、销毁旧 fiber、启动新 fiber；
+  只改 <code>config</code> 走的是 <code>_patchContext()</code> 里的 <code>fiber.update(this.options.config, true)</code>，
+  插件原地收到新配置。apply 失败还会尝试回滚到旧配置，回滚也失败才抛
+  <code>AggregateError</code>。
+</div>
+
+<div class="note warn">
+  <span class="tag">group 行永远不 disabled</span>
+  <code>Entry._disabled()</code> 的第一行是 <code>if (options.group) return false</code>，
+  注释写着 <code>// group is always enabled</code>。
+  但给一个 group 写 <code>disabled: true</code> 依然能关掉整个子树：
+  子行判断自己是否 disabled 时会沿 <code>parent.ctx.fiber.entry</code> 往上走，
+  逐级调用 <code>disabledOf(entry.options)</code>。group 自己那个 fiber 是活的，
+  里面的东西一个都不跑。
+</div>
+
+<h2><span class="num">§7.2</span>层叠补丁</h2>
+
+<p>
+一棵树如果只能从一个文件读出来，"官方发行版 + 用户改两行"这件事就没法表达。
+用户要么 fork 整个文件，升级时自己解冲突；要么什么都改不了。
+dsh 给的是<strong>补丁层</strong>：起点是一个空的 entry list，每一层往上面叠。
+</p>
+
+<p><code class="srcpath">docs/architecture.md</code> 的原话是：</p>
+
+<blockquote>
+Layers apply to an empty entry list in this order: each bundle in the profile's listed order,
+then the profile's <code>cordis.patch.yml</code>, then the home-level one, then any <code>--patch</code> overlay.
+A patch targets a row by id and replaces its whole config, or inserts new rows.
+</blockquote>
+
+<div class="diagram">[]                                                          &lt;- 空 entry list
+ │
+ ├─ bundle 1    dsh-base/cordis.patch.yml            一整条 insert：约 60 行
+ ├─ bundle 2    dsh-web-app/cordis.patch.yml         按 id 覆盖，再 insert 浏览器那一半
+ │              （bundle 顺序 = profile package.json 的 dsh.profile.bundles 顺序）
+ ├─ profile     $DSH_HOME/profiles/web/cordis.patch.yml
+ ├─ home        $DSH_HOME/cordis.patch.yml           机器级偏好，所以压过 profile 层
+ └─ overlay     --patch ./a.yml --patch ./b.yml      按 argv 顺序
+                        │
+                        ▼
+                 composed tree  ──►  Loader 挂载</div>
+
+<p>
+两个概念要分清。<strong>profile</strong> 是 Harness home 下的一个命名组合，位置在
+<code>$DSH_HOME/profiles/&lt;name&gt;/</code>，里面一个 <code>package.json</code>（它的
+<code>dsh.profile.bundles</code> 列出有序的 bundle 层，<code>dependencies</code> 装它自己的外部插件）
+加一个用户自己的 <code>cordis.patch.yml</code>。<strong>bundle</strong> 是一个 npm 包，
+manifest 里写 <code>"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }</code>。
+它分发的是"配置行 + 这些行要挂的代码"，插进来之后依然能被上面的层继续打补丁。
+</p>
+
+<div class="note vs">
+  <span class="tag">换成别的 harness</span>
+  每个 harness 都有配置文件，区别在于配置描述的是什么。Claude Code 的 <code>settings.json</code>、
+  Codex CLI 的 <code>config.toml</code>、还有 <code>CLAUDE.md</code> / <code>AGENTS.md</code> 这类 prose 层，
+  配的是一个结构在编译期就定好的程序：哪些键可以填、填了会影响什么，由那个程序说了算。
+  假设你想改内建文件工具的行为，你能做的是加一个 hook 在调用前拦一下、挂一个 MCP server
+  提供另一个名字的工具、或者在 <code>CLAUDE.md</code> 里写一段话让模型少用它。
+  配置的词汇表里没有"这个工具由哪个模块实现"这一项，因为那不是配置层能表达的东西。
+  omp 也在这一类里。它有 settings、<code>models.yml</code>、extensions 和 marketplace；
+  settings 的 <code>config.yml</code> 还能叠内置默认、全局、项目、可重复的
+  <code>--config</code> overlay 与运行时 flag。对象深合并，数组整块替换。
+  这些入口不少，叠出来的仍然是那个程序的一张固定键表。
+  <code>cordis.yml</code> 是另一回事，它就是程序本身。dsh 用户换掉文件工具，写的是
+  <code>- id: tool-fs</code> 加一行 <code>name: ./my-fs-tools.js</code>，
+  <code>Entry.update()</code> 看到 <code>name</code> 变了就销毁旧 fiber、import 新模块、起新 fiber。
+  连 agent 主循环也一样：它在 base bundle 里就是一行 <code>id: agent-loop</code>
+  （我这份 clone 里是第 436 行），和 <code>tools</code>、<code>system-prompt</code> 挨着，谁都能打它。
+</div>
+
+<table class="vsgrid">
+<thead><tr>
+  <th>配置层能寻址到什么</th>
+  <th>Pi 的 TS 扩展</th>
+  <th>omp settings / extensions</th>
+  <th>Claude Code <code>settings.json</code></th>
+  <th>Codex <code>config.toml</code></th>
+  <th class="dshcol"><code>cordis.patch.yml</code></th>
+</tr></thead>
+<tbody>
+<tr><td>配置的对象</td>
+    <td>一个能被扩展加东西的程序</td>
+    <td>settings 与 <code>models.yml</code>；extensions / marketplace 往程序里加东西</td>
+    <td>结构编译期定好的程序</td>
+    <td>结构编译期定好的程序</td>
+    <td class="dshcol">插件树本身，一行一个实例</td></tr>
+<tr><td>"某个工具由哪个模块实现"写在配置里</td>
+    <td><span class="n">无</span>（在扩展代码里）</td>
+    <td><span class="n">无</span>（<code>extensions:</code> 只列模块，工具名撞上内建会被拒）</td>
+    <td><span class="n">无</span></td>
+    <td><span class="n">无</span></td>
+    <td class="dshcol"><span class="y">有</span>（<code>name:</code>）</td></tr>
+<tr><td>关掉一个内建能力</td>
+    <td><span class="p">部分</span>（不加载那个扩展）</td>
+    <td><span class="p">部分</span>（<code>bash.enabled</code> 这类各工具自己的键，或 <code>tools.approval</code> 写 <code>deny</code>）</td>
+    <td><span class="p">部分</span>（permission 与 hook 拦截）</td>
+    <td><span class="p">部分</span>（approval 与 sandbox 模式）</td>
+    <td class="dshcol"><span class="y">有</span>（<code>disabled:</code>，可以是表达式）</td></tr>
+<tr><td>agent 主循环是一个可寻址的行</td>
+    <td><span class="n">无</span></td>
+    <td><span class="n">无</span>（循环在 <code>@oh-my-pi/pi-agent-core</code> 里）</td>
+    <td><span class="n">无</span></td><td><span class="n">无</span></td>
+    <td class="dshcol"><span class="y">有</span>（<code>id: agent-loop</code>）</td></tr>
+</tbody>
+</table>
+
+<div class="note warn">
+  <span class="tag">这套设计的代价，HN 第一条高票就问了</span>
+  发布当天 HN 主线程（item 49285244，545 分 234 条评论，2026-08-13）里票最高的疑问来自
+  <code>rco8786</code>：<em>"But like, what is it? Odd that this reached #1 on HN. The README is pretty bare
+  outside of installation instructions and a link to 'Cordis', which is 'A Meta-Framework of
+  Spatiotemporal Composability.'"</em>
+  这条质疑和上面那张表是同一件事的两面。能力全在配置里，README 就没什么可写的：
+  它不能说"我有这十五个工具"，因为工具是哪些取决于你叠了哪几层；
+  也不能说"我的循环这样跑"，因为循环是一行可以被打掉的配置。
+  想知道这东西是什么，你得读 <code>cordis.patch.yml</code>，或者跑一次 <code>--dump-config</code>。
+  新人手上没有那两样东西，落地页上又只有一个抽象名词等着他。
+</div>
+
+<p>
+补丁语义只有一个函数，<code class="srcpath">vendor/include/src/index.ts</code> 的
+<code>applyEntryPatches()</code>。它的注释开头就写着这是 "THE patch semantics of this include"，
+挂载和离线工具（<code>dsh --dump-config</code>）共用同一个实现，所以 dump 出来的树不可能和实际启动的树漂移。
+规则逐条列出来：
+</p>
+
+<ul>
+  <li>输入永不被改，输出永远是脱开的。函数第一行是 <code>data = structuredClone(data)</code>，
+      即使没有任何补丁也照样克隆。原因写在注释里：补丁或挂载共享的 entry 对象会把早先的值烙进缓存的解析结果，
+      于是配置热重载时"删掉一条补丁"永远无法还原。</li>
+  <li>寻址表递归建立。<code>buildMap()</code> 收集每一行的 <code>id</code>，
+      并对 <code>entry.group &amp;&amp; Array.isArray(entry.config)</code> 的行递归下去。group 里的行也能被外面按 id 打到。</li>
+  <li><code>insert</code> 不带 id 就追加到根；带 id 就追加到那个 <em>group</em> 的 <code>config</code> 里。
+      目标不存在 warn <code>patch insert: entry %C not found</code>，目标不是 group 则 warn
+      <code>patch insert: entry %C is not a group</code>。</li>
+  <li>插进来的行立刻被索引。<code>insert</code> 分支末尾有一句 <code>buildMap(insert)</code>，
+      注释说明理由：补丁列表一层一个来源，后面的层必须能配置或关掉前面的层刚插入的行，
+      否则 "inserted rows were silently unpatchable"。</li>
+  <li>非 insert 补丁必须有 id。带了 <code>name</code> 而且和目标不符，整条跳过并 warn
+      <code>name mismatch</code>。这道栓拦的是这种情况：你以为在改 A，其实那个 id 已经被别人占了。</li>
+  <li>覆盖是按键赋值：<code>target[key] = value</code>。而 <code>config</code> 就是一个键，
+      所以"打一行 config"等于<strong>整块替换</strong>，不做深合并，要保留的字段必须重写一遍。
+      <code>dsh-base</code> 的注释把这条约束反推成了组织原则：
+      "a row whose value differs by mode does NOT live here"。</li>
+  <li>打不中的补丁只 warn，不炸。一次 profile 启动会打几十条补丁，
+      让一条过时的补丁拖垮整个进程是错的产品行为。</li>
+</ul>
+
+<p>想看自己这台机器实际启动的那棵树：</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">apps/cli/src/args.ts · 三个真实的 flag</span></div>
+<pre><code data-lang="text">dsh --profile web --dump-config              # bundle 层 + 用户层 + --patch，全叠完
+dsh --profile web --dump-default-config      # 只叠 bundle 层（用户的 patch 文件写坏了时的救援手段）
+dsh --profile tui --patch ./extra.yml        # 追加一层 overlay，可重复</code></pre>
+</div>
+
+<p>
+它打印出来的每一行都可以被你自己的补丁替换掉。dump 是 boot-free 的：
+它不评估 <code>!!js</code>，也不跑 app 的命令行 provider，
+所以打印的是配置层的真相，不是运行期的真相。
+</p>
+
+<p>
+下面这个 demo 之前，先猜一下。base 层那行 <code>session-query-sqlite</code> 有两个键，
+<code>path</code> 和 <code>openAt: never</code>。overlay 层打同一行，config 里只写了
+<code>path</code>，没提 <code>openAt</code>。
+</p>
+
+<div id="p-merge"></div>
+<script>
+DSH.predict('p-merge', {
+  q: '叠完之后，这一行的 openAt 是什么？',
+  options: [
+    { label: "还是 base 的 never", why: '深合并才会这样，applyEntryPatches 不做深合并。' },
+    { label: 'null', why: '没有人给它赋过 null。' },
+    { label: '这个键不在了', ok: true, why: '补丁是按键赋值的，而 config 就是一个键：整块被换掉。' }
+  ],
+  explain: '下面的 warn sink 会把消失的键点名。'
+});
+</script>
+
+<div class="demo" id="d-patch">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 7.1</span>补丁层叠</div>
+    <div class="spacer"></div>
+    <button class="btn" data-act="js">求值 !!js：关</button>
+    <button class="btn" data-act="killloop">把 agent-loop 那一行删掉</button>
+    <button class="btn" data-act="reset">还原三层</button>
+  </div>
+  <div class="demo-body">
+    <div class="c7-panes">
+      <div>
+        <div class="pane-label">layer 1 · bundle base</div>
+        <textarea class="edit" id="p-base" spellcheck="false" wrap="off"></textarea>
+      </div>
+      <div>
+        <div class="pane-label">layer 2 · profile patch</div>
+        <textarea class="edit" id="p-profile" spellcheck="false" wrap="off"></textarea>
+      </div>
+      <div>
+        <div class="pane-label">layer 3 · --patch overlay</div>
+        <textarea class="edit" id="p-overlay" spellcheck="false" wrap="off"></textarea>
+      </div>
+    </div>
+    <div class="c7-tree" id="t-compose"></div>
+    <div class="c7-legend">
+      绿 = 该层新插入的行 &nbsp;·&nbsp; 黄 = 被该层替换过的行 &nbsp;·&nbsp; 删除线 = disabled
+    </div>
+    <div class="pane-label" style="margin-top:16px">warn sink（applyEntryPatches 的第三个参数）</div>
+    <div class="out" id="out-patch"></div>
+  </div>
+</div>
+
+<p>
+三个面板都可以直接改，每敲一个字符整棵树重算一遍。几件事值得亲手试：
+</p>
+
+<ul>
+  <li><code>session-query-sqlite</code> 那一行：<code>openAt</code> 不在树上了，也没有回落到 base 的
+      <code>never</code>。想让它回来，把 <code>openAt: first-search</code> 手动加回 overlay 那块 config。
+      把 <code>path:</code> 也一起删掉，config 整块变成 <code>null</code>，warn sink 会把两个键都点名。</li>
+  <li><code>agent-presets</code> 那一行由 layer 2 插入，又被 layer 3 打成
+      <code>default: minimal</code>。<code>buildMap(insert)</code> 那句注释就是为这个存在的。</li>
+  <li>点"把 agent-loop 那一行删掉"。这个进程照样起得来，只是不会有任何东西去请求模型。</li>
+  <li>看 warn sink。overlay 里有两条打不中的补丁：<code>tool-web</code> 这棵树上没有，
+      <code>tools</code> 存在但不是 group。两条都只是 warning，别的补丁照常生效。</li>
+</ul>
+
+<h2><span class="num">§7.3</span><code>!!js</code> 与延迟求值</h2>
+
+<p>
+纯数据配置有一个硬伤：有些值要到运行时才知道。端口看命令行，沙箱模式看环境变量，
+会话目录看 Harness home 装在哪，而 <code>tool-bash</code> 在 Windows 上根本不该存在。
+把这些挪进插件内部，读配置的人就看不出实际值从哪来了；做成模板字符串，又要养一套 DSL。
+</p>
+
+<p>
+dsh 走的是第三条路：给 YAML 加一个标签，让标量变成<strong>表达式节点</strong>。
+整个方言就是这一个 <code>yaml.Type</code>：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">vendor/include/src/index.ts · 方言的全部</span></div>
+<pre><code data-lang="js">const JsExpr = new yaml.Type('tag:yaml.org,2002:js', {
+  kind: 'scalar',
+  resolve: (data) =&gt; typeof data === 'string',
+  construct: (data) =&gt; ({ __jsExpr: data }),
+  predicate: isJsExpr,
+  represent: (data) =&gt; data['__jsExpr'],
+})
+
+export const entryListSchema = yaml.JSON_SCHEMA.extend(JsExpr)</code></pre>
+</div>
+
+<p>
+基底是 <code>JSON_SCHEMA</code>，不是默认 schema，也就是说 YAML 那些花活（<code>yes</code>/<code>no</code>、
+时间戳、八进制）都不认，只认 JSON 的类型集合，外加这一个标签。
+<code>construct</code> 把 <code>!!js expr</code> 变成 <code>{ __jsExpr: 'expr' }</code>，
+<code>represent</code> 又能把它写回原样。这是能往回写的前提。
+Loader 会在它认为配置变了的时候把整棵树写回源文件，
+如果表达式在解析时就被求值成了字面量，写回去的文件就把当时那次求值的结果烙死了。
+</p>
+
+<h3>求值发生在什么时候</h3>
+
+<p>
+求值是惰性的、按行的，而且只发生在两个位置。第一个是插件 <code>config</code>，
+在 Loader 装的 <code>internal/config</code> 钩子里：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">vendor/loader/src/index.ts · 谁的表达式在谁的 fiber 里求值</span></div>
+<pre><code data-lang="js">ctx.on('internal/config', function (this: Fiber, _config, next) {
+  const config = next()
+  if (!this.entry || this.parent.fiber?.entry === this.entry) return config
+  // Tree carriers (Group, Include) keep their configs literal: their
+  // entry and patch lists hold other rows' configs, whose `!!js`
+  // expressions belong to those rows' own fibers.
+  const plugin = this.runtime?.callback as Record&lt;PropertyKey, unknown&gt; | undefined
+  if (plugin?.[EntryGroup.key]) return config
+  return interpolate(this.ctx, config)
+}, { global: true })</code></pre>
+</div>
+
+<p>
+两处细节。求值的作用域是这一行自己的 fiber context（<code>this.ctx</code>），不是根 context，
+所以 <code>inject: [webStartup]</code> 的行可以写
+<code>!!js ctx.webStartup.host ?? '127.0.0.1'</code>，Loader 会等那个 service 存在之后再解析它的表达式。
+而 tree carrier（<code>Group</code>、<code>Include</code>）的 config 保持字面量：
+它们的 config 装的是别人的 config，那些表达式属于别人的 fiber。
+</p>
+
+<p>
+第二个位置是 <code>disabled</code>，它不走 <code>interpolate</code>，走 <code>Entry.disabledOf()</code>：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">vendor/loader/src/config/{entry,utils}.ts</span></div>
+<pre><code data-lang="js">// Entry：每次读 entry.disabled 都重新求值，原始节点留在 options 里
+private disabledOf(options: EntryOptions): boolean {
+  return isJsExpr(options.disabled)
+    ? Boolean(this.evaluate(options.disabled.__jsExpr))
+    : Boolean(options.disabled)
+}
+
+// utils：求值器本体，一共九行
+export const evaluate = new Function('ctx', 'expr', `
+  with (ctx) {
+    return eval(expr)
+  }
+`) as ((ctx: object, expr: string) =&gt; any)</code></pre>
+</div>
+
+<p>
+<code>with (ctx) { return eval(expr) }</code> 解释了配置里那些写法为什么都成立。
+<code>with</code> 把 context 的成员摊平成裸名字，所以 <code>dshHomePath('sessions')</code> 能直接调
+（<code>boot()</code> 把它挂在根 context 上）；而求值器的第一个形参就叫 <code>ctx</code>，
+所以 <code>ctx.webStartup.host</code> 也能写。两种风格在真实文件里并存，不是笔误。
+</p>
+
+<p>
+这条标签不是藏在实现里的细节，官方教程正面教它。
+<code class="srcpath">docs/cordis-tutorial/05-config.md</code> 的原话是
+"The loader used in this repo supports a <code>!!js</code> tag for config values that must be computed at load time"，
+紧跟的例子就是 <code>greeting: !!js process.env.DEMO_GREETING ?? 'Hello'</code>。
+同一页把适用范围也划了出来：<code>!!js</code> 只在 <code>config</code> 里和一个条目的
+<code>disabled</code> 字段里生效。后面那一处的分量更重些：
+<code>disabled</code> 的表达式在每次挂载决策时都会对 loader context 重新求值一遍。
+</p>
+
+<div class="note warn">
+  <span class="tag">诚实地说清这件事</span>
+  这是<strong>配置求值期的任意代码执行</strong>。<code>eval</code> 拿到的是宿主进程的全部权限：
+  一份 <code>cordis.patch.yml</code> 和一段 JS 脚本的危险性完全相同。
+  dsh 没有假装它是沙箱，<code class="srcpath">packages/preset/agent-presets/README.md</code> 的
+  Trust 一节把这个立场写死了："a preset is exactly as privileged as the plugins it names.
+  A <code>user</code> preset — authored by a person or by an agent — carries the same trust as shell access"。
+  Demo 7.1 上面那个 <code>求值 !!js</code> 按钮跑的就是同一个
+  <code>new Function('ctx','expr','with (ctx) { return eval(expr) }')</code>，
+  只不过喂给它的是一个假的 <code>ctx</code>（<code>process.platform = 'darwin'</code>、
+  <code>dshHomePath()</code> 指向 <code>/Users/you/.dsh/</code>）。
+</div>
+
+<p>
+这个立场在发布之后被人当成攻击面认真检了一遍。检出来的东西不推翻上面那段话，
+它做的是把上面那段话的后果摆到台面上。
+</p>
+
+<div class="note warn">
+  <span class="tag">下载来的一份 profile 是没人审过的脚本</span>
+  一份从别处取来的 profile、或者一个 add 进来的 bundle，
+  里面的 <code>!!js</code> 会在 load 期跑在你的宿主进程里，权限和你自己敲一行 node 完全一样。
+  Fz0x00 的插件安全审计把这条路径做成了可复现的 demo：
+  <code>demo-01-js-config-rce</code> 落下一个标记文件，内容是 <code>PWNED-BY-LIVE-JS</code>。
+  那份报告钉在 commit <code>47f9438</code>，正是本书对照的这个快照，活体验证跑在
+  <code>@deepseek-ai/dsh@0.1.0-rc.6</code> 上。它另外记了两件周边的事：
+  <code>dsh plugin add</code> 字面上就是一次没有签名的 <code>pnpm add</code>，
+  而 <code>dsh plugin remove</code> 不会移除一个已经写进配置里的 <code>!!js</code> 后门。
+  前提也得说清楚：这条路要你自己去 add 那份 profile 或 bundle，不是零点击的远程 RCE。
+</div>
+
+<p>
+读这份审计得连着它自己的分轴一起读，不然容易读成"dsh 不安全"。它把仓库切成两半。
+面向模型和 agent 的那一半，原话是 "Axis A (model/agent behavior) is production-grade"，
+点名的东西是工具执行管线、fail-closed 审批、进程沙箱、凭据引用模型、append-only 审计，
+还有浏览器那道 confusion-deputy 围栏（对活实例验过 403/415）。
+面向插件代码的那一半，原话是 "Axis B (plugin code) currently has no security design"：
+插件在宿主进程内以宿主权限运行，install、update、篡改、持久化、热重载这几条路径上
+没有签名、完整性、来源或者确认闸门。<code>!!js</code> 落在后一半。
+报告也自陈了几条真实存在的缓解：pnpm 的 registry integrity、<code>0600</code>/<code>0700</code> 权限、
+<code>.env</code> 的 bootstrap guard、特权 RPC 的 loopback pinning。
+</p>
+
+<div class="note src">
+  <span class="tag">这一节的两处外部出处</span>
+  <code class="srcpath">docs/cordis-tutorial/05-config.md</code> · <code>!!js</code> 的官方教法与适用范围<br>
+  GitHub Discussion #454，作者 Fz0x00，完整报告在仓库
+  <code>Fz0x00/deepseek-harness-plugin-security-audit</code>：钉住 commit <code>47f9438</code>，
+  活体验证针对 <code>@deepseek-ai/dsh@0.1.0-rc.6</code>，40 条攻击路径、96 条带 file:line 的源码证据、13 个可复现 demo<br>
+  GitHub Discussion #587，作者 xiejin77，第二份独立审计，结论同向：
+  "<code>dsh plugin add &lt;pkg&gt;</code> is literally <code>pnpm add &lt;pkg&gt;</code>"，
+  插件可以在 boot 期、任何运行时防护激活之前改写 sandbox mode、approval policy 与 credentials；
+  作者同样注明这需要受害者主动 add
+</div>
+
+<h2><span class="num">§7.4</span>host 平面 vs agent 平面</h2>
+
+<p>
+补丁层解决了"这台机器跑什么"，没解决"这个会话跑什么"。
+Web 界面里两个标签页可能一个是全功能编码 agent，一个是只有两个工具的极简模式；
+它们在同一个进程里，共用同一份持久化、同一个沙箱策略、同一条模型路由。
+所以插件树被切成了两个平面。
+</p>
+
+<table>
+<thead><tr><th></th><th>host 平面</th><th>agent 平面（一个 preset）</th></tr></thead>
+<tbody>
+<tr><td>由谁组合</td><td>bundle 层 + 用户补丁层</td><td>一个目录里的 <code>agent.cordis.yml</code></td></tr>
+<tr><td>挂几次</td><td>每进程一次</td><td>每 preset 一次；每个点名它的会话按 scope 父子关系加入</td></tr>
+<tr><td>拥有什么</td><td>registry 本体、沙箱与审批栈、持久化、模型路由</td><td>只拥有"一个会话可以不一样"的那部分：工具、persona、prompt section</td></tr>
+<tr><td>典型行</td><td><code>tools</code>、<code>fs-sandbox</code>、<code>approval</code>、<code>llm-deepseek</code>、<code>session-persistence-jsonl</code></td><td><code>tool-fs</code>、<code>tool-web</code>、<code>persona</code>、<code>plan-mode</code></td></tr>
+</tbody>
+</table>
+
+<p>
+划线的标准不靠语感。出厂 preset 的注释里有几条可以机械判定的关系，讲得比架构文档清楚，直接引用：
+</p>
+
+<blockquote>
+<code>shell-env</code> stays in the HOST composition: <code>apps/cli/src/web.ts</code> injects it to publish
+<code>DSH_WEB_URL</code>/<code>DSH_WEB_MODE</code>, and a host row that injects a service is the criterion
+for host-plane ownership — injection resolves before any session exists, so there is no agent to key by.
+</blockquote>
+
+<blockquote>
+The task REGISTRY stays on the host plane: its producers sit outside any realm this file could put it in —
+<code>tool-bash</code> above resolves it with <code>ctx.get</code>, and an entry-local realm here is invisible to
+every sibling row, so <code>run_in_background</code> would answer "background jobs unavailable" while these
+controls sat in the catalog. [...] What a preset chooses is whether its agent can collect and stop
+background work at all.
+</blockquote>
+
+<blockquote>
+<code>tokenMeter</code> is deliberately NOT in this realm: [...] it owns the context-meter projection units the
+browser reads for every session — behind a realm those units would come and go with whichever presets happen
+to be mounted. What a preset chooses is whether its agent compacts at all, which is
+<code>compaction-basic</code> below.
+</blockquote>
+
+<p>
+三段注释说的是同一件事。被 preset 外面读的东西留在 host，只被 preset 里面读的东西可以下沉。
+preset 拿到的选择权停在"这个 agent 有没有这个能力"这一层，不到"这个能力怎么实现"那一层。
+下沉也有完全正当的案例，<code>standard</code> 的 <code>planning</code> group 注释：
+"Plan state is per-agent by nature, so an entry-local realm is not a workaround here — it is the correct lifetime."
+</p>
+
+<h3>realm 规则：一条硬约束</h3>
+
+<p>
+preset 里任何发布 service 的行必须待在一个带 <code>isolate</code> 的 group 里。
+<code>standard</code> 的文件头把理由和机制一起写了：
+</p>
+
+<blockquote>
+A service row here MUST sit inside a group carrying an <code>isolate</code> realm.
+Without one it publishes into the root realm, where it is process-global — another preset publishing the same
+name collides, and a host reader would resolve one preset's instance for every session;
+<code>dsh-agent-presets</code> rejects that at mount. <code>true</code> means an entry-local realm: this standing
+mount's own private instance, apart from every other preset's. (A shared label does NOT pool instances —
+<code>provide()</code> throws on the second registration under the same realm symbol; labels join REALMS,
+and are not what this file needs.)
+</blockquote>
+
+<p>
+检查在 <code>mountPreset()</code> 里，靠 <code>leakedServices()</code> 实现：
+遍历 service store 的所有 own symbol，凡是实现属于这次挂载的 fiber、
+且 <code>rootIsolate[impl.name] === key</code>（也就是它占的正是根 realm 给这个名字的槽位）的，
+就是漏出去的。返回值按 <code>localeCompare</code> 排序，所以诊断信息里名字的顺序和文件里的顺序无关。
+</p>
+
+<p>
+这个设计我认为是对的。但上面那段引文我每次重读还是要想三遍：<code>true</code> 开一个 entry-local realm，
+字符串是 label，label 加入 REALMS，而同名 label 并不池化实例，第二次 <code>provide()</code> 直接抛。
+三件事各自都清楚，凑在一起就是要慢慢过。
+</p>
+
+<div class="demo" id="d-realm">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 7.2</span>isolate realm 拒绝</div>
+    <div class="spacer"></div>
+    <button class="btn primary" data-act="run">挂载</button>
+    <button class="btn" data-act="fix">用 cordis:group 包起来</button>
+    <button class="btn" data-act="reset">还原</button>
+  </div>
+  <div class="demo-body">
+    <div class="pane-label">我自己写的 preset · $DSH_HOME/.agent-presets/mine/agent.cordis.yml</div>
+    <textarea class="edit" id="p-realm" spellcheck="false" wrap="off" style="min-height:260px"></textarea>
+    <div class="out" id="out-realm" style="margin-top:14px"></div>
+  </div>
+</div>
+
+<p>
+先点"挂载"：两行 provider（<code>dsh-terminal</code> 发布 <code>terminals</code>、
+<code>dsh-fs-local</code> 发布 <code>fs</code>）都落进根 realm，挂载被拒。
+注意诊断里的顺序是 <code>fs, terminals</code>，而文件里 <code>terminals</code> 在前。
+再点"用 cordis:group 包起来"，文本会被改写成两个带 <code>isolate</code> 的 group
+（这正是出厂 <code>minimal</code> preset 的形状），再挂载就通过了。
+</p>
+
+<div class="note">
+  <span class="tag">为什么 cordis:group 是一个"插件"</span>
+  <code>cordis:group</code> 和 <code>cordis:include</code> 一起注册在 app-boot 里，
+  走的是 ambient module pipeline 而不是被包含树自己的 specifier 解析。
+  <code class="srcpath">packages/boot/app-boot/README.md</code> 说明了原因：
+  "which is what lets a composition outside this workspace — an agent preset under the Harness home —
+  use a group row at all"。你写在 <code>~/.dsh/.agent-presets/</code> 下的 preset，
+  <code>node_modules</code> 向上查找根本走不到 harness 装在哪，
+  所以 group 这种结构行必须由宿主提供。
+</div>
+
+<h2><span class="num">§7.5</span>四个出厂 preset</h2>
+
+<p>
+出厂的四个 preset 在 <code class="srcpath">apps/cli/config/agent-presets/</code>，
+每个目录一个 <code>agent.cordis.yml</code> 加一个只放展示文本的 <code>preset.yml</code>。
+并排放一起看，同一套 host 之上能拉出多少种形状就有了具体数字：
+</p>
+
+<p>
+列名是仓库里的目录名。官方微信稿和跟着发的媒体稿用的是另一套中文名，两套对起来是
+标准 = <code>standard</code>，PTC（程序化工具调用）≈ <code>code</code>，
+极简 = <code>minimal</code>，创造 = <code>cordis</code>。
+表里第一行的 <code>preset.yml</code> 名字就是界面下拉框显示的那一串，下面一律用目录名。
+</p>
+
+<table>
+<thead><tr>
+  <th></th><th><code>minimal</code></th><th><code>standard</code></th><th><code>code</code></th><th><code>cordis</code></th>
+</tr></thead>
+<tbody>
+<tr><td><code>preset.yml</code> 名字</td><td>极简模式</td><td>标准模式</td><td>PTC 模式</td><td>创造模式</td></tr>
+<tr><td><code>order</code></td><td>3</td><td>1</td><td>2</td><td>4</td></tr>
+<tr><td>顶层行 / 组内行</td><td>3 / 5</td><td>16 / 13</td><td>17 / 13</td><td>17 / 13</td></tr>
+<tr><td><code>isolate</code> group 数</td><td>2（<code>terminals</code>、<code>fs</code>）</td>
+    <td>3（<code>planMode</code>、<code>compaction</code>+<code>toolResultPruner</code>、<code>workflowEngine</code>）</td>
+    <td>3（同 standard）</td><td>3（同 standard）</td></tr>
+<tr><td>persona</td><td><code>complete: true</code>，正文一句话</td>
+    <td><code>{{model}}</code> / <code>{{cwd}}</code> 一行</td><td>同 standard</td>
+    <td>四段：两个平面的归属规则 + preset 目录约定 + 先读 skill</td></tr>
+<tr><td>runtime context</td><td><code>includeRuntimeContext: false</code></td><td>有</td><td>有</td><td>有</td></tr>
+<tr><td>shell</td><td>持久 PTY（<code>tool-bash-persistent</code>，300s）</td>
+    <td><code>tool-bash</code> / <code>tool-pwsh</code>（按平台互斥 disable）</td><td>同 standard</td><td>同 standard</td></tr>
+<tr><td>文件</td><td><code>str_replace_editor</code> + 裸 <code>fs-local</code></td>
+    <td><code>tool-fs</code> + <code>tool-fs-search</code>（用 host 的沙箱 fs）</td><td>同 standard</td><td>同 standard</td></tr>
+<tr><td>compaction</td><td>没有</td><td><code>compaction-basic</code> + <code>command-compact</code> + pruner</td>
+    <td>同 standard</td><td>同 standard</td></tr>
+<tr><td>plan mode</td><td>无</td><td>有</td><td>有</td><td>有</td></tr>
+<tr><td>子 agent / workflow</td><td>无</td><td>spawn + fork + workflow + ralph<br>（codex / claude-code 两行 <code>disabled: true</code>）</td>
+    <td>同 standard</td><td>同 standard</td></tr>
+<tr><td>skills</td><td>无</td><td><code>skill-filesystem</code> + <code>tool-skill</code></td><td>同 standard</td>
+    <td>同上，但 <code>customSkillDirs</code> 指向 preset 自己的 <code>skills/</code> 目录</td></tr>
+<tr><td>相对 standard 的差</td><td colspan="1">另一套组合</td><td>基准</td>
+    <td>+ <code>tool-presentation: { mode: code }</code></td>
+    <td>+ <code>tool-cordis</code>，且两个 skill 行移到文件末尾并带上 <code>customSkillDirs</code></td></tr>
+<tr><td>模型可见工具数（macOS）</td><td>2</td><td>25</td><td>1（<code>run_code</code>）</td><td>32</td></tr>
+</tbody>
+</table>
+
+<p>
+<code>code</code> 和 <code>cordis</code> 都是 <code>standard</code> 的<strong>整目录拷贝</strong>，
+然后各改各的（<code>code</code> 只多一行，<code>cordis</code> 换了 persona、加了 <code>tool-cordis</code>、把两个 skill 行挪到末尾），
+不是"standard 加一条补丁"。README 把这笔账算得很清楚，列在 Known Limitations 里：
+</p>
+
+<blockquote>
+A copy is a snapshot that drifts — upgrading the deployment does not update copies of shipped presets,
+and there is no patch semantics at this layer to express "standard plus one change"
+(that is the bundle layer's <code>cordis.patch.yml</code>); the shipped set itself accepts the same cost —
+<code>cordis</code> and <code>code</code> are full copies of <code>standard</code> — so the whole assembly stays
+readable in one file.
+</blockquote>
+
+<p>
+skills 那一行还有个方向上的差别值得记一笔。dsh 的 <code>skill-filesystem</code> 扫两个来源，
+omp 的 skill 发现覆盖六个生态的目录：<code>.omp</code>、<code>.claude/skills</code>、
+<code>.agents/skills</code>、<code>.codex/skills</code>、<code>.config/opencode/skills</code>、
+<code>.github/skills</code>，谁写的 <code>SKILL.md</code> 都能被直接捡起来。
+在"和别人已经装好的那套东西对接"这件事上，窄的那个是 dsh。
+</p>
+
+<h3><code>minimal</code>：三行，两个工具</h3>
+
+<p>
+<code>minimal</code> 值得单独看，它是四个里唯一一个"不是产品"的组合。整个文件三行顶层：
+一个 persona、一个装持久 shell 的 group、一个装文件系统的 group。
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">apps/cli/config/agent-presets/minimal/agent.cordis.yml · 第一行与文件头注释</span></div>
+<pre><code data-lang="yaml"># The persona is the complete system prompt, so global identity, Web orientation,
+# tool guidance, and later assembly listeners cannot add prompt text. Runtime
+# context snapshots are suppressed for this preset, and the model composes only
+# persistent `bash` and `str_replace_editor`. Context compaction is absent.
+
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    text: You are a helpful software engineer assistant.
+    complete: true
+    includeRuntimeContext: false</code></pre>
+</div>
+
+<p>
+<code>complete: true</code> 的意思是这就是完整的 system prompt。全局身份、Web 环境说明、工具指引、
+后续任何 assembly listener，都加不进一个字。加上 <code>includeRuntimeContext: false</code>
+和完全没有 compaction，你得到的是一个提示词固定、工具固定、上下文不被任何策略动过的 agent。
+</p>
+
+<div class="note">
+  <span class="tag">出厂就带着的那个 benchmark agent</span>
+  两个工具，一句写死的 system prompt（<code>You are a helpful software engineer assistant.</code>），
+  没有 compaction，没有运行时上下文快照。这就是当年那批 SWE-bench agent 的形状：
+  一个 shell，一个编辑器，一句话提示词。DeepSeek 没把它藏起来，
+  它和另外三个产品级 preset 并排躺在 <code class="srcpath">apps/cli/config/agent-presets/</code> 里，
+  在界面下拉框里叫"极简模式"，<code>order</code> 是 3。
+  官方对这个模式的说明是"用于最小环境基准测试"，
+  和这一节从文件里读出来的形状是同一件事。
+  <code>standard</code> 那边是 25 个工具、plan mode、goal、子 agent、workflow、skills、compaction，
+  每一样都在给模型多一份可以出错的自由度。两者共用同一个 host、同一份日志、同一条模型路由。
+</div>
+
+<div class="note vs">
+  <span class="tag">换成别的 harness</span>
+  同一个进程、同一时刻，一个会话是两个工具的评测 agent，另一个会话是三十二个工具的产品 agent。
+  这件事 omp 也做得到。它的每个 <code>AgentSession</code> 各自持有一份隔离的工具注册表，
+  创建时能传 <code>toolNames</code> / <code>restrictToolNames</code> / <code>customTools</code>，
+  跑起来之后 <code>pi.setActiveTools(names)</code> 也只改当前这一个会话。
+  区别在于每会话变的是什么。omp 变的是一张<strong>工具名单</strong>，
+  dsh 变的是一整棵插件子树，工具只是那棵子树上的若干行。
+  所以 preset 能动的不止名单。<code>minimal</code> 的 persona 带 <code>complete: true</code>，
+  后面任何 assembly listener 都加不进一个字，它也完全没有 compaction。
+  <code>code</code> 比 <code>standard</code> 只多一行 <code>tool-presentation: { mode: code }</code>，
+  整张工具面就塌成一个 <code>run_code</code>。这些都不在名单那一层。
+  还有一根轴容易和它混掉，所以说明白：OpenCode 的 Go server 加 OpenAPI 3.1 端点解决的是
+  "一个会话，很多客户端"，CLI、桌面端、网页、脚本可以同时接到同一个 session 上。
+  dsh 在那根轴上也有东西（跑起来的 Web UI 会去拉 37 个 client plugin bundle），
+  但和 preset 无关。preset 管的是"一个进程，很多形状不同的 agent"。
+</div>
+
+<div class="demo" id="d-preset">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 7.3</span>preset 切换与工具目录</div>
+    <div class="spacer"></div>
+    <select class="btn" id="preset-pick">
+      <option value="minimal">minimal · 极简模式</option>
+      <option value="standard" selected>standard · 标准模式</option>
+      <option value="code">code · PTC 模式</option>
+      <option value="cordis">cordis · 创造模式</option>
+    </select>
+    <button class="btn primary" data-act="run">挂载</button>
+  </div>
+  <div class="demo-body">
+    <div class="split">
+      <div>
+        <div class="pane-label">agent.cordis.yml（长 prompt 正文已省略）</div>
+        <div class="c7-tree" id="t-preset" style="margin-top:0"></div>
+      </div>
+      <div>
+        <div class="pane-label">挂载日志与模型可见目录</div>
+        <div class="out" id="out-preset"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<p>
+四个 preset 都跑同一个 <code>mountPreset()</code>：先按平台求值 <code>disabled</code>，
+再递归进 group 并记录 realm，检查有没有 service 漏进根 realm，最后把每一行贡献的工具收进目录。
+选 <code>minimal</code>，目录会精确塌到两个：<code>bash</code>（来自 <code>tool-bash-persistent</code>）和
+<code>str_replace_editor</code>。选 <code>code</code>，25 个工具会被
+<code>tool-presentation</code> 那一行折叠成一个 <code>run_code</code>：
+</p>
+
+<blockquote>
+<code>native</code> (every schema), <code>code</code> (only <code>run_code</code> plus a generated TypeScript SDK),
+or <code>both</code>. [...] under <code>code</code> the registry resolves a model-direct call naming any other tool
+to <code>UNKNOWN_TOOL</code>, so this row is what keeps the announced surface and the callable surface the same
+for every agent it covers.
+</blockquote>
+
+<div class="note warn">
+  <span class="tag">顺手数一下 cordis_ 开头的工具</span>
+  选 <code>cordis</code>，目录里会出现七个 <code>cordis_*</code>。这个数字是我照着
+  <code class="srcpath">packages/extensions/tool-cordis/src/index.ts</code> 里
+  <code>name: 'cordis_...'</code> 的七个出现点数出来的。
+  同一个包的 README 第 5 行写的是 "five model-facing tools"，列的名字里有一个
+  <code>cordis_inspect</code>，代码里已经拆成了 <code>cordis_inspect_list</code> /
+  <code>_query</code> / <code>_self</code>。仓库里还有一份 Agent Note 说 "three tools"，
+  名字是 <code>cordis_inspect</code>、<code>cordis_mount</code>、<code>cordis_unmount</code>。
+  代码是对的，两份文档是两个时间点的快照。master 从发布到现在一个 commit 都没动过，
+  这种漂移短期内不会有人来修。
+</div>
+
+<h2><span class="num">§7.6</span>本章的产物</h2>
+
+<p>
+本章给 mini-dsh 加的东西不在服务那一层，它是一层把配置变成树的机制。
+<code>applyEntryPatches()</code> 是从真实 include 逐条移植的补丁语义；
+<code>composeLayers()</code> 在它外面套一层来源追踪，外加一份"哪些键被整块换掉了"的记账
+（真实实现不需要这层，它由 <code>renderConfigDump()</code> 用 <code>#&nbsp;==</code> 注释行承担）；
+<code>mountPreset()</code> 是 realm 检查加工具目录收集。
+页面上三个 demo 跑的就是下面这三个函数。
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh v0.7 · 补丁语义（vendor/include/src/index.ts 的移植）</span></div>
+  <pre><code id="src-apply" data-lang="js"></code></pre>
+</div>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh v0.7 · 层叠 + 来源追踪 + 掉键记账</span></div>
+  <pre><code id="src-compose" data-lang="js"></code></pre>
+</div>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh v0.7 · preset 挂载与 realm 检查</span></div>
+  <pre><code id="src-mount" data-lang="js"></code></pre>
+</div>
+
+<p>
+读 YAML 的那 90 行（<code>parseEntryYaml</code>）也在同一段脚本里，没有引入任何 YAML 库。
+它只认这个方言实际用到的那些东西：映射、序列、行内 flow 数组、
+<code>|</code> / <code>|-</code> / <code>&gt;</code> / <code>&gt;-</code> 块标量、整行注释，以及 <code>!!js</code>。
+</p>
+
+<div class="note good">
+  <span class="tag">下一章预告</span>
+  刚才在 <code>code</code> preset 里，<code>tool-presentation: { mode: code }</code> 这一行
+  把 25 个工具的目录折叠成了一个 <code>run_code</code>。
+  一行配置换掉整个模型可见面，这件事本身就说明被换掉的那个东西必须足够独立。
+  第 8 章造它：从工具 schema 生成 TypeScript SDK，让模型写一段程序而不是调一次工具，
+  五次往返压成一次。
+</div>
+
+<h2><span class="num">§7.7</span>回到真实的 dsh</h2>
+
+<p>本章覆盖的是三个包加一个应用层：</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">真实签名（节选）</span></div>
+<pre><code data-lang="js">// vendor/include/src/index.ts — 补丁语义，挂载与 --dump-config 共用
+export function applyEntryPatches(
+  data: EntryOptions[],
+  patches: PatchOptions[] | undefined,
+  warn: (message: string, ...args: any[]) =&gt; void,
+): EntryOptions[]
+
+// vendor/loader/src/config/entry.ts — 合并新 options，按需重启，并经父树持久化
+async update(options: Partial&lt;EntryOptions&gt;, create = false, force = false): Promise&lt;void&gt;
+
+// vendor/loader/src/config/utils.ts — 表达式求值与递归插值
+export const evaluate: (ctx: object, expr: string) =&gt; any
+export function interpolate(ctx: object, value: any): any
+
+// packages/preset/agent-presets/src/mount.ts
+export function mountPreset(agentCtx: Context, preset: AgentPreset): Promise&lt;void&gt;
+export function leakedServices(ctx: Context, mount: Fiber): string[]   // 按 localeCompare 排序
+
+// packages/boot/app-boot — 组合并启动，或离线渲染同一棵树
+boot(binName, absoluteConfigPath, patches?, prepare?, bareModuleBaseUrl?)
+renderConfigDump(binName, absoluteConfigPath, layers, warn?)</code></pre>
+</div>
+
+<p>几个真实实现里的东西，我们刻意省掉了：</p>
+
+<ul>
+  <li>补丁层其实不止四层。<code>apps/cli/src/profile-boot.ts</code> 在所有用户层之上还压了一层
+      telemetry 开关：非空的 <code>DSH_TELEMETRY_DISABLED</code> 会把 <code>session-telemetry-otel</code> 打成
+      <code>disabled</code>。base 的注释解释了为什么必须是补丁：
+      "the launchers patch the row disabled; config cannot disable a row"。</li>
+  <li>用户补丁层是热的。<code>watchUserPatches</code> 盯住精确路径（文件和父目录都不存在也照样盯），
+      把突发变更串行化，并在调用方给定的层序里重新组合。读/解析/候选任一步失败都保留上一棵好树，
+      同时广播 <code>hmr/config-update-failed(filename, Error)</code>。</li>
+  <li>preset 子树把 <code>write()</code> 覆盖成 no-op。Loader 一旦认为配置变了就会把树写回源文件，
+      而"某一行自己 dispose 了 fiber"就足以让它这么认为。继承这个行为等于把一个会话的运行时状态
+      烙进所有会话共享的文件里，还会在 <code>setTimeout</code> 里对只读的出厂 preset 发起
+      <code>writeFile</code>。preset 文件是输入，不是持久化目标。</li>
+  <li>mount 拒绝三件事，我们只实现了两件。第三件是"一直没变成可用状态的行"：
+      模块 import 失败或插件抛异常由 Loader 自己拒，剩下的是<em>还在等一个这份组合从未提供的 service</em> 的行，
+      由 <code>inactiveRows(tree)</code> 点名。<code>code</code> preset 的
+      <code>tool-presentation</code> 就靠这条：它等 host 的 <code>codeRuntime</code>，
+      于是"没有 TypeScript runtime 的部署"在挂载时就失败并报出这个 id，而不是拖到第一次请求。</li>
+  <li><code>isolate</code> 还有 label 形式。<code>true</code> 是 entry-local realm（<code>LocalRealm</code>），
+      写字符串则是 <code>GlobalRealm</code>：同名 label 的 entry 加入同一个 realm。
+      注意 label <em>不会</em>把实例池化，第二次 <code>provide()</code> 在同一个 realm symbol 下会直接抛。</li>
+</ul>
+
+<div class="note src">
+  <span class="tag">自己去读</span>
+  <code class="srcpath">vendor/loader/src/config/entry.ts</code> — <code>EntryOptions</code> 与 <code>Entry.update()</code><br>
+  <code class="srcpath">vendor/loader/src/config/{group,isolate,utils}.ts</code> — group、realm、表达式求值<br>
+  <code class="srcpath">vendor/include/src/index.ts</code> — YAML 方言与 <code>applyEntryPatches()</code><br>
+  <code class="srcpath">packages/bundle/base/cordis.patch.yml</code> — 每个 profile 的第一层，注释密度全仓最高之一<br>
+  <code class="srcpath">packages/bundle/{web-app,headless}/cordis.patch.yml</code> — 两种表面各自怎么改写 base<br>
+  <code class="srcpath">apps/cli/config/agent-presets/{minimal,standard,code,cordis}/agent.cordis.yml</code> — 四个出厂 preset<br>
+  <code class="srcpath">packages/preset/agent-presets/README.md</code> — 双平面、realm 规则、authoring、已知局限<br>
+  <code class="srcpath">packages/boot/app-boot/README.md</code> 的 Profiles 一节 — profile/bundle 的机制<br>
+  <code class="srcpath">docs/architecture.md</code> 的 "Profiles and bundles" 一节 — 层序的官方表述
+</div>
+
+</main>
+<aside id="dsh-toc"></aside>
+</div>
+
+<script>
+// ===================================================================
+// 一个只认这套方言的 YAML 读取器。没有依赖，没有 fetch。
+// 支持：映射、序列、行内 flow 数组、块标量、整行/行尾注释、!!js。
+// ===================================================================
+function parseEntryYaml(text) {
+  const st = { lines: String(text).replace(/\t/g, '  ').split('\n'), i: 0 };
+  skipBlank(st);
+  if (st.i >= st.lines.length) return [];
+  const value = parseNode(st, indentOf(struct(st, st.i)));
+  skipBlank(st);
+  if (st.i < st.lines.length) throw new Error('第 ' + (st.i + 1) + ' 行：缩进无法归属');
+  return value;
+}
+
+function indentOf(line) { return line.match(/^ */)[0].length; }
+
+/** 结构位置读到的行：剥掉行尾注释和尾随空格。块标量不走这里。 */
+function struct(st, k) {
+  const line = st.lines[k];
+  if (line === undefined) return undefined;
+  let quote = null;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (quote) { if (c === quote) quote = null; }
+    else if (c === '"' || c === "'") quote = c;
+    else if (c === '#' && (i === 0 || /\s/.test(line[i - 1]))) return line.slice(0, i).replace(/\s+$/, '');
+  }
+  return line.replace(/\s+$/, '');
+}
+
+function skipBlank(st) {
+  while (st.i < st.lines.length) {
+    const t = st.lines[st.i].trim();
+    if (t === '' || t[0] === '#') st.i++; else break;
+  }
+}
+
+function splitKey(s) {
+  const m = /^([A-Za-z_][\w.$-]*):(?:\s+(.*))?$/.exec(s);
+  return m ? { key: m[1], rest: m[2] === undefined ? '' : m[2] } : null;
+}
+
+function parseNode(st, ind) {
+  skipBlank(st);
+  const body = struct(st, st.i).slice(ind);
+  return (body === '-' || body.slice(0, 2) === '- ') ? parseSeq(st, ind) : parseMap(st, ind);
+}
+
+function parseSeq(st, ind) {
+  const out = [];
+  for (;;) {
+    skipBlank(st);
+    const line = struct(st, st.i);
+    if (line === undefined || indentOf(line) !== ind) break;
+    const body = line.slice(ind);
+    if (body !== '-' && body.slice(0, 2) !== '- ') break;
+    const rest = body === '-' ? '' : body.slice(2).trim();
+    if (!rest) { st.i++; out.push(parseChild(st, ind)); continue; }
+    if (splitKey(rest)) {
+      // "- " 正好是两列缩进：改写成等价的、从 ind+2 开始的映射首行
+      st.lines[st.i] = ' '.repeat(ind + 2) + line.slice(ind + 2);
+      out.push(parseNode(st, ind + 2));
+    } else {
+      st.i++;
+      out.push(parseScalar(rest));
+    }
+  }
+  return out;
+}
+
+function parseMap(st, ind) {
+  const out = {};
+  for (;;) {
+    skipBlank(st);
+    const line = struct(st, st.i);
+    if (line === undefined || indentOf(line) !== ind) break;
+    const kv = splitKey(line.slice(ind));
+    if (!kv) break;
+    st.i++;
+    if (kv.rest === '') out[kv.key] = parseChild(st, ind);
+    else if (/^[|>]-?$/.test(kv.rest)) out[kv.key] = parseBlockScalar(st, ind, kv.rest);
+    else out[kv.key] = parseScalar(kv.rest);
+  }
+  return out;
+}
+
+function parseChild(st, ind) {
+  skipBlank(st);
+  const line = struct(st, st.i);
+  if (line === undefined || indentOf(line) <= ind) return null;
+  return parseNode(st, indentOf(line));
+}
+
+function parseBlockScalar(st, ind, mark) {
+  const buf = [];
+  let base = -1;
+  while (st.i < st.lines.length) {
+    const raw = st.lines[st.i];
+    if (raw.trim() === '') { buf.push(''); st.i++; continue; }
+    if (indentOf(raw) <= ind) break;
+    if (base < 0) base = indentOf(raw);
+    buf.push(raw.slice(base));
+    st.i++;
+  }
+  while (buf.length && buf[buf.length - 1] === '') buf.pop();
+  let text = mark[0] === '>' ? buf.join(' ').replace(/\s+/g, ' ').trim() : buf.join('\n');
+  if (mark.length === 1) text += '\n';   // clip：保留一个尾换行；'-' 是 strip
+  return text;
+}
+
+function parseScalar(s) {
+  s = String(s).trim();
+  if (s.slice(0, 5) === '!!js ') return { __jsExpr: s.slice(5).trim() };
+  if (s[0] === '[' && s[s.length - 1] === ']') {
+    const inner = s.slice(1, -1).trim();
+    return inner ? inner.split(',').map(parseScalar) : [];
+  }
+  if (s === 'true') return true;
+  if (s === 'false') return false;
+  if (s === 'null') return null;
+  if (/^-?\d+(\.\d+)?$/.test(s)) return Number(s);
+  const q = s[0];
+  if ((q === '"' || q === "'") && s.length > 1 && s[s.length - 1] === q) return s.slice(1, -1);
+  return s;
+}
+
+// ===================================================================
+// !!js：和真实 loader 一字不差的两个函数
+// ===================================================================
+const evaluate = new Function('ctx', 'expr', '\n  with (ctx) {\n    return eval(expr)\n  }\n');
+
+function isJsExpr(value) { return value instanceof Object && '__jsExpr' in value; }
+
+function interpolate(ctx, value) {
+  if (isJsExpr(value)) return evaluate(ctx, value.__jsExpr);
+  if (!value || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map(function (item) { return interpolate(ctx, item); });
+  const out = {};
+  for (const k in value) out[k] = interpolate(ctx, value[k]);
+  return out;
+}
+
+// 一个假的根 context，扮演 boot() 挂上去的那些东西
+var MOCK_CTX = {
+  process: {
+    platform: 'darwin',
+    cwd: function () { return '/Users/you/repo'; },
+    env: { DSH_TOOLS_MODE: undefined, DSH_PERMISSION_MODE: undefined, DSH_CWD: undefined }
+  },
+  dshHomePath: function () {
+    return '/Users/you/.dsh/' + Array.prototype.slice.call(arguments).join('/');
+  },
+  baseUrl: 'file:///Users/you/.dsh/.agent-presets/mine/',
+  webStartup: { host: '0.0.0.0', port: 3080, trustedHosts: ['192.168.1.7'] }
+};
+
+function tryEval(expr) {
+  try { return { ok: true, value: evaluate(MOCK_CTX, expr) }; }
+  catch (err) { return { ok: false, value: String(err && err.message || err) }; }
+}
+
+// ===================================================================
+// 本章的产物 1：补丁语义。逐条对应 vendor/include/src/index.ts。
+// ===================================================================
+function applyEntryPatches(data, patches, warn) {
+  data = structuredClone(data);
+  if (!patches || !patches.length) return data;
+
+  const entryMap = new Map();
+  const buildMap = (entries) => {
+    for (const entry of entries) {
+      if (!entry || typeof entry !== 'object') continue;
+      if (entry.id) entryMap.set(entry.id, entry);
+      // group 的 config 装的是子行，所以外面也能按 id 打到它们
+      if (entry.group && Array.isArray(entry.config)) buildMap(entry.config);
+    }
+  };
+  buildMap(data);
+
+  for (const patch of patches) {
+    const { id, insert, name, ...overrides } = patch;
+
+    if (insert) {
+      if (id) {
+        const target = entryMap.get(id);
+        if (!target) { warn('patch insert: entry %C not found', id); continue; }
+        if (!target.group) { warn('patch insert: entry %C is not a group', id); continue; }
+        if (!Array.isArray(target.config)) target.config = [];
+        target.config.push(...insert);
+      } else {
+        data.push(...insert);
+      }
+      // 索引刚插进来的行：同一批里后面的补丁必须能打到它们
+      buildMap(insert);
+      continue;
+    }
+
+    if (!id) { warn('patch: id is required for non-insert patches'); continue; }
+
+    const target = entryMap.get(id);
+    if (!target) { warn('patch: entry %C not found', id); continue; }
+
+    if (name && name !== target.name) {
+      warn('patch: name mismatch for %C (expected %C, got %C), skipping', id, target.name, name);
+      continue;
+    }
+
+    // 按键赋值。config 就是一个键 -> 整块替换，不是深合并。
+    for (const [key, value] of Object.entries(overrides)) {
+      if (key === 'id') continue;
+      target[key] = value;
+    }
+  }
+
+  return data;
+}
+
+// ===================================================================
+// 本章的产物 2：把层叠出来的树，连同"谁插的、谁改的、谁的键掉了"一起交出去。
+// ===================================================================
+function composeLayers(layers) {
+  let data = [];
+  const origin = Object.create(null);
+  const touched = Object.create(null);
+  const dropped = Object.create(null);   // id -> 被整块替换顺手带走的 config 键
+  const warnings = [];
+
+  for (const layer of layers) {
+    const before = indexRows(data);
+    const keysBefore = configKeys(data);
+    data = applyEntryPatches(data, layer.patches, function (message) {
+      const args = Array.prototype.slice.call(arguments, 1);
+      warnings.push(layer.label + ': ' + message.replace(/%C/g, function () { return String(args.shift()); }));
+    });
+    const after = indexRows(data);
+    const keysAfter = configKeys(data);
+    for (const id in after) {
+      if (!(id in before)) origin[id] = layer.label;
+      else if (after[id] !== before[id]) touched[id] = layer.label;
+    }
+    // 整块替换会让上一层写过的键无声消失。这里把它们记下来，好在 warn sink 里点名。
+    for (const id in keysBefore) {
+      const gone = keysBefore[id].filter((k) => (keysAfter[id] || []).indexOf(k) < 0);
+      if (gone.length) dropped[id] = { layer: layer.label, keys: gone };
+    }
+  }
+
+  return { data, origin, touched, dropped, warnings };
+}
+
+/** id -> 这一行 config 的键名列表。config 是子行列表或标量的行不参与。 */
+function configKeys(rows, into) {
+  into = into || Object.create(null);
+  for (const row of rows) {
+    if (!row || !row.id) continue;
+    if (row.group && Array.isArray(row.config)) { configKeys(row.config, into); continue; }
+    const cfg = row.config;
+    if (cfg && typeof cfg === 'object' && !Array.isArray(cfg)) into[row.id] = Object.keys(cfg);
+  }
+  return into;
+}
+
+/** id -> 该行的指纹。group 的子行单独入表，所以子行变化不会把 group 标成"被替换"。 */
+function indexRows(rows, into) {
+  into = into || Object.create(null);
+  for (const row of rows) {
+    if (!row || !row.id) continue;
+    into[row.id] = JSON.stringify(row.group ? Object.assign({}, row, { config: '<children>' }) : row);
+    if (row.group && Array.isArray(row.config)) indexRows(row.config, into);
+  }
+  return into;
+}
+
+// ===================================================================
+// 真实世界里这些行各自发布什么 service、贡献什么工具。
+// 全部取自 clone：super(ctx, '...') 与 ctx.tools.register(defineTool({ name })).
+// ===================================================================
+var PROVIDES = {
+  '@deepseek-ai/dsh-terminal': ['terminals'],
+  '@deepseek-ai/dsh-fs-local': ['fs'],
+  '@deepseek-ai/dsh-plan-mode': ['planMode'],
+  '@deepseek-ai/dsh-compaction-basic': ['compaction'],
+  '@deepseek-ai/dsh-compaction-tool-result-pruner': ['toolResultPruner'],
+  '@deepseek-ai/dsh-workflow-worker-thread': ['workflowEngine']
+};
+
+var TOOLS = {
+  '@deepseek-ai/dsh-tool-bash': ['bash'],
+  '@deepseek-ai/dsh-tool-pwsh': ['pwsh'],
+  '@deepseek-ai/dsh-tool-bash-persistent': ['bash'],
+  '@deepseek-ai/dsh-tool-str-replace-editor': ['str_replace_editor'],
+  '@deepseek-ai/dsh-tool-fs': ['read', 'write', 'edit', 'read_image'],
+  '@deepseek-ai/dsh-tool-fs-search': ['glob', 'grep'],
+  '@deepseek-ai/dsh-tool-jobs': ['job_list', 'job_output', 'job_kill'],
+  '@deepseek-ai/dsh-tool-skill': ['skill'],
+  '@deepseek-ai/dsh-tool-goal': ['get_goal', 'create_goal', 'update_goal'],
+  '@deepseek-ai/dsh-plan-mode': ['exit_plan_mode'],
+  '@deepseek-ai/dsh-tool-ask-user': ['ask_user_question'],
+  '@deepseek-ai/dsh-tool-todo': ['todo_write'],
+  '@deepseek-ai/dsh-tool-subagent-control': ['send_message', 'interrupt_agent'],
+  '@deepseek-ai/dsh-tool-subagent-control/list-agents': ['list_agents'],
+  '@deepseek-ai/dsh-tool-ralph': ['ralph'],
+  '@deepseek-ai/dsh-tool-cordis': ['cordis_inspect_list', 'cordis_inspect_query', 'cordis_inspect_self',
+                                   'cordis_define', 'cordis_run', 'cordis_stop', 'cordis_undefine']
+};
+
+/** 有些行的工具名来自它自己的 config。 */
+function toolsOf(row) {
+  const cfg = row.config && !Array.isArray(row.config) ? row.config : {};
+  if (row.name === '@deepseek-ai/dsh-tool-subagent') return [cfg.toolName || 'subagent'];
+  if (row.name === '@deepseek-ai/dsh-tool-workflow') return [cfg.toolName || 'workflow'];
+  if (row.name === '@deepseek-ai/dsh-tool-web') {
+    return ['web_search'].concat(cfg.fetch === false ? [] : ['web_fetch']);
+  }
+  return TOOLS[row.name] || [];
+}
+
+/** disabled 每次读都重新求值，原始节点留在 options 里。 */
+function disabledOf(row) {
+  if (isJsExpr(row.disabled)) {
+    const r = tryEval(row.disabled.__jsExpr);
+    return { off: Boolean(r.ok && r.value), expr: row.disabled.__jsExpr, resolved: r };
+  }
+  return { off: Boolean(row.disabled), expr: null, resolved: null };
+}
+
+// ===================================================================
+// 本章的产物 3：挂载一个 preset。realm 检查 + 工具目录收集。
+// ===================================================================
+function mountPreset(rows, log) {
+  const rootRealm = [];      // 漏进根 realm 的 service 名
+  const tools = [];
+  let presentation = 'native';
+
+  const walk = (list, realms, depth) => {
+    for (const row of list) {
+      const pad = '  '.repeat(depth);
+      const state = disabledOf(row);
+      if (state.off) {
+        log.dim(pad + row.id + '  disabled' + (state.expr ? ' (!!js ' + state.expr + ' -> true)' : '') + '，跳过');
+        continue;
+      }
+
+      if (row.group) {
+        const realm = row.isolate || {};
+        const names = Object.keys(realm);
+        log.acc(pad + row.id + '  ' + row.name +
+                (names.length ? '  isolate { ' + names.join(', ') + ' }' : '  没有 isolate'));
+        walk(Array.isArray(row.config) ? row.config : [], realms.concat([realm]), depth + 1);
+        continue;
+      }
+
+      // provide()：落进最近一个声明了这个名字的 realm，否则落进根 realm
+      for (const name of PROVIDES[row.name] || []) {
+        const inner = realms.slice().reverse().find(function (r) { return r[name]; });
+        if (inner) log.ok(pad + row.id + '  provide(' + name + ') -> entry-local realm');
+        else { rootRealm.push(name); log.bad(pad + row.id + '  provide(' + name + ') -> ROOT realm'); }
+      }
+
+      if (row.name === '@deepseek-ai/dsh-agent-tool-presentation') {
+        const cfg = row.config || {};
+        presentation = cfg.mode || 'native';
+        log.warn(pad + row.id + '  presentAs(' + presentation + ')  这一行决定模型看到哪种目录');
+        continue;
+      }
+
+      const contributed = toolsOf(row);
+      if (contributed.length) {
+        tools.push(...contributed);
+        log.log(pad + row.id + '  tool: ' + contributed.join(', '));
+      } else if (!(PROVIDES[row.name] || []).length) {
+        log.dim(pad + row.id + '  （不贡献模型可见工具）');
+      }
+    }
+  };
+
+  walk(rows, [], 0);
+
+  if (rootRealm.length) {
+    const leaked = rootRealm.slice().sort(function (a, b) { return a.localeCompare(b); });
+    throw new Error('row(s) published process-global service(s) [' + leaked.join(', ') + ']; '
+      + 'a preset service must sit behind an `isolate` realm or move to the host composition');
+  }
+
+  const catalog = presentation === 'code' ? ['run_code']
+    : presentation === 'both' ? ['run_code'].concat(tools).sort()
+    : tools.slice().sort();
+  return { catalog, presentation };
+}
+
+DSH.showSource('src-apply', applyEntryPatches);
+DSH.showSource('src-compose', [composeLayers, configKeys, indexRows]);
+DSH.showSource('src-mount', mountPreset);
+
+// ===================================================================
+// 渲染：一棵配置树
+// ===================================================================
+function fmtValue(v, evalOn) {
+  if (isJsExpr(v)) {
+    let html = '<span class="c7-js">!!js ' + DSH.esc(v.__jsExpr) + '</span>';
+    if (evalOn) {
+      const r = tryEval(v.__jsExpr);
+      html += ' <span class="' + (r.ok ? 'c7-val' : 'c7-err') + '">-&gt; '
+            + DSH.esc(r.ok ? JSON.stringify(r.value) : r.value) + '</span>';
+    }
+    return html;
+  }
+  if (typeof v === 'string' && v.indexOf('\n') >= 0) {
+    return DSH.esc(JSON.stringify(v.slice(0, 60) + (v.length > 60 ? ' …' : '')));
+  }
+  return DSH.esc(JSON.stringify(v));
+}
+
+function renderTree(node, rows, opts) {
+  opts = opts || {};
+  const evalOn = !!opts.evalOn;
+  const html = [];
+
+  const emit = function (row, depth) {
+    const pad = '  '.repeat(depth);
+    const state = disabledOf(row);
+    const off = state.off || (isJsExpr(row.disabled) && !evalOn && false);
+    let tags = '';
+    if (opts.touched && opts.touched[row.id]) {
+      tags += '<span class="c7-tag c7-rep">替换 · ' + DSH.esc(opts.touched[row.id]) + '</span>';
+    }
+    if (opts.origin && opts.origin[row.id] && opts.origin[row.id] !== opts.baseLabel) {
+      tags += '<span class="c7-tag c7-new">插入 · ' + DSH.esc(opts.origin[row.id]) + '</span>';
+    }
+    if (row.group) tags += '<span class="c7-tag c7-grp">group</span>';
+
+    const id = DSH.esc(String(row.id || '(无 id)'));
+    const name = DSH.esc(String(row.name || ''));
+    html.push('<span class="c7-row' + (off ? ' c7-off' : '') + '">' + pad
+      + '<span class="c7-id">' + id + '</span>'
+      + '  <span class="c7-name">' + name + '</span>' + tags + '</span>');
+
+    if (row.disabled !== undefined && row.disabled !== null) {
+      html.push('<span class="c7-row' + (off ? ' c7-off' : '') + '">' + pad
+        + '  <span class="c7-key">disabled:</span> ' + fmtValue(row.disabled, evalOn) + '</span>');
+    }
+    if (row.inject) {
+      html.push('<span class="c7-row">' + pad + '  <span class="c7-key">inject:</span> '
+        + fmtValue(row.inject, evalOn) + '</span>');
+    }
+    if (row.isolate) {
+      html.push('<span class="c7-row">' + pad + '  <span class="c7-key">isolate:</span> '
+        + DSH.esc(JSON.stringify(row.isolate)) + '</span>');
+    }
+
+    if (row.group && Array.isArray(row.config)) {
+      row.config.forEach(function (child) { emit(child, depth + 1); });
+      return;
+    }
+    if (row.config && typeof row.config === 'object' && !Array.isArray(row.config)) {
+      Object.keys(row.config).forEach(function (k) {
+        html.push('<span class="c7-row' + (off ? ' c7-off' : '') + '">' + pad
+          + '  <span class="c7-key">' + DSH.esc(k) + ':</span> '
+          + fmtValue(row.config[k], evalOn) + '</span>');
+      });
+    } else if (row.config !== undefined) {
+      html.push('<span class="c7-row">' + pad + '  <span class="c7-key">config:</span> '
+        + fmtValue(row.config, evalOn) + '</span>');
+    }
+  };
+
+  rows.forEach(function (row) { emit(row, 0); });
+  node.innerHTML = html.join('') ||
+    '<span class="c7-row c7-name">（空 entry list）</span>';
+}
+
+// ===================================================================
+// Demo 7.1 - 三层补丁叠成一棵树
+// ===================================================================
+var BASE_YML = [
+  '# packages/bundle/base/cordis.patch.yml (节选)',
+  '# 整个 dsh-base 就是"一条 insert 打在空列表上"',
+  '- insert:',
+  '    - id: llm',
+  "      name: '@deepseek-ai/dsh-llm'",
+  '',
+  '    - id: session',
+  "      name: '@deepseek-ai/dsh-session'",
+  '',
+  '    - id: session-query-sqlite',
+  "      name: '@deepseek-ai/dsh-session-query-sqlite'",
+  '      config:',
+  "        path: ':memory:'",
+  '        openAt: never',
+  '',
+  '    - id: tools',
+  "      name: '@deepseek-ai/dsh-tools'",
+  '',
+  '    - id: system-prompt',
+  "      name: '@deepseek-ai/dsh-system-prompt'",
+  '      config:',
+  "        persona: ''",
+  '',
+  '    - id: agent-loop',
+  "      name: '@deepseek-ai/dsh-agent-loop'",
+  '      config:',
+  '        agents: []',
+  '',
+  '    - id: tool-bash',
+  "      name: '@deepseek-ai/dsh-tool-bash'",
+  "      disabled: !!js process.platform === 'win32'",
+  '',
+  '    - id: tool-fs',
+  "      name: '@deepseek-ai/dsh-tool-fs'",
+  '',
+  '    - id: sandbox-policy',
+  "      name: '@deepseek-ai/dsh-sandbox-policy'",
+  '      config:',
+  "        mode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'",
+  '        workspaceRoot: !!js process.cwd()'
+].join('\n');
+
+var PROFILE_YML = [
+  '# packages/bundle/web-app/cordis.patch.yml (节选)',
+  '# 按 id 覆盖 base 的行，然后 insert 浏览器那一半',
+  '- id: system-prompt',
+  '  config:',
+  "    persona: 'You are a coding agent powered by the {{model}} model.'",
+  '',
+  '- id: tools',
+  '  config:',
+  '    mode: !!js process.env.DSH_TOOLS_MODE',
+  '',
+  '# agent 平面整体搬去 preset：关掉而不是删掉',
+  '- id: tool-bash',
+  '  disabled: true',
+  '',
+  '- id: tool-fs',
+  '  disabled: true',
+  '',
+  '- insert:',
+  '    - id: webserver',
+  "      name: '@deepseek-ai/dsh-host-webserver'",
+  '      inject: [webStartup]',
+  '      config:',
+  "        host: !!js ctx.webStartup.host ?? '127.0.0.1'",
+  '        port: !!js ctx.webStartup.port ?? 3080',
+  '',
+  '    - id: agent-presets',
+  "      name: '@deepseek-ai/dsh-agent-presets'",
+  '      config:',
+  '        default: standard'
+].join('\n');
+
+var OVERLAY_YML = [
+  '# dsh --profile web --patch ./search.yml',
+  '# 打开全文检索：整块重写这一行的 config。',
+  '# 注意这里只写了 path，没提 openAt。',
+  '- id: session-query-sqlite',
+  '  config:',
+  "    path: !!js dshHomePath('search.sqlite')",
+  '',
+  '# 上一层刚 insert 进来的行，这一层照样能打',
+  '- id: agent-presets',
+  '  config:',
+  '    default: minimal',
+  '',
+  '# 下面两条都打不中，只留 warning',
+  '- id: tool-web',
+  '  disabled: true',
+  '',
+  '- id: tools',
+  '  insert:',
+  '    - id: my-plugin',
+  '      name: ./my-plugin.js'
+].join('\n');
+
+// 「把 agent-loop 那一行删掉」按钮往 overlay 追加的东西。
+// 补丁层没有 delete 这个动作，能做的只有 disabled。
+var KILL_LOOP_PATCH = [
+  '# 把 agent-loop 那一行删掉',
+  '- id: agent-loop',
+  '  disabled: true'
+].join('\n');
+
+(function () {
+  var evalOn = false;
+
+  DSH.demo('d-patch', {
+    init: function (o, api) {
+      var fill = function () {
+        api.$('#p-base').value = BASE_YML;
+        api.$('#p-profile').value = PROFILE_YML;
+        api.$('#p-overlay').value = OVERLAY_YML;
+      };
+      fill();
+      this._fill = fill;
+      api.$$('textarea.edit').forEach(function (ta) {
+        ta.addEventListener('input', function () { render(o, api); });
+      });
+      render(o, api);
+    },
+    reset: function (o, api) {
+      api.$('#p-base').value = BASE_YML;
+      api.$('#p-profile').value = PROFILE_YML;
+      api.$('#p-overlay').value = OVERLAY_YML;
+      render(o, api);
+    },
+    js: function (o, api) {
+      evalOn = !evalOn;
+      api.$('[data-act="js"]').textContent = '求值 !!js：' + (evalOn ? '开' : '关');
+      render(o, api);
+    },
+    killloop: function (o, api) {
+      var ta = api.$('#p-overlay');
+      if (ta.value.indexOf('id: agent-loop') >= 0) {
+        o.clear();
+        o.dim('overlay 里已经有这条补丁了。点"还原三层"回到有循环的版本。');
+        return;
+      }
+      ta.value = ta.value.replace(/\s+$/, '') + '\n\n' + KILL_LOOP_PATCH;
+      render(o, api);
+      o.rule();
+      o.warn('agent-loop 被打成 disabled。树上那一行还在，只是划掉了。');
+      o.dim('补丁层没有 delete。base 的注释写的是 "the launchers patch the row disabled;');
+      o.dim('config cannot disable a row"，所以关一行的唯一办法就是再打一层补丁。');
+      o.dim('这个进程照样起得来：webserver 在监听，session 在写日志，工具都注册好了，');
+      o.dim('沙箱策略也生效。只是没有任何东西会去请求模型。');
+      o.dim('主循环就是一行配置，打掉它和打掉 sandbox-policy 一样容易。');
+    }
+  });
+
+  function render(o, api) {
+    var node = document.getElementById('t-compose');
+    var specs = [
+      { label: 'base', el: api.$('#p-base') },
+      { label: 'profile', el: api.$('#p-profile') },
+      { label: 'overlay', el: api.$('#p-overlay') }
+    ];
+    o.clear();
+
+    var layers = [];
+    for (var i = 0; i < specs.length; i++) {
+      try {
+        var parsed = parseEntryYaml(specs[i].el.value);
+        if (!Array.isArray(parsed)) throw new Error('这一层必须是一个列表');
+        layers.push({ label: specs[i].label, patches: parsed });
+      } catch (err) {
+        node.innerHTML = '<span class="c7-err">' + DSH.esc(specs[i].label + ' 层解析失败：'
+          + (err && err.message || err)) + '</span>';
+        o.bad('解析失败，树没有重算');
+        return;
+      }
+    }
+
+    var res;
+    try {
+      res = composeLayers(layers);
+    } catch (err) {
+      node.innerHTML = '<span class="c7-err">' + DSH.esc('层叠失败：' + (err && err.message || err)) + '</span>';
+      return;
+    }
+
+    renderTree(node, res.data, {
+      evalOn: evalOn, origin: res.origin, touched: res.touched, baseLabel: 'base'
+    });
+
+    if (!res.warnings.length) o.ok('没有 warning，每一条补丁都打中了');
+    res.warnings.forEach(function (w) { o.warn(w); });
+    Object.keys(res.dropped).forEach(function (id) {
+      var d = res.dropped[id];
+      o.warn(d.layer + ' 层整块替换了 ' + id + ' 的 config，' + d.keys.join('、') + ' 跟着没了');
+    });
+    o.dim('合计 ' + countRows(res.data) + ' 行（含 group 子行），来自 ' + layers.length + ' 层');
+  }
+
+  function countRows(rows) {
+    var n = 0;
+    rows.forEach(function (r) {
+      n += 1;
+      if (r.group && Array.isArray(r.config)) n += countRows(r.config);
+    });
+    return n;
+  }
+})();
+
+// ===================================================================
+// Demo 7.3 - 四个出厂 preset。文本是真实文件的行骨架。
+// ===================================================================
+var MINIMAL_YML = [
+  '- id: persona',
+  "  name: '@deepseek-ai/dsh-persona'",
+  '  config:',
+  '    text: You are a helpful software engineer assistant.',
+  '    complete: true',
+  '    includeRuntimeContext: false',
+  '',
+  '- id: persistent-shell',
+  '  name: cordis:group',
+  '  group: true',
+  '  isolate:',
+  '    terminals: true',
+  '  config:',
+  '    - id: pty',
+  "      name: '@deepseek-ai/dsh-terminal'",
+  '',
+  '    - id: terminal-bash',
+  "      name: '@deepseek-ai/dsh-terminal-bash'",
+  '      config:',
+  '        timeoutMs: 300000',
+  '',
+  '    - id: persistent-bash',
+  "      name: '@deepseek-ai/dsh-tool-bash-persistent'",
+  '      config:',
+  '        timeoutMs: 300000',
+  '',
+  '- id: filesystem',
+  '  name: cordis:group',
+  '  group: true',
+  '  isolate:',
+  '    fs: true',
+  '  config:',
+  '    - id: fs-local',
+  "      name: '@deepseek-ai/dsh-fs-local'",
+  '      config:',
+  '        cwd: !!js process.env.DSH_CWD ?? process.cwd()',
+  '',
+  '    - id: str-replace-editor',
+  "      name: '@deepseek-ai/dsh-tool-str-replace-editor'",
+  '      config:',
+  '        maxOutputChars: 16000'
+].join('\n');
+
+var STD_HEAD = [
+  '- id: persona',
+  "  name: '@deepseek-ai/dsh-persona'",
+  '  config:',
+  "    text: 'You are a coding agent powered by the {{model}} model. Your working directory is {{cwd}}.'",
+  '',
+  '- id: agent-instructions',
+  "  name: '@deepseek-ai/dsh-agent-instructions'",
+  '  config:',
+  '    maxBytes: 65536',
+  '',
+  '- id: tool-bash',
+  "  name: '@deepseek-ai/dsh-tool-bash'",
+  "  disabled: !!js process.platform === 'win32'",
+  '',
+  '- id: tool-pwsh',
+  "  name: '@deepseek-ai/dsh-tool-pwsh'",
+  "  disabled: !!js process.platform !== 'win32'",
+  '',
+  '- id: tool-fs',
+  "  name: '@deepseek-ai/dsh-tool-fs'",
+  '',
+  '- id: tool-fs-search',
+  "  name: '@deepseek-ai/dsh-tool-fs-search'",
+  '  config:',
+  '    sampleOverCapGlobResults: false',
+  '',
+  '- id: tool-jobs',
+  "  name: '@deepseek-ai/dsh-tool-jobs'",
+  ''
+].join('\n');
+
+var STD_SKILLS = [
+  '- id: skill-filesystem',
+  "  name: '@deepseek-ai/dsh-skill-filesystem'",
+  '',
+  '- id: tool-skill',
+  "  name: '@deepseek-ai/dsh-tool-skill'",
+  ''
+].join('\n');
+
+var STD_TAIL = [
+  '- id: tool-goal',
+  "  name: '@deepseek-ai/dsh-tool-goal'",
+  '',
+  '- id: planning',
+  '  name: cordis:group',
+  '  group: true',
+  '  isolate:',
+  '    planMode: true',
+  '  config:',
+  '    - id: plan-mode',
+  "      name: '@deepseek-ai/dsh-plan-mode'",
+  '',
+  '- id: compaction',
+  '  name: cordis:group',
+  '  group: true',
+  '  isolate:',
+  '    compaction: true',
+  '    toolResultPruner: true',
+  '  config:',
+  '    - id: compaction-basic',
+  "      name: '@deepseek-ai/dsh-compaction-basic'",
+  '',
+  '    - id: command-compact',
+  "      name: '@deepseek-ai/dsh-command-compact'",
+  '',
+  '    - id: tool-result-pruner',
+  "      name: '@deepseek-ai/dsh-compaction-tool-result-pruner'",
+  '      config:',
+  '        thresholdChars: 8192',
+  '',
+  '- id: delegation',
+  '  name: cordis:group',
+  '  group: true',
+  '  isolate:',
+  '    workflowEngine: true',
+  '  config:',
+  '    - id: tool-subagent-control',
+  "      name: '@deepseek-ai/dsh-tool-subagent-control'",
+  '',
+  '    - id: tool-subagent-list-agents',
+  "      name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'",
+  '',
+  '    - id: tool-subagent',
+  "      name: '@deepseek-ai/dsh-tool-subagent'",
+  '      config:',
+  '        provider: spawn',
+  '        toolName: subagent',
+  '        backgroundMode: continuable',
+  '',
+  '    - id: tool-subagent-fork',
+  "      name: '@deepseek-ai/dsh-tool-subagent'",
+  '      config:',
+  '        provider: fork',
+  '        toolName: subagent_fork',
+  '        backgroundMode: continuable',
+  '',
+  '    - id: tool-subagent-codex',
+  "      name: '@deepseek-ai/dsh-tool-subagent'",
+  '      disabled: true',
+  '      config:',
+  '        provider: codex',
+  '        toolName: subagent_codex',
+  '',
+  '    - id: tool-subagent-claude-code',
+  "      name: '@deepseek-ai/dsh-tool-subagent'",
+  '      disabled: true',
+  '      config:',
+  '        provider: claude-code',
+  '        toolName: subagent_claude_code',
+  '',
+  '    - id: workflow-worker-thread',
+  "      name: '@deepseek-ai/dsh-workflow-worker-thread'",
+  '      config:',
+  '        provider: spawn',
+  '',
+  '    - id: tool-workflow',
+  "      name: '@deepseek-ai/dsh-tool-workflow'",
+  '',
+  '    - id: tool-ralph',
+  "      name: '@deepseek-ai/dsh-tool-ralph'",
+  '      config:',
+  '        subagentProvider: spawn',
+  '        maxRounds: 64',
+  '',
+  '- id: tool-ask-user',
+  "  name: '@deepseek-ai/dsh-tool-ask-user'",
+  '',
+  '- id: tool-todo',
+  "  name: '@deepseek-ai/dsh-tool-todo'",
+  '  config:',
+  '    allowParallelInProgress: true',
+  '',
+  '- id: tool-web',
+  "  name: '@deepseek-ai/dsh-tool-web'",
+  '  config:',
+  '    fetch: false',
+  '    searchTimeoutMs: 60000',
+  ''
+].join('\n');
+
+var PRESETS = {
+  minimal: {
+    path: 'apps/cli/config/agent-presets/minimal/agent.cordis.yml',
+    label: '极简模式',
+    text: MINIMAL_YML
+  },
+  standard: {
+    path: 'apps/cli/config/agent-presets/standard/agent.cordis.yml',
+    label: '标准模式',
+    text: STD_HEAD + '\n' + STD_SKILLS + '\n' + STD_TAIL
+  },
+  code: {
+    path: 'apps/cli/config/agent-presets/code/agent.cordis.yml',
+    label: 'PTC 模式',
+    text: STD_HEAD + '\n' + STD_SKILLS + '\n' + STD_TAIL + '\n'
+      + ['- id: tool-presentation',
+         "  name: '@deepseek-ai/dsh-agent-tool-presentation'",
+         '  config:',
+         '    mode: code'].join('\n')
+  },
+  cordis: {
+    path: 'apps/cli/config/agent-presets/cordis/agent.cordis.yml',
+    label: '创造模式',
+    // standard 减去 skills 两行，末尾加 tool-cordis 与带 customSkillDirs 的 skills 两行
+    text: STD_HEAD + '\n' + STD_TAIL + '\n'
+      + ['- id: tool-cordis',
+         "  name: '@deepseek-ai/dsh-tool-cordis'",
+         '',
+         '- id: skill-filesystem',
+         "  name: '@deepseek-ai/dsh-skill-filesystem'",
+         '  config:',
+         '    customSkillDirs:',
+         "      - !!js \"process.getBuiltinModule('node:url').fileURLToPath(new URL('skills/', baseUrl))\"",
+         '',
+         '- id: tool-skill',
+         "  name: '@deepseek-ai/dsh-tool-skill'"].join('\n')
+  }
+};
+
+(function () {
+  DSH.demo('d-preset', {
+    init: function (o, api) {
+      api.$('#preset-pick').addEventListener('change', function () { mount(o, api); });
+      mount(o, api);
+    },
+    run: function (o, api) { mount(o, api); }
+  });
+
+  function mount(o, api) {
+    var id = api.$('#preset-pick').value;
+    var preset = PRESETS[id];
+    var node = document.getElementById('t-preset');
+    o.clear();
+
+    var rows;
+    try { rows = parseEntryYaml(preset.text); }
+    catch (err) { o.bad('解析失败：' + (err && err.message || err)); return; }
+
+    renderTree(node, rows, { evalOn: true });
+
+    o.head('preset = ' + id + '  (' + preset.label + ')');
+    o.dim(preset.path);
+    var counts = countShape(rows);
+    o.dim('顶层行 ' + counts.top + '   组内行 ' + counts.nested + '   isolate group ' + counts.groups);
+    o.rule();
+
+    var result;
+    try {
+      result = mountPreset(rows, o);
+    } catch (err) {
+      o.rule();
+      o.bad('agent-presets 拒绝挂载：' + err.message);
+      return;
+    }
+
+    o.rule();
+    o.ok('realm 检查通过：没有 service 落进根 realm');
+    o.head('模型可见工具目录  presentAs=' + result.presentation + '  共 ' + result.catalog.length + ' 个');
+    result.catalog.forEach(function (t) { o.acc('  ' + t); });
+    if (id === 'minimal') {
+      o.dim('两个。提示词固定、没有 compaction、没有运行时上下文：这是 benchmark 形状。');
+    }
+    if (result.presentation === 'code') {
+      o.dim('注册进 registry 的工具没有减少，减少的是"呈现"：其余名字对模型直接调用返回 UNKNOWN_TOOL。');
+    }
+  }
+
+  function countShape(rows) {
+    var top = 0, nested = 0, groups = 0;
+    rows.forEach(function (r) {
+      top += 1;
+      if (r.group) {
+        if (r.isolate) groups += 1;
+        if (Array.isArray(r.config)) nested += r.config.length;
+      }
+    });
+    return { top: top, nested: nested, groups: groups };
+  }
+})();
+
+// ===================================================================
+// Demo 7.2 - isolate realm 拒绝
+// ===================================================================
+var LEAKY_YML = [
+  '# 我想让这个会话用持久 shell 和裸的本地文件系统',
+  '- id: persona',
+  "  name: '@deepseek-ai/dsh-persona'",
+  '  config:',
+  '    text: You are a helpful software engineer assistant.',
+  '    complete: true',
+  '',
+  '- id: pty',
+  "  name: '@deepseek-ai/dsh-terminal'",
+  '',
+  '- id: terminal-bash',
+  "  name: '@deepseek-ai/dsh-terminal-bash'",
+  '  config:',
+  '    timeoutMs: 300000',
+  '',
+  '- id: persistent-bash',
+  "  name: '@deepseek-ai/dsh-tool-bash-persistent'",
+  '  config:',
+  '    timeoutMs: 300000',
+  '',
+  '- id: fs-local',
+  "  name: '@deepseek-ai/dsh-fs-local'",
+  '  config:',
+  '    cwd: !!js process.cwd()',
+  '',
+  '- id: str-replace-editor',
+  "  name: '@deepseek-ai/dsh-tool-str-replace-editor'",
+  '  config:',
+  '    maxOutputChars: 16000'
+].join('\n');
+
+var FIXED_YML = [
+  '# 修好了：两个 provider 各自进一个 entry-local realm，',
+  '# 消费者跟着进同一个 realm（realm 对 group 外面是不可见的）',
+  '- id: persona',
+  "  name: '@deepseek-ai/dsh-persona'",
+  '  config:',
+  '    text: You are a helpful software engineer assistant.',
+  '    complete: true',
+  '',
+  '- id: persistent-shell',
+  '  name: cordis:group',
+  '  group: true',
+  '  isolate:',
+  '    terminals: true',
+  '  config:',
+  '    - id: pty',
+  "      name: '@deepseek-ai/dsh-terminal'",
+  '',
+  '    - id: terminal-bash',
+  "      name: '@deepseek-ai/dsh-terminal-bash'",
+  '      config:',
+  '        timeoutMs: 300000',
+  '',
+  '    - id: persistent-bash',
+  "      name: '@deepseek-ai/dsh-tool-bash-persistent'",
+  '      config:',
+  '        timeoutMs: 300000',
+  '',
+  '- id: filesystem',
+  '  name: cordis:group',
+  '  group: true',
+  '  isolate:',
+  '    fs: true',
+  '  config:',
+  '    - id: fs-local',
+  "      name: '@deepseek-ai/dsh-fs-local'",
+  '      config:',
+  '        cwd: !!js process.cwd()',
+  '',
+  '    - id: str-replace-editor',
+  "      name: '@deepseek-ai/dsh-tool-str-replace-editor'",
+  '      config:',
+  '        maxOutputChars: 16000'
+].join('\n');
+
+(function () {
+  DSH.demo('d-realm', {
+    init: function (o, api) { api.$('#p-realm').value = LEAKY_YML; },
+    reset: function (o, api) { api.$('#p-realm').value = LEAKY_YML; o.clear(); o.dim('已还原成会被拒绝的版本。'); },
+    fix: function (o, api) {
+      api.$('#p-realm').value = FIXED_YML;
+      o.clear();
+      o.dim('已把两个 provider 分别包进带 isolate 的 cordis:group。再点一次"挂载"。');
+    },
+    run: function (o, api) {
+      var rows;
+      try { rows = parseEntryYaml(api.$('#p-realm').value); }
+      catch (err) { o.bad('解析失败：' + (err && err.message || err)); return; }
+
+      o.head('mountPreset(agentCtx, preset)');
+      var result;
+      try {
+        result = mountPreset(rows, o);
+      } catch (err) {
+        o.rule();
+        o.bad('Error: ' + err.message);
+        o.dim('这条信息来自 packages/preset/agent-presets/src/mount.ts。');
+        o.dim('注意名字顺序是 localeCompare 排过的，和文件里的行序无关。');
+        return;
+      }
+      o.rule();
+      o.ok('挂载成功。没有 service 落进根 realm。');
+      o.head('模型可见工具目录 共 ' + result.catalog.length + ' 个');
+      result.catalog.forEach(function (t) { o.acc('  ' + t); });
+      o.dim('这正是出厂 minimal preset 的形状。');
+    }
+  });
+})();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,1813 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Code Mode — DeepSeek Harness from Scratch</title>
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/site.js"></script>
+<style>
+/* 本章自带的两个小组件：计分板与 catalog 徽章行。其余全部用 site.css 的词汇。 */
+.score { width: 100%; border-collapse: collapse; margin: 14px 0 0; font-size: 13.5px; }
+.score th, .score td { padding: 7px 10px; border-top: 1px solid var(--rule); text-align: right; }
+.score th:first-child, .score td:first-child { text-align: left; }
+.score thead th { border-top: 0; font-family: var(--mono); font-size: 11px;
+  letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); }
+.score td.v { font-family: var(--mono); }
+.score tr.win td.c { color: var(--good); font-weight: 600; }
+.score tr.win td.n { color: var(--danger); }
+.badges { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
+/* 本章的对照表多了一列 omp。第一列收窄，给后面四列腾出宽度，
+   免得 UNKNOWN_TOOL 这种 nowrap 的标识符把格子撑破。 */
+table.vsgrid.five th:first-child, table.vsgrid.five td:first-child { width: 18%; }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+<main>
+
+<header class="masthead">
+  <div class="kicker">第 08 章</div>
+  <h1>Code Mode</h1>
+  <p class="standfirst">
+    一次工具调用换一次模型往返。一个五步的调查就要五次往返，而且每一份中间结果都会永久留在 context 里。
+    Code Mode 把这五次压成一次：模型不发工具调用了，它写一段 TypeScript 程序，程序在 harness 里跑，
+    只有它 return 或者打印出来的东西回到对话。
+  </p>
+  <div class="meta"><span>本章造出 run_code + 生成的 SDK</span><span>4 个 demo</span><span>约 26 分钟</span></div>
+</header>
+
+<h2><span class="num">§8.1</span>往返次数就是延迟</h2>
+
+<p>
+第 1 章那个 <code>miniLoop</code>，一路到第 7 章都保持着同一个形状：一个 step = 一次模型请求 + 这次请求触发的工具调用。
+代价就藏在形状里。模型只能在 step 边界上做决定，于是任何"看到 A 之后才知道要去看 B"的活儿，
+都要多付一次完整的模型往返。
+</p>
+
+<p>
+拿一个具体任务：一个 monorepo 里有若干 package，每个 package 的 <code>package.json</code> 用
+<code>docs</code> 字段声明自己的文档路径，找出哪些文档缺少 <code>## Model Experience</code> 段落。
+依赖链是三层：目录列表 → 每个 package 的 manifest → manifest 指向的文档。
+</p>
+
+<div class="diagram">native mode                                  code mode
+┌─────────┐                                  ┌─────────┐
+│  model  │ ① bash ls packages               │  model  │ ① run_code(program)
+└─────────┘                                  └─────────┘
+     ↓ 结果全文进 context                          ↓
+┌─────────┐                                  ┌──────────────────────────┐
+│  model  │ ② 3× read package.json           │ program（一次往返之内）  │
+└─────────┘                                  │   bash ls                │
+     ↓ 三份结果全文进 context                     │   3× read  ─┐ 并发       │
+┌─────────┐                                  │   3× read  ─┘            │
+│  model  │ ③ 3× read README                 │   return { missing }     │
+└─────────┘                                  └──────────────────────────┘
+     ↓ 三份结果全文进 context                          ↓ 只有 return 的值进 context
+┌─────────┐                                  ┌─────────┐
+│  model  │ ④ 最终答复                        │  model  │ ② 最终答复
+└─────────┘                                  └─────────┘
+4 次模型请求 · 7 份工具结果进 context           2 次模型请求 · 1 份 curated 结果</div>
+
+<p>
+左边为什么是 4 次而不是 7 次：native 模式下并行分发是有的，同一个 step 里的三个
+<code>read</code> 会在池子里重叠跑。往返次数等于依赖链的深度，跟工具调用总数没关系。
+并行分发省的是墙上时钟，省不了往返。dsh 自己的设计笔记把这两件事分得很清楚：
+</p>
+
+<blockquote>
+Parallel native dispatch in the loop. The other answer to round-trip cost at decision time; it was blocked on
+concurrency-safety metadata and offers no composition either way — it parallelizes calls the model already
+decided on in one step.
+</blockquote>
+
+<p>
+第二个代价更贵，而且不可逆。native 模式下每一份中间结果都会进入 context，然后一直留在那里。
+上面那七次调用里有六份是文件全文，模型真正需要的只是"哪个文件缺段落"这一句话。
+Code Mode 下过滤发生在程序里，模型只看到 <code>{ checked: 3, missing: ["packages/probe/README.md"] }</code>。
+</p>
+
+<p>
+下面这个 demo 把两种模式并排跑起来。两边用的是同一套 mini 工具、同一个 mini 仓库、同一个调度器，
+唯一的差别是 presentation。跑之前先押一个数：
+</p>
+
+<div id="p-ctx"></div>
+<script>
+DSH.predict('p-ctx', {
+  q: '同一个调查任务跑完，进入模型 context 的字符数，code 模式比 native 少多少？',
+  options: [
+    { label: '差不多', why: '中间结果全文进 context 是 native 模式的默认行为，省不掉。' },
+    { label: '少一半左右' },
+    { label: '少到四分之一', ok: true, why: '2481 字符对 623 字符，4.0 倍。' },
+    { label: '少两个数量级', why: '程序源码自己也要进 context，它不免费。' }
+  ],
+  explain: '两个数都是 demo 真数出来的，看计分板倒数第二行。'
+});
+</script>
+
+<div class="demo" id="d-race">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 8.1</span>native / code 并排对比</div>
+    <div class="spacer"></div>
+    <button class="btn primary" data-act="run">同时开跑</button>
+    <button class="btn" data-act="reset">清空</button>
+  </div>
+  <div class="demo-body">
+    <div class="split">
+      <div>
+        <div class="pane-label">mode: native</div>
+        <div class="out" id="out-native"></div>
+      </div>
+      <div>
+        <div class="pane-label">mode: code</div>
+        <div class="out" id="out-code"></div>
+      </div>
+    </div>
+    <div id="score-box"></div>
+  </div>
+</div>
+
+<div class="note">
+  <span class="tag">读数怎么看</span>
+  墙上时钟只差不到两倍，因为工具本身的延迟两边一样，程序不会让磁盘变快。
+  被压下来的是另外两行：模型请求次数，和进入 context 的字符数。前者是延迟里最贵的一项，
+  一次请求几百毫秒到几秒；后者是永久成本，它跟着会话一路涨到压缩阈值。
+  右栏那几行 <code>#n 工具 exc|par start→settle</code> 是程序内部真实的 dispatch 时间线：
+  <code>bash</code> 独占跑完，三个 <code>read</code> 才重叠进来。§8.4 解释这个分类是谁定的。
+</div>
+
+<div class="note vs">
+  <span class="tag">换成别的 harness</span>
+  没有 code mode 的 harness 只能按左栏跑。一个"读五个文件、再 grep 一遍"的调查就是五次模型往返，
+  五份完整结果永久占着 context，一份都退不掉。上面 demo 里这个任务的依赖链是三层、七次调用，
+  native 侧付掉 4 次请求和 2481 个字符，code 侧是 2 次和 623 个字符。
+  终端型 harness 走的是另一条省法：Pi 只带 read / write / edit / bash 四个内置工具，
+  system prompt 压得很短，省的是每一次往返的单价。客户端-服务端分离的 harness
+  （OpenCode 那种 Go server 持有执行生命周期、对外开一个 OpenAPI 端点的形状）换掉的是谁来驱动会话。
+  两条路都不动"一次工具调用换一次往返"这条账。omp 动这条账，它有一个叫 <code>eval</code> 的工具，
+  包装的选择跟 dsh 正好相反，下一节讲。
+</div>
+
+<h2><span class="num">§8.2</span>presentation 是一行 preset 配置</h2>
+
+<p>
+Code Mode 在 dsh 里没有全局开关。第 7 章把整个产品降维成一棵可打补丁的配置树，
+每个 agent 挂载自己的插件子树；Code Mode 就是那棵子树上的一行：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">apps/cli/config/agent-presets/code/agent.cordis.yml · 真实文件的最后七行</span></div>
+<pre><code data-lang="yaml"># ── presentation ────────────────────────────────────────────────────────────
+
+# Code Mode for this agent alone. The row waits for the host's `codeRuntime`
+# rather than assuming it: a deployment that composes no TypeScript runtime
+# fails this preset at mount, naming this id, instead of at the first request.
+- id: tool-presentation
+  name: '@deepseek-ai/dsh-agent-tool-presentation'
+  config:
+    mode: code</code></pre>
+</div>
+
+<p>
+<code>code</code> preset 和 <code>standard</code> preset 的全部差别就是这一行。为什么它是 preset 里的一行，
+而不是一个新的 registry？registry 搬不下来：agent loop 要读它的 scheduler，
+apiproxy 要读它的 presenter 去渲染工具卡片，每个工具插件都往它里面注册。
+一个 service 只有在它所有的消费者都跟着下移时才能下移。preset 能拥有的是这个 registry 的
+<strong>presentation</strong>：
+</p>
+
+<blockquote>
+What a preset can own is the presentation of that registry. <code>ctx.tools.presentAs()</code> declares it for
+the mounting agent alone, so a Code Mode session runs beside native ones in one process, each seeing its own catalog.
+</blockquote>
+
+<p>
+"同一个进程里并排" 是字面意思。一个部署可以同时跑三种 agent：主 agent 走 native，
+一个调查型 subagent 走 code，一个混合 agent 走 both。它们共享一个 registry 实例、一个沙箱、一份持久化，
+各自看到的 catalog 不同而已。<code>mode</code> 没有默认值，必填，理由很干脆：
+没写这一行的 preset 已经拿到部署默认值了，再给它一个可省略的值，等于让这一行白组合。
+一个 composition 里出现第二次声明会被拒绝，不合并。"模型看到哪种形态"有两个答案，那是矛盾，不是覆盖。
+</p>
+
+<div class="note vs">
+  <span class="tag">换成别的 harness</span>
+  让模型写程序去调工具这件事，dsh 不是首创，也不归它独有。Anthropic 出过一个跑代码的工具，
+  Cloudflare 把 code mode 这个说法写成了模式文章，omp 有一个叫 <code>eval</code> 的工具。
+  少见的是收紧那一步。前两条路上，"这个 agent 面对的是一张工具表还是一份 SDK"
+  由工具作者或者部署决定，一个进程一种答案；omp 那边谁都不决定，两个入口一直摆着，
+  模型每一轮自己挑。dsh 把这个决定压成 per-agent preset 里的一行 <code>mode: code</code>，
+  于是一个 code mode 会话能和 native 会话在同一个进程里并排跑，共享同一个 registry 实例。
+  收紧也在同一行付掉：<code>code</code> 之下，registry 把直呼任何其他工具解析成 <code>UNKNOWN_TOOL</code>，
+  宣告的表面和可调用的表面因此没法分叉。
+</div>
+
+<div class="note vs">
+  <span class="tag">omp 的 eval</span>
+  omp 里对应的工具叫 <code>eval</code>，它和另外三十个内置工具并列站着，<code>approval="exec"</code>，
+  一个会话里 <code>concurrency="exclusive"</code>。它不收紧任何东西。一次调用是一个 cell，
+  状态活到下一次调用，<code>py</code> / <code>js</code> / <code>rb</code> / <code>jl</code>
+  四种语言各留一份自己的状态。工具触达靠 prelude 注入：<code>tool.&lt;name&gt;(args)</code>，
+  连同 <code>display()</code>、<code>read()</code>、<code>write()</code>、<code>completion()</code>、
+  <code>agent()</code>、<code>parallel()</code>、<code>pipeline()</code> 一起进运行时。
+  那边没有按工作区生成的静态 TypeScript SDK 文件，prelude 是运行时注入的，
+  所以也就没有 <code>ToolOutputMap</code> 这一半。
+  两边各自让掉了一样东西。omp 留着逃生口：模型只需要读一个文件的时候，
+  发一次普通的 <code>read</code> 就完事，不必先写程序；跨调用的持久 kernel 和四种语言也一起归它。
+  dsh 把入口收成一个，换到的是一段整会话不变的请求前缀，以及"宣告的表面等于可调用的表面"
+  这条由 executor 兜住的保证；付出的是那一行读文件也得包一层程序的开销。
+</div>
+
+<table class="vsgrid five">
+<thead><tr><th>这个决定写在哪</th><th>工具层</th><th>部署层</th><th>omp：并列的一个工具</th><th class="dshcol">dsh：preset 里一行</th></tr></thead>
+<tbody>
+<tr><td>谁做决定</td><td>工具作者</td><td>运维、启动参数</td><td>模型每一轮自己挑</td><td class="dshcol">agent 的 preset 组合</td></tr>
+<tr><td>同进程并存两种形态</td><td><span class="p">部分</span>：两个入口都在，谁都没被收紧</td><td><span class="n">无</span>：一个进程一种答案</td><td><span class="y">有</span>：每个会话都同时有两个入口</td><td class="dshcol"><span class="y">有</span>：按 agent 各看各的 catalog</td></tr>
+<tr><td>直呼其他工具会失败</td><td><span class="n">无</span></td><td><span class="p">部分</span>：粒度到不了单个 agent</td><td><span class="n">无</span>：三十个工具照常可调</td><td class="dshcol"><span class="y">有</span>：<code>UNKNOWN_TOOL</code></td></tr>
+<tr><td>SDK 带输出类型</td><td><span class="p">看工具</span></td><td><span class="p">看实现</span></td><td><span class="n">无</span>：prelude 运行时注入，不生成声明文件</td><td class="dshcol"><span class="y">有</span>：output schema 必填，投影成 <code>ToolOutputMap</code></td></tr>
+<tr><td>持久 kernel</td><td><span class="p">看实现</span></td><td><span class="p">看实现</span></td><td><span class="y">有</span>：一次调用一个 cell，状态留到下次</td><td class="dshcol"><span class="n">无</span>：每次运行开一个新 worker，程序的世界随它一起死</td></tr>
+<tr><td>多语言</td><td><span class="p">看实现</span></td><td><span class="p">看实现</span></td><td><span class="y">四种</span>：py / js / rb / jl，各自一份状态</td><td class="dshcol"><span class="p">接口两种</span>：schema 按语言解析，只发布了 typescript 后端</td></tr>
+</tbody>
+</table>
+
+<h3>宣告的表面必须等于可调用的表面</h3>
+
+<p>
+这里有个容易做错的地方。假设你只改 prompt：把 native schema 换成 SDK 文本，registry 的执行入口没动。
+模型偶尔还是会发一个原生的 <code>read</code> 调用，它见过太多这样的训练数据，而 registry 会老老实实执行。
+这时候你有两个表面，宣告的那个只有 <code>run_code</code>，实际可调用的那个是全部。
+两个表面对不上的系统没法推理。
+</p>
+
+<p>
+dsh 让 presentation 同时决定能执行什么。判定函数只有一行，值得整段抄下来：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">packages/core/tools/src/index.ts · 真实实现</span></div>
+<pre><code data-lang="js">private collapses(name: string, scope: ScopeKey | undefined, nested: boolean): boolean {
+  return !nested &amp;&amp; this.modeFor(scope) === 'code' &amp;&amp; name !== RUN_CODE_NAME
+}
+
+// resolveExecution 在策略流水线之前就用它做决定：
+// 视图（get）与 presentation 无关；collapse 归属于操作边界，也就是这里。
+private resolveExecution(name, scope, nested): ToolDefinition | undefined {
+  const tool = this.get(name, scope)
+  if (tool === undefined) return undefined
+  if (this.collapses(name, scope, nested)) return undefined
+  return tool
+}</code></pre>
+</div>
+
+<p>
+三个连接词各有分工。<code>!nested</code> 放过程序内部发出的子调用，也就是下一节的主题。
+<code>mode === 'code'</code> 让 <code>both</code> 模式下的原生调用照常执行；<code>both</code> 之下这条规则为假，
+那条 prompt 规则也跟着渲染成空字符串。<code>name !== RUN_CODE_NAME</code> 留下唯一的入口。
+被拒绝的调用返回 <code>UNKNOWN_TOOL</code>，和"这个工具根本没注册"是同一个错误码，
+因为对模型来说这两件事的含义就该一样。
+</p>
+
+<p>
+还有个细节：prompt 里那句"只有 run_code 能直接调"用的是和 executor 同一个谓词，
+所以 prompt 不可能声明一条 registry 不执行的规则。它的真实文本是：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">packages/core/tools/src/index.ts · CODE_ONLY_INSTRUCTION（section 顺序 99，排在所有 per-tool guidance 之前）</span></div>
+<pre><code data-lang="text">`run_code` is the only tool you can call directly — a tool call naming any other
+tool fails. Reach every tool the SDK declares below from inside the program.</code></pre>
+</div>
+
+<p>
+顺序 99 是刻意的。每个工具插件都注册自己的 guidance 段，顺序 100-199，
+它们讲的都是"用 read 工具而不要 cat"这类事，谁都不会说明这个工具怎么触达。
+collapse 规则要是排在它们后面，模型就会先读完一整册"该用这些工具"，
+然后才读到"但你一个都不能直接调"。
+</p>
+
+<div class="demo" id="d-mode">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 8.2</span>宣告的表面 = 可调用的表面</div>
+    <div class="spacer"></div>
+    <select class="btn" id="mode-pick">
+      <option value="native">mode: native</option>
+      <option value="code" selected>mode: code</option>
+      <option value="both">mode: both</option>
+    </select>
+    <button class="btn primary" data-act="run">全部检查</button>
+    <button class="btn" data-act="direct">只试模型直呼 read</button>
+  </div>
+  <div class="demo-body">
+    <div class="badges" id="mode-badges"></div>
+    <div class="out" id="out-mode"></div>
+  </div>
+</div>
+
+<p>
+选 <code>code</code> 跑一次：宣告的 catalog 只剩 <code>run_code</code> 一项，模型直呼 <code>read</code> 拿到
+<code>UNKNOWN_TOOL</code>，同一个 <code>read</code> 从程序里发出（<code>nested = true</code>）正常返回。
+切到 <code>both</code>，同一次直呼就成功了，靠的是 <code>collapses</code> 的第二个连接词。
+</p>
+
+<div class="note">
+  <span class="tag">KV cache</span>
+  presentation 在 agent 被组合的那一刻就定下来，整个会话生命周期内不变，
+  所以请求前缀是稳定的：这一行配置不制造任何 cache 失效。
+  这也是它必须落在 preset 组合期、不能做成运行时开关的另一个理由。
+  会话中途把 catalog 从 12 个 schema 换成 1 个，等于把整段前缀作废。
+</div>
+
+<h2><span class="num">§8.3</span>生成的 SDK</h2>
+
+<p>
+模型不看 JSON Schema 了，它看一份 TypeScript 声明文件。这份声明从同一个 visible set 投影出来。
+native schema 和 SDK 是一个集合的两种投影，不存在两份需要互相同步的东西。
+生成器是纯函数，按名字字典序排列，所以工具集不变的时候它逐字节稳定。
+</p>
+
+<p>
+下面这个 demo 用 mini registry 的三个工具跑真正的生成器。生成的文本形状和真实的一样，
+渲染规则是照抄的：
+</p>
+
+<div class="demo" id="d-sdk">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 8.3</span>从 catalog 生成 SDK</div>
+    <div class="spacer"></div>
+    <button class="btn primary" data-act="run">生成</button>
+    <button class="btn" data-act="reset">清空</button>
+  </div>
+  <div class="demo-body">
+    <div class="out" id="out-sdk"></div>
+  </div>
+</div>
+
+<p>生成器本身：</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh v0.8 · 页面上运行的就是这段代码</span></div>
+  <pre><code id="src-sdk" data-lang="js"></code></pre>
+</div>
+
+<p>
+真实的 dsh 生成的是什么样子？<code>examples/acp-agent/tests/snapshots/code-mode-turn/system-prompt.expected.md</code>
+是一份逐字节快照测试，里面存的就是一个 code mode agent 实际收到的 system prompt。
+它的 SDK 段固定的使用说明部分，原文如下：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">system-prompt.expected.md · 第 28-37 行原文（超宽的三条 bullet 按版面折了行）</span></div>
+<pre><code data-lang="text">## Writing code for run_code
+
+`run_code` takes two required arguments: `code` — the body of an async TypeScript
+function (erasable syntax only — no `enum` or namespaces; type annotations are
+advisory, the code runs type-stripped) — and `description`, a short summary of what
+the program does. Inside the program:
+
+- Call tools as `await tools.name(args)` — quoted access for exotic names:
+  `tools["my-tool"](args)`. Every call resolves to the tool's typed canonical JSON
+  value. Tool arguments must be lossless JSON.
+- A FAILED tool call rejects with `ToolCallError`, whose `toolName` identifies the
+  failed tool and whose `message` is human-readable — `try/catch` it to handle and
+  continue.
+- Independent read-only calls MAY overlap under `Promise.all` (safe calls run
+  concurrently; mutating calls run alone, in submission order). Sequence dependent
+  work with `await`.
+- Emit results with `return` and/or `console.log(...)`. ONLY what you print or
+  return comes back to you — intermediate tool results never enter the
+  conversation, so extract just what you need.
+
+The available tools:</code></pre>
+</div>
+
+<p>
+然后是 <code>&#96;&#96;&#96;ts</code> 代码块，里面是 <code>JsonValue</code>、<code>ToolArgsMap</code>、
+<code>ToolOutputMap</code>，最后是三个声明。那个 <code>ts</code> 代码块覆盖 19 个工具、403 行，尾巴长这样：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">system-prompt.expected.md · 第 425-442 行，逐字原文</span></div>
+<pre><code data-lang="js">  write: {
+    path: string;
+    operation: "create" | "update";
+    before: string | null;
+    after: string;
+  };
+}
+
+type ToolName = keyof ToolOutputMap
+
+declare class ToolCallError extends Error {
+  readonly name: "ToolCallError";
+  readonly toolName: ToolName;
+}
+
+declare const tools: {
+  [K in ToolName]: (args: ToolArgsMap[K]) => Promise&lt;ToolOutputMap[K]&gt;;
+}</code></pre>
+</div>
+
+<p>三处值得停下来看：</p>
+
+<h3>一、每个字段都带 JSDoc，而且是原始 description</h3>
+
+<p>
+参数的描述不是重新写的，它就是 JSON Schema 里那份 <code>description</code>，被搬到了 JSDoc 里。
+所以 <code>bash</code> 的参数在 SDK 里长这样（真实快照第 44-59 行的一部分）：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">system-prompt.expected.md · 节选</span></div>
+<pre><code data-lang="js">  bash: {
+    /** The bash command to execute. */
+    command: string;
+    /** Clear, concise description of what this command does in active voice, 5-10 words
+        (shown in the UI). Examples: "ls" → "List files in current directory"; ... */
+    description: string;
+    /** Timeout in milliseconds. The executor applies its configured default and cap,
+        and kills the command on expiry. */
+    timeoutMs?: number;
+    ...
+  } &amp; Record&lt;string, JsonValue&gt;;</code></pre>
+</div>
+
+<p>
+末尾那个 <code>&amp; Record&lt;string, JsonValue&gt;</code> 不是装饰。参数 schema 没有声明
+<code>additionalProperties: false</code>（工具自己做校验），所以渲染器诚实地把它渲染成开放对象；
+而输出 schema 声明了 <code>additionalProperties: false</code>，所以输出侧没有这个交叉类型。
+类型文本忠实反映 schema，不做美化。
+</p>
+
+<h3>二、输出侧被完整类型化了</h3>
+
+<p>
+大部分 code mode 实现会跳过这一半。给参数生成类型很容易，JSON Schema 本来就在那里。
+给返回值生成类型，要求每个工具都声明一份规范输出 schema，这是工具作者要付的税。
+dsh 收了这笔税：<code>ToolDefinition</code> 的 <code>output { schema, render }</code> 是必填的。
+回报是 <code>ToolOutputMap</code> 里那些具体到
+<code>{ kind: "background"; jobId: string } | { kind: "foreground"; exitCode: number | null; ... }</code>
+的联合类型。模型写 <code>result.stdout.text</code> 的时候知道自己在写什么，不用对着 <code>any</code> 猜。
+</p>
+
+<p>
+顺带一个不对称：原生 schema 投影里没有 <code>output</code>，模型看到的只有
+<code>name</code> / <code>description</code> / <code>parameters</code>，只有 SDK 投影带上它。
+"输出有类型"这件事只有 SDK 这个投影给得出来。
+</p>
+
+<h3>三、ToolCallError 携带 toolName</h3>
+
+<p>
+程序里的一次失败必须能被程序自己处理，否则整段程序白跑。所以失败以异常形态出现，
+并且带上是哪个工具失败了。真实链路：host 端把工具的错误结果变成绑定层的 rejection，
+worker 端把它包装成一个真正的 <code>ToolCallError</code> 实例，只附加工具名。
+原生的 content 和内部错误元数据不进入程序可见的失败契约。这个 class 是运行时按请求数据现场物化的：
+</p>
+
+<blockquote>
+Binding rejection classes are request data — an optional namespace descriptor names the constructor global
+and the own property that receives the failed member name. The worker materializes and injects that real class,
+so <code>instanceof</code> works without hardcoding <code>tools</code> or <code>ToolCallError</code>.
+</blockquote>
+
+<p>
+换句话说，<code>code-runtime</code> 这个 seam 完全不知道"工具"是什么。
+Code Mode 交给它的是 <code>{ global: 'tools', functions, errorClass: { name: 'ToolCallError', memberNameProperty: 'toolName' } }</code>，
+运行时照着造。第 6 章那套能力接缝的又一次应用。
+</p>
+
+<h2><span class="num">§8.4</span>嵌套调用不是后门</h2>
+
+<p>
+最容易想错的一件事：程序能直接拿到工具函数，那它是不是绕过了权限、沙箱、审批、超时？没有。
+<code>collapses</code> 里的 <code>!nested</code> 只放过入口检查，放过之后调用照样从头走一遍
+第 6 章那条完整的守卫流水线。
+</p>
+
+<div class="diagram">程序里的一次 await tools.read(...)
+  │
+  ├─ jsonNormalizeArgs   参数必须是无损 JSON（undefined / BigInt / 循环 → 这一次调用被拒）
+  ├─ 排入 per-run 调度器  按提交顺序，classify 为 parallel / exclusive
+  ├─ prepare             pre-execute 守卫：权限、沙箱、审批       ← 有序阶段
+  ├─ dispatch            工具主体 + 超时                        ← 只有这一段并发
+  ├─ finalize            post-execute、additionalContexts、concludesTurn ← 有序阶段
+  └─ settle              tool/code-dispatch 事件写进会话日志
+</div>
+
+<p>
+这条链和 native 调用走的是同一个 registry、同一批 pre-execute 监听器、同一个沙箱后端。
+dsh 自己的说法是 "Code Mode uses the same <code>tools/pre-execute</code> policy gate as bash"。
+一个越界的写入在程序里被拒绝，和它在 native 调用里被拒绝，是完全一样的拒绝。
+</p>
+
+<h3>并发遵守原生规则，不遵守 Promise.all</h3>
+
+<p>
+另一个容易想错的地方。<code>Promise.all</code> 只表达"我不在乎顺序"，它不授予并发权限。
+能不能重叠由工具自己声明：
+</p>
+
+<table>
+<thead><tr><th>分类</th><th>条件</th><th>调度</th></tr></thead>
+<tbody>
+<tr><td><code>parallel</code></td><td><code>isConcurrencySafe(args)</code> 恰好返回 <code>true</code></td><td>与相邻的 parallel 调用重叠，上限 <code>maxParallelSubCalls</code>（默认 10）</td></tr>
+<tr><td><code>exclusive</code></td><td>未声明、返回非 <code>true</code>、参数无效、分类器抛异常</td><td>先排空池子，独占运行，直到 <em>commit 完成</em> 才放开屏障</td></tr>
+</tbody>
+</table>
+
+<p>
+真实 dsh 里 <code>read</code> 声明了 <code>isConcurrencySafe: () =&gt; true</code>，注释写得很清楚：
+"Observation races fail closed because guarded mutations re-check the version in-lock"。
+<code>web_search</code> / <code>web_fetch</code> / <code>subagent</code> 和 session-query 那几个也声明了。
+<code>bash</code> 没有声明，<code>write</code> / <code>edit</code> 也没有。所以一段
+<code>Promise.all([tools.bash(a), tools.bash(b)])</code> 在真实 dsh 里是串行跑的，一个接一个，按提交顺序。
+模型大概会对这一点期望过高，dsh 自己把它列成了已知风险：
+</p>
+
+<blockquote>
+Sub-dispatch overlap is bounded by tool safety claims, not by the caller. A program's <code>Promise.all</code> or
+<code>asyncio.gather</code> buys wall-clock parallelism only across calls the tool itself classifies concurrency-safe;
+a run of exclusive calls still costs its round-trips in sequence, and models may over-expect.
+</blockquote>
+
+<p>
+启动严格按提交顺序，结果也按提交顺序 commit，一个 head-of-line 游标。
+分类在每次启动前<em>重新读</em>一遍，因为一个调用排队期间 registry 可能被改动，把它翻成 exclusive；
+读不到就 fail-closed 判 exclusive。这些规则不是 Code Mode 新发明的，它复用的是 agent loop 里那套原生调度契约。
+</p>
+
+<p>
+下面这个 demo 真的在执行你输入的程序，没有 <code>setTimeout</code> 表演。
+程序体被交给一个 <code>AsyncFunction</code>，参数是注入的 <code>tools</code> / <code>console</code> / <code>ToolCallError</code>，
+真实 worker 里也是这么做的，每一次 <code>await tools.x(...)</code> 都真的排进上面那个调度器。
+两个预设按钮会把程序填进编辑框，填进去之后随便改：把 <code>Promise.all</code> 换成 <code>for</code> 循环，
+看时间线怎么变；把某个路径写错，看 <code>ToolCallError</code> 怎么被 catch 住；
+或者把 <code>console.log</code> 那一行删掉，看模型的视野少了什么。
+</p>
+
+<div class="demo" id="d-run">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 8.4</span>可编辑的 run_code</div>
+    <div class="spacer"></div>
+    <button class="btn primary" data-act="run">执行程序</button>
+    <button class="btn" data-act="sandbox">填一段越界写入</button>
+    <button class="btn" data-act="boom">写一段会炸的程序</button>
+    <button class="btn sm" data-act="reset">恢复默认程序</button>
+  </div>
+  <div class="demo-body">
+    <div class="pane-label">run_code 的 code 参数（程序体，可编辑）</div>
+    <textarea class="edit" id="prog" rows="26" spellcheck="false"></textarea>
+    <div class="pane-label" style="margin-top:12px">调度器时间线 + 模型看到的结果</div>
+    <div class="out" id="out-run"></div>
+  </div>
+</div>
+
+<p>
+"填一段越界写入" 那段程序试着写 <code>/etc/hosts</code>。沙箱守卫在 pre-execute 阶段拒绝，
+拒绝变成程序里的一个 <code>ToolCallError</code>，程序 catch 住继续跑。
+"嵌套调用不是后门"的完整含义就是这个：能力没有变宽，变的只有触达路径。
+</p>
+
+<h2><span class="num">§8.5</span>代价</h2>
+
+<p>
+这些收益是要付钱的。四项代价，前三项在真实 dsh 里也没有被消掉。
+</p>
+
+<h3>一、炸在中途，副作用留在原地</h3>
+
+<p>
+native 模式下每一次工具调用都是独立的、被完整记录的、原子的事件。模型看到第 3 次成功、第 4 次失败，
+它精确知道世界处在什么状态。程序不这样。一段程序写了三个文件然后在第四步炸掉，
+模型收到的是 <code>code run failed (exception): ...</code> 加上程序打印过的东西，
+那三个文件到底改了没有，得它自己推断。
+</p>
+
+<p>
+点一下上面 demo 的"写一段会炸的程序"：文件系统里真的多了三个文件，模型的结果里只有一条失败信息，
+加上程序自己 <code>console.log</code> 出来的三行。demo 把这两边逐个对了一遍，
+告诉你哪几个副作用落在模型视野里。然后把那行 <code>console.log</code> 删掉再跑一次，对账会翻面。
+<strong>可见的副作用只有程序打印过的那些。</strong>
+</p>
+
+<p>
+dsh 在这里做了一件缓解：每一次子调用都单独写一条 <code>tool/code-dispatch</code> 事件进会话日志，
+带上参数、结果、是否失败，所以回放和排查是可能的，第 5 章那本只追加日志在这里付了利息。
+但那是给人和给工具看的，不进模型 context。
+</p>
+
+<h3>二、错误处理的责任转移给了模型</h3>
+
+<p>
+native 模式下一次工具失败会作为一条 <code>tool_result</code> 回到模型面前，模型下一个 step 自然就看到了，
+重试逻辑是循环免费给的。Code Mode 下失败是程序里的一个 rejection，模型必须在写程序的时候就想好要不要
+<code>try/catch</code>。没 catch，整段程序死掉，前面所有成功调用的结果一起丢失，它们从没进过 context。
+SDK 说明里那一条被写成大写的 <code>A FAILED tool call rejects with ToolCallError</code>，就是为这个。
+</p>
+
+<h3>三、排查比一串工具调用难</h3>
+
+<p>
+一条 native 工具调用轨迹是自解释的：谁调了什么，返回了什么，一行一条。
+一段程序的失败是一个 stack trace，行号指向模型自己写的代码。
+dsh 为此保证 type-strip 是位置保持的（"position-preserving, so runtime error line numbers
+match the model's source"），这样 stack trace 里的行号还能对上模型写的那一版源码。
+不小的工程量，只为了让报错可读。
+</p>
+
+<h3>四、common case 会被抽税</h3>
+
+<p>
+这条是 dsh 明确拒绝走 Cloudflare 原教旨路线的理由。一个编码 agent 大量的工作是"读一个文件"、"改一行"、
+"跑一次测试"，这些本来就是理想的单次原生调用。强迫每一次 <code>edit</code> 都包一层程序，
+是给最常见的情况加税：
+</p>
+
+<blockquote>
+Always-exclusive (Cloudflare-faithful, no mode). Rejected for this SDK's primary consumer: a coding agent's
+bread-and-butter single calls (<code>bash</code>, <code>read</code>, <code>edit</code>) are already ideal as native calls, and forcing
+every edit through a program taxes the common case. The mode config keeps the faithful form (<code>'code'</code>) one line away
+without imposing it.
+</blockquote>
+
+<p>
+所以 <code>mode</code> 有三个值。<code>both</code> 存在的意义就在这儿：常见动作走原生，
+需要组合、循环、分支、join 的时候写程序。代价是模型多了一个"该走哪条路"的决定要做。
+</p>
+
+<p>
+omp 把这条论证走到了尽头：那边没有 mode 这个东西，<code>eval</code> 永远只是一个工具，
+常见动作永远是原生调用。"该走哪条路"的决定它也一直在付，付得不显眼而已，
+因为两个入口从来没有一个被关掉过。
+</p>
+
+<h2><span class="num">§8.6</span>本章的产物</h2>
+
+<p>
+加到 mini-dsh 上的东西有三块：一个 presentation 选择器（<code>wireSchemas</code> + <code>collapses</code>）、
+一个 SDK 生成器（<code>renderToolsSdk</code>，上面 §8.3 已经列过）、
+一个 <code>run_code</code> transport 加它自己的有序调度车道。核心是后者：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh v0.8 · run_code transport（页面上运行的就是这段）</span></div>
+  <pre><code id="src-runcode" data-lang="js"></code></pre>
+</div>
+
+<p>
+调度器是这一章唯一有点难度的地方。它只有一条<strong>有序车道</strong>：
+每一趟循环先 commit 队首那个已结算的调用（有序的 post-execute），
+再看能不能启动下一个排队的（有序的 pre-execute），都不行就睡到有东西结算、或者有新提交。
+只有工具主体那一段是真并发的。
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh v0.8 · per-run 调度器：一条有序车道 + 一个并发池</span></div>
+  <pre><code id="src-sched" data-lang="js"></code></pre>
+</div>
+
+<p>
+以及 presentation 那两个投影，它们决定了"宣告的表面"：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh v0.8 · presentation 的两种投影 + executor collapse</span></div>
+  <pre><code id="src-present" data-lang="js"></code></pre>
+</div>
+
+<div class="note good">
+  <span class="tag">下一章预告</span>
+  现在模型能写程序调用工具了。但工具的集合是部署时定死的：
+  <code>run_code</code> 能触达的只有 preset 组合期注册进 registry 的那些东西。
+  第 9 章把最后一层拿掉：模型现场写一个 <em>插件</em>，用第 3 章的 fiber 挂进正在运行的进程，
+  然后立刻调用它自己注册的新工具。Code Mode 让模型能组合工具，<code>cordis_define</code> 让它能造工具。
+</div>
+
+<h2><span class="num">§8.7</span>回到真实的 dsh</h2>
+
+<p>真实实现分在四个包里，职责切得很干净：</p>
+
+<table>
+<thead><tr><th>包</th><th>角色</th></tr></thead>
+<tbody>
+<tr><td><code class="srcpath">core/agent-tool-presentation</code></td><td>一行 preset 配置：<code>mode: native | code | both</code></td></tr>
+<tr><td><code class="srcpath">core/tools</code></td><td>Consumer：SDK 生成、prompt 段、executor collapse、分发桥接层</td></tr>
+<tr><td><code class="srcpath">code-runtime/code-runtime</code></td><td>Service Definition：跑一段程序，对一组绑定，返回 <code>{ value, logs, error? }</code></td></tr>
+<tr><td><code class="srcpath">code-runtime/code-runtime-worker-thread</code></td><td>Provider：一次运行一个全新的 Node worker thread</td></tr>
+</tbody>
+</table>
+
+<p>关键签名：</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">真实签名节选</span></div>
+<pre><code data-lang="js">// packages/core/tools/src/code-mode.ts
+export const RUN_CODE_NAME = 'run_code'
+export const SDK_SECTION_ORDER = 150
+export class CodeRunFailedError extends HarnessError   // code: 'CODE_RUN_FAILED'
+export function createRunCodeTool(registry: ToolRuntime, options: RunCodeBridgeOptions): ToolDefinition
+
+// packages/core/tools/src/ts-types.ts
+export function renderToolsSdk(schemas: ToolSdkSchema[]): string
+export function jsonSchemaToTs(schema: unknown, indent = 0): string
+
+// packages/core/tools/src/index.ts
+private collapses(name, scope, nested): boolean
+private resolveExecution(name, scope, nested): ToolDefinition | undefined
+private wireSchemas(scope?): ToolProviderResult      // code 模式下只留 run_code
+presentAs(mode: ToolPresentationMode): () =&gt; void    // 第二次声明会被拒绝，不合并
+
+// packages/code-runtime/code-runtime
+run(request: CodeRunRequest): Promise&lt;CodeRunResult&gt;  // 每种程序结局都是 error 字段，不是 reject
+readonly language: string                             // 'typescript' | 'python'
+readonly isolation: string                            // 'worker-thread' | 'process' | 'container'</code></pre>
+</div>
+
+<p>我们的 mini 版本刻意省掉的东西：</p>
+
+<ul>
+  <li>没有隔离。我们的 <code>AsyncFunction</code> 和页面共享一个 realm，能看到 <code>window</code>。
+  真实实现每次运行开一个全新的 <code>worker_threads.Worker</code>：<code>env: {}</code>、<code>execArgv: []</code>、
+  <code>resourceLimits</code> 堆上限、不池化，"a program's world dies with its worker"。
+  官方说得很直白，这是 containment，不构成 security boundary，信任姿态和 bash 工具等价。</li>
+  <li>没有 type stripping。真实实现在 host 侧用 <code>node:module</code> 的
+  <code>stripTypeScriptTypes</code> 剥类型（erasable syntax only，<code>enum</code> 和 namespace 直接被拒绝并
+  作为程序 <code>exception</code> 返回），我们的 demo 把程序体当纯 JS 解析，所以写了类型标注会语法错误。</li>
+  <li>没有预算。真实实现有三道独立预算：<code>computeMs</code> 计的是 worker 的
+  <em>实测忙碌时间</em>（用 <code>eventLoopUtilization()</code> 每 25ms 采样，所以死循环藏不到一个 pending 的诱饵调用后面，
+  而等一个慢工具不计费）、<code>maxWallMs</code> 兜住忙碌时间看不见的东西（等一个没人 resolve 的 promise）、
+  <code>maxOutputBytes</code>（默认 64 MiB）只管外层输出。</li>
+  <li>没有敌意对端假设。真实实现把程序当敌对方：message port 上每一条入站消息都被
+  形状校验并<em>重建</em>，绑定名只按 own property 解析（伪造的 <code>constructor</code> 走不到原型链上），
+  worker 侧的命名空间对象是 null-prototype 加 <code>defineProperty</code> 建的，
+  所以一个叫 <code>__proto__</code> 的工具是普通的 own key，碰不到原型 setter。</li>
+  <li>read 的返回不一样。真实 <code>read</code> 返回带行号的文本，程序要自己剥行号；
+  我们的 mini <code>read</code> 直接给原文，为了让 demo 里 <code>JSON.parse(m.text)</code> 能读。</li>
+  <li>没有 Python flavor。真实实现的 <code>run_code</code> schema 文本是<em>按语言</em>解析的
+  （<code>RUN_CODE_FLAVORS</code>，读的是已挂载 runtime 的 <code>language</code>），
+  两张 per-language 表都用 <code>satisfies</code> 对着 <code>CodeSdkLanguage</code> 检查，
+  只加一张表会在 typecheck 时炸，而不是等到运行时。</li>
+</ul>
+
+<div class="note warn">
+  <span class="tag">HN 上的一条质疑</span>
+  发布当天那条 HN 主线程（item 49285244，545 分 234 条评论）里，<code>syntaxing</code> 问了一句很短的话：
+  "Is there a reason why so many of these agent harness are written in node.js?"
+  放在这一章它有具体的着力点。Code Mode 要跑一段模型现场写的程序，而 dsh 交出来的隔离是
+  <code>worker_threads</code>，同一个进程里的一条线程，官方文档自己写明这是 containment，不是 security boundary，
+  信任姿态和 bash 工具一样。<code>CodeRuntime</code> 的 <code>isolation</code> 是个纯描述字符串，
+  well-known 值列了三个（<code>worker-thread</code> / <code>process</code> / <code>container</code>），
+  紧跟着一句 "not a security claim"；而 <code>packages/code-runtime/</code> 下发出来的 provider 只有
+  worker thread 那一个，<code>language</code> 也只有 <code>typescript</code> 有已发布的后端。
+  想要一道真边界，自己写 provider。
+</div>
+
+<div class="note warn">
+  <span class="tag">一个组合期的失败设计</span>
+  <code>mode: code</code> 这一行不会乐观生效。它<em>等待</em> <code>ctx.codeRuntime</code>：
+  一个没有组合任何 code runtime 的部署，会在 <em>mount 阶段</em>失败并指名这个 id，
+  而不是在会话的第一次请求时失败。理由是 "applying optimistically moves the failure to the session's
+  first request, where the operator can act on neither the preset nor the composition"，
+  错误必须落在操作者能动手的那一层。
+</div>
+
+<div class="note src">
+  <span class="tag">自己去读</span>
+  <code class="srcpath">examples/acp-agent/tests/snapshots/code-mode-turn/system-prompt.expected.md</code> — 逐字节快照：一个 code mode agent 实际收到的完整 system prompt<br>
+  <code class="srcpath">packages/core/tools/src/code-mode.ts</code> — <code>run_code</code> 的 schema、分发桥接层、有序车道<br>
+  <code class="srcpath">packages/core/tools/src/ts-types.ts</code> — <code>SDK_INSTRUCTIONS</code> 与 <code>renderToolsSdk</code><br>
+  <code class="srcpath">packages/core/tools/src/index.ts</code> — <code>collapses</code> / <code>resolveExecution</code> / <code>wireSchemas</code> / <code>presentAs</code><br>
+  <code class="srcpath">packages/core/agent-tool-presentation/README.md</code> — 为什么是一行 preset 而不是一个 registry<br>
+  <code class="srcpath">packages/code-runtime/code-runtime-worker-thread/README.md</code> — 敌意对端、双预算、日志账本<br>
+  <code class="srcpath">apps/cli/config/agent-presets/code/agent.cordis.yml</code> — 完整的 code preset<br>
+  <code class="srcpath">.agents/notes/implemented/feature/2026-06-15-code-mode.md</code> — 设计笔记，含被拒方案与已知风险
+</div>
+
+</main>
+<aside id="dsh-toc"></aside>
+</div>
+
+
+<script>
+// ===================================================================
+// 0. 玩具仓库。三个 package，每个 package.json 用 docs 字段声明文档路径。
+//    packages/probe/README.md 缺少 "## Model Experience" 段落。
+// ===================================================================
+var FS0 = {
+  'packages/probe/package.json':
+    '{\n  "name": "@mini/probe",\n  "version": "0.8.0",\n  "docs": "packages/probe/README.md"\n}\n',
+  'packages/probe/README.md':
+    '# @mini/probe\n\n'
+    + 'Diagnostic probes for a mounted composition: which plugins loaded, which\n'
+    + 'services resolved, and which effects are still pending.\n\n'
+    + '## Service API\n\n'
+    + '- `snapshot()` returns one fiber tree with per-node state.\n'
+    + '- `pending()` lists effects that never reached `active`.\n\n'
+    + '#### KV Cache effect\n\n'
+    + 'None: probes register no prompt section and no tool.\n',
+  'packages/session/package.json':
+    '{\n  "name": "@mini/session",\n  "version": "0.8.0",\n  "docs": "packages/session/README.md"\n}\n',
+  'packages/session/README.md':
+    '# @mini/session\n\n'
+    + 'The append-only event log and the surface projection folded out of it.\n'
+    + 'Nothing is ever rewritten; a compaction is a logged surface replacement.\n\n'
+    + '## Service API\n\n'
+    + '- `append(kind, payload)` writes one event and returns its offset.\n'
+    + '- `deriveMessages()` folds the log into the model-visible view.\n'
+    + '- `surfaceOp(op)` records a projection override without touching history.\n\n'
+    + '## Model Experience\n\n'
+    + 'Indirectly: every request is a pure function of the log, so a request is\n'
+    + 'reconstructable from storage alone.\n\n'
+    + '#### KV Cache effect\n\n'
+    + 'A surface replacement rewrites the suffix it covers and nothing before it.\n',
+  'packages/tools/package.json':
+    '{\n  "name": "@mini/tools",\n  "version": "0.8.0",\n  "docs": "packages/tools/README.md"\n}\n',
+  'packages/tools/README.md':
+    '# @mini/tools\n\n'
+    + 'The tool registry: registration layers, the guarded execution pipeline,\n'
+    + 'and the two model-facing projections of one visible set.\n\n'
+    + '## Service API\n\n'
+    + '- `register(definition)` adds one tool and returns a disposer.\n'
+    + '- `execute(input)` runs the complete policy/dispatch/result pipeline.\n'
+    + '- `executionMode(input)` classifies one call parallel or exclusive.\n\n'
+    + '## Model Experience\n\n'
+    + 'Under `native` every registered schema is announced. Under `code` only\n'
+    + '`run_code` is, and the generated SDK declares the rest.\n\n'
+    + '#### KV Cache effect\n\n'
+    + 'Registering a tool mid-session invalidates the request prefix.\n'
+};
+
+var FS = {};
+function resetFS() { FS = {}; Object.keys(FS0).forEach(function (k) { FS[k] = FS0[k]; }); }
+resetFS();
+
+// ===================================================================
+// 1. 三个 mini 工具。schema 用真实 dsh 的那套 JSON Schema 子集写，
+//    output schema 是必填的：SDK 的输出侧类型全靠它。
+// ===================================================================
+var TOOL_DEFS = [
+  {
+    name: 'bash',
+    description: 'Execute a bash command (`bash -c`) and return its stdout/stderr. Each call runs in a fresh shell: no state persists between calls. Non-zero exits are reported as `[exit code: N]`.',
+    parameters: {
+      type: 'object',
+      required: ['command', 'description'],
+      properties: {
+        command: { type: 'string', description: 'The bash command to execute.' },
+        description: { type: 'string', description: 'Clear, concise description of what this command does in active voice, 5-10 words (shown in the UI).' },
+        workdir: { type: 'string', description: 'Working directory for this command. Defaults to the session workspace.' }
+      }
+    },
+    output: {
+      type: 'object', additionalProperties: false, required: ['exitCode', 'stdout'],
+      properties: {
+        exitCode: { type: 'number' },
+        stdout: {
+          type: 'object', additionalProperties: false, required: ['text', 'truncated'],
+          properties: { text: { type: 'string' }, truncated: { type: 'boolean' } }
+        }
+      }
+    },
+    // 真实的 bash 工具没有声明 isConcurrencySafe，所以它永远是 exclusive。
+    latencyMs: 90,
+    run: function (args) {
+      var cmd = String(args.command == null ? '' : args.command).trim();
+      if (cmd === 'ls packages') {
+        var seen = {};
+        Object.keys(FS).forEach(function (p) {
+          var m = /^packages\/([^/]+)\//.exec(p);
+          if (m) seen[m[1]] = true;
+        });
+        return { exitCode: 0, stdout: { text: Object.keys(seen).sort().join('\n') + '\n', truncated: false } };
+      }
+      return { exitCode: 127, stdout: { text: 'bash: ' + cmd + ': command not found\n', truncated: false } };
+    }
+  },
+  {
+    name: 'read',
+    description: 'Read a UTF-8 text file and return its content.',
+    parameters: {
+      type: 'object',
+      required: ['file_path'],
+      properties: {
+        file_path: { type: 'string', description: 'Path to read, resolved by the filesystem backend.' },
+        offset: { type: 'number', description: '1-based first line to return. Defaults to 1.' },
+        limit: { type: 'number', description: 'Maximum number of lines to return. Defaults to 2000.' }
+      }
+    },
+    output: {
+      type: 'object', additionalProperties: false, required: ['path', 'lines', 'text'],
+      properties: { path: { type: 'string' }, lines: { type: 'number' }, text: { type: 'string' } }
+    },
+    // 真实 read 的原话：观测竞态 fail closed，因为受保护的写入会在锁内重查版本号。
+    isConcurrencySafe: function () { return true; },
+    latencyMs: 70,
+    run: function (args) {
+      var p = String(args.file_path);
+      if (!Object.prototype.hasOwnProperty.call(FS, p)) throw new Error('file_path not found: ' + p);
+      var text = FS[p];
+      return { path: p, lines: text.split('\n').length - 1, text: text };
+    }
+  },
+  {
+    name: 'write',
+    description: 'Create or fully replace a UTF-8 text file.',
+    parameters: {
+      type: 'object',
+      required: ['file_path', 'content'],
+      properties: {
+        file_path: { type: 'string', description: 'Path to write, resolved by the filesystem backend.' },
+        content: { type: 'string', description: 'Full UTF-8 text content to write.' }
+      }
+    },
+    output: {
+      type: 'object', additionalProperties: false, required: ['path', 'operation'],
+      properties: { path: { type: 'string' }, operation: { enum: ['create', 'update'] } }
+    },
+    mutating: true,
+    latencyMs: 60,
+    run: function (args) {
+      var p = String(args.file_path);
+      var existed = Object.prototype.hasOwnProperty.call(FS, p);
+      FS[p] = String(args.content);
+      return { path: p, operation: existed ? 'update' : 'create' };
+    }
+  }
+];
+
+// ===================================================================
+// 2. JSON Schema -> TypeScript。这是 SDK 生成器的全部。
+// ===================================================================
+function tsIndent(n) { return new Array(n + 1).join('  '); }
+
+function tsType(node, indent) {
+  if (!node || (node.type === undefined && !node.enum)) return 'JsonValue';
+  if (node.enum) return node.enum.map(function (v) { return JSON.stringify(v); }).join(' | ');
+  if (node.type === 'array') return tsType(node.items, indent) + '[]';
+  if (node.type === 'object') {
+    var props = node.properties || {};
+    var keys = Object.keys(props);
+    // additionalProperties 没被显式关掉 -> 开放对象，交叉一个索引类型，绝不美化
+    var open = node.additionalProperties !== false;
+    if (!keys.length) return open ? 'Record<string, JsonValue>' : 'Record<string, never>';
+    var required = node.required || [];
+    var lines = ['{'];
+    keys.forEach(function (k) {
+      if (props[k].description) lines.push(tsIndent(indent + 1) + '/** ' + props[k].description + ' */');
+      lines.push(tsIndent(indent + 1) + k
+        + (required.indexOf(k) >= 0 ? '' : '?') + ': ' + tsType(props[k], indent + 1) + ';');
+    });
+    lines.push(tsIndent(indent) + '}');
+    return lines.join('\n') + (open ? ' & Record<string, JsonValue>' : '');
+  }
+  return node.type;
+}
+
+function renderToolsSdk(schemas) {
+  // 字典序排列：工具集不变时逐字节稳定，这是请求前缀能被缓存的前提
+  var sorted = schemas.slice().sort(function (a, b) {
+    return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+  });
+  var argsMembers = [], outputMembers = [];
+  sorted.forEach(function (s) {
+    argsMembers.push('  /** ' + s.description + ' */');
+    argsMembers.push('  ' + s.name + ': ' + tsType(s.parameters, 1) + ';');
+    outputMembers.push('  ' + s.name + ': ' + tsType(s.output, 1) + ';');
+  });
+  return [
+    'type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue }',
+    '',
+    'interface ToolArgsMap {\n' + argsMembers.join('\n') + '\n}',
+    '',
+    'interface ToolOutputMap {\n' + outputMembers.join('\n') + '\n}',
+    '',
+    'type ToolName = keyof ToolOutputMap',
+    '',
+    'declare class ToolCallError extends Error {\n'
+      + '  readonly name: "ToolCallError";\n'
+      + '  readonly toolName: ToolName;\n}',
+    '',
+    'declare const tools: {\n'
+      + '  [K in ToolName]: (args: ToolArgsMap[K]) => Promise<ToolOutputMap[K]>;\n}'
+  ].join('\n');
+}
+
+// ===================================================================
+// 3. presentation：一个 visible set，两种投影，加一条 executor collapse。
+// ===================================================================
+
+// 模型能"直接调"的 schema 投影：注意没有 output，原生 schema 只有这三个字段。
+function wireSchemaOf(def) {
+  return { name: def.name, description: def.description, parameters: def.parameters };
+}
+
+// SDK 投影：多带一个 output，这是 Code Mode 独有的收益。
+function sdkSchemaOf(def) {
+  return { name: def.name, description: def.description, parameters: def.parameters, output: def.output };
+}
+
+// 可见集合：非 native 模式下多一个保留的 run_code transport。
+function visibleDefs(defs, mode, runCodeDef) {
+  return mode === 'native' ? defs.slice() : defs.concat([runCodeDef]);
+}
+
+// 宣告给模型的 catalog。code 模式下只留 run_code，连 knownNames 一起收紧。
+function wireSchemas(visible, mode) {
+  var schemas = visible.map(wireSchemaOf);
+  if (mode === 'code') {
+    return {
+      schemas: schemas.filter(function (s) { return s.name === 'run_code'; }),
+      knownNames: ['run_code']
+    };
+  }
+  return { schemas: schemas, knownNames: schemas.map(function (s) { return s.name; }) };
+}
+
+// executor collapse：和 prompt 里那条规则用的是同一个谓词。
+// !nested 放过程序内部的子调用；both 模式下这条规则是假的，原生调用照常执行。
+function collapses(mode, name, nested) {
+  return !nested && mode === 'code' && name !== 'run_code';
+}
+
+// ===================================================================
+// 4. registry：分阶段的守卫流水线（第 6 章那条链的最小版本）。
+// ===================================================================
+var GUARDS = [
+  function approval(def, call, trace) {
+    if (!def.mutating) return null;
+    trace('guard', call, 'approval  ' + def.name + ' 是 mutating，需要审批 -> granted');
+    return null;
+  },
+  function sandbox(def, call, trace) {
+    var p = call.args && call.args.file_path;
+    if (typeof p === 'string' && p.indexOf('packages/') !== 0) {
+      return {
+        code: 'SANDBOX_DENIED',
+        message: '[sandbox: file access denied under workspace-write mode] ' + p
+      };
+    }
+    trace('guard', call, 'sandbox   ok');
+    return null;
+  }
+];
+
+function deepFreeze(v) {
+  if (v && typeof v === 'object' && !Object.isFrozen(v)) {
+    Object.freeze(v);
+    Object.keys(v).forEach(function (k) { deepFreeze(v[k]); });
+  }
+  return v;
+}
+
+function createRegistry(config) {
+  var mode = config.mode;
+  var runCodeDef = null;
+  var reg = {
+    mode: mode,
+    maxParallel: config.maxParallelSubCalls || 10,
+    onDispatch: config.onDispatch || function () {},
+    onGuard: config.onGuard || function () {},
+
+    runCode: function () {
+      if (mode === 'native') return null;
+      if (!runCodeDef) runCodeDef = createRunCodeTool(reg);
+      return runCodeDef;
+    },
+    visible: function () { return visibleDefs(TOOL_DEFS, mode, reg.runCode()); },
+    wire: function () { return wireSchemas(reg.visible(), mode); },
+    // 绑定给程序的集合 = SDK 声明的集合，一个视图，不可能对不上
+    sdkSchemas: function () {
+      return reg.visible()
+        .filter(function (d) { return d.name !== 'run_code'; })
+        .map(sdkSchemaOf);
+    },
+
+    resolveExecution: function (name, nested) {
+      var found = null;
+      reg.visible().forEach(function (d) { if (d.name === name) found = d; });
+      if (!found) return null;
+      if (collapses(mode, name, nested)) return null;
+      return found;
+    },
+    executionMode: function (call) {
+      var def = reg.resolveExecution(call.name, call.nested);
+      if (!def || !def.isConcurrencySafe) return 'exclusive';
+      try { return def.isConcurrencySafe(call.args) === true ? 'parallel' : 'exclusive'; }
+      catch (e) { return 'exclusive'; }
+    },
+
+    // 有序阶段：解析 + pre-execute 守卫
+    prepare: async function (call) {
+      var def = reg.resolveExecution(call.name, call.nested);
+      if (!def) {
+        return { kind: 'result', call: call, result: {
+          isError: true, code: 'UNKNOWN_TOOL', message: 'unknown tool "' + call.name + '"' } };
+      }
+      for (var i = 0; i < GUARDS.length; i++) {
+        var denial = GUARDS[i](def, call, reg.onGuard);
+        if (denial) {
+          return { kind: 'result', call: call, result: {
+            isError: true, code: denial.code, message: denial.message } };
+        }
+      }
+      return { kind: 'dispatch', call: call, def: def };
+    },
+    // 唯一并发的阶段：工具主体 + 超时
+    dispatch: async function (prepared) {
+      var def = prepared.def;
+      try {
+        if (def.latencyMs) await DSH.wait(def.latencyMs);
+        var value = await def.run(prepared.call.args);
+        return { call: prepared.call, result: { isError: false, value: value } };
+      } catch (err) {
+        var msg = err.message;
+        if (err.code === 'CODE_RUN_FAILED' && err.logs && err.logs.length) {
+          msg += '\nCaptured output:\n' + err.logs.join('\n');
+        }
+        return { call: prepared.call, result: {
+          isError: true, code: err.code || 'TOOL_FAILED', message: msg } };
+      }
+    },
+    // 有序阶段：post-execute。真实实现在这里冻结投影、转发 additionalContexts / concludesTurn
+    finalize: function (parked) {
+      if (!parked.result.isError) deepFreeze(parked.result.value);
+      return parked.result;
+    },
+    execute: async function (call) {
+      var prepared = await reg.prepare(call);
+      if (prepared.kind === 'result') return reg.finalize(prepared);
+      return reg.finalize(await reg.dispatch(prepared));
+    }
+  };
+  return reg;
+}
+
+// ===================================================================
+// 5. per-run 调度器：一条有序车道 + 一个并发池。
+//    启动严格按提交顺序，结果按提交顺序 commit（head-of-line 游标），
+//    只有工具主体那一段真并发。原生 loop 用的是同一套契约。
+// ===================================================================
+function createSubCallScheduler(reg, maxParallel, onEvent, nested) {
+  var pending = [];            // 已提交、未启动
+  var commitQ = [];            // 已启动、等着按顺序 commit
+  var inFlight = 0;            // 正在跑工具主体的数量
+  var exclusiveActive = false;
+  var driving = false, driverRun = Promise.resolve(), wake = null;
+  var aborted = false, submitted = 0;
+
+  function wakeup() { var r = wake; wake = null; if (r) r(); }
+
+  function drive() {
+    if (driving) return driverRun;
+    driving = true;
+    driverRun = (async function () {
+      try {
+        for (;;) {
+          // 先建好唤醒 promise 再看状态，否则检查与 await 之间到达的事件会丢
+          var signal = new Promise(function (r) { wake = r; });
+
+          var head = commitQ[0];
+          if (head && head.settled) {
+            commitQ.shift();
+            await head.commit();
+            // 屏障覆盖到 commit：后来者要等独占调用的完整流水线跑完
+            if (head.mode === 'exclusive') exclusiveActive = false;
+            continue;
+          }
+
+          var next = pending[0];
+          if (next) {
+            if (aborted) { pending.shift(); next.abandon(); continue; }
+            // 启动前重新分类：排队期间 registry 可能变，读不到就 fail-closed 判独占
+            var m = reg.executionMode(next.call);
+            var free = !exclusiveActive
+              && (m === 'exclusive' ? inFlight === 0 : inFlight < maxParallel);
+            if (free) {
+              if (m === 'exclusive') exclusiveActive = true;
+              next.mode = m;
+              pending.shift();
+              commitQ.push(next);           // 先入队，保证 commit 顺序 = 提交顺序
+              await next.start();           // 有序的 pre-execute 在车道内跑
+              inFlight++;
+              next.flight.then(function () { inFlight--; wakeup(); });
+              continue;
+            }
+          }
+
+          if (!pending.length && !commitQ.length && inFlight === 0) return;
+          await signal;
+        }
+      } finally { driving = false; wake = null; }
+    })();
+    return driverRun;
+  }
+
+  function submit(name, args) {
+    var seq = ++submitted;
+    var call = { callId: 'code:' + seq, name: name, args: args, nested: nested !== false, seq: seq };
+    return new Promise(function (resolve, reject) {
+      var parked = null;
+      var entry = {
+        call: call, settled: false, mode: null, flight: Promise.resolve(),
+        abandon: function () {
+          reject(new Error('run_code run is over; ' + name + ' tool call abandoned'));
+        },
+        start: async function () {
+          onEvent('start', entry);
+          var prepared = await reg.prepare(call);
+          if (prepared.kind === 'result') { parked = prepared; entry.settled = true; return; }
+          entry.flight = reg.dispatch(prepared).then(function (p) {
+            parked = p; entry.settled = true;
+          });
+        },
+        commit: async function () {
+          var result = reg.finalize(parked);
+          onEvent('settle', entry, result);
+          resolve(result);
+        }
+      };
+      pending.push(entry);
+      wakeup();
+      void drive();
+    });
+  }
+
+  // 运行结束：放弃还没启动的，等在飞的落地，把有序车道排空
+  async function drain() { aborted = true; wakeup(); await drive(); }
+
+  return { submit: submit, drain: drain, count: function () { return submitted; } };
+}
+
+// ===================================================================
+// 6. run_code transport。
+// ===================================================================
+var AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+
+var ToolCallError = (function () {
+  function ToolCallError(message, toolName) {
+    var e = Error.call(this, message);
+    this.message = e.message;
+    this.stack = e.stack;
+    this.name = 'ToolCallError';
+    this.toolName = toolName;
+  }
+  ToolCallError.prototype = Object.create(Error.prototype);
+  ToolCallError.prototype.constructor = ToolCallError;
+  return ToolCallError;
+})();
+
+function CodeRunFailedError(message, logs) {
+  var e = Error.call(this, message);
+  this.message = e.message;
+  this.stack = e.stack;
+  this.name = 'CodeRunFailedError';
+  this.code = 'CODE_RUN_FAILED';
+  this.logs = logs || [];
+}
+CodeRunFailedError.prototype = Object.create(Error.prototype);
+CodeRunFailedError.prototype.constructor = CodeRunFailedError;
+
+// 参数必须是无损 JSON。undefined / 循环 / BigInt 让这一次调用被拒，而不是悄悄变形。
+function jsonNormalize(value, what) {
+  var text;
+  try { text = JSON.stringify(value); }
+  catch (err) { throw new Error(what + ' must be lossless JSON: ' + err.message); }
+  if (text === undefined) {
+    throw new Error(what + ' must be lossless JSON (call the tool with an arguments object, e.g. `{}`)');
+  }
+  return JSON.parse(text);
+}
+
+function makeConsoleShim(logs) {
+  function write() {
+    logs.push(Array.prototype.map.call(arguments, function (v) {
+      return typeof v === 'string' ? v : JSON.stringify(v);
+    }).join(' '));
+  }
+  return { log: write, info: write, warn: write, error: write, debug: write };
+}
+
+// 程序体变成一个 AsyncFunction 的函数体，参数是注入的绑定全局、异常类、console shim。
+// 真实 worker 做的是同一件事，区别只在它先剥掉了类型、而且在另一个线程里。
+function runProgram(source, tools, consoleShim, ToolCallErrorClass) {
+  var body = new AsyncFunction('tools', 'console', 'ToolCallError', source);
+  return body(tools, consoleShim, ToolCallErrorClass);
+}
+
+function createRunCodeTool(reg) {
+  return {
+    name: 'run_code',
+    description: 'Execute a TypeScript program against the available tools. Takes two required arguments: `code`, the BODY of an async function (erasable syntax only; top-level `await` and `return` work), and `description`, a short summary of what the program does. Call tools as `await tools.name(args)` per the declarations in the system prompt. Only what you print or return comes back — curate it.',
+    parameters: {
+      type: 'object',
+      required: ['code', 'description'],
+      properties: {
+        code: { type: 'string', description: 'The program: the body of an async TypeScript function.' },
+        description: { type: 'string', description: 'Clear, concise description of what this program does in active voice, 5-10 words (shown in the UI).' }
+      }
+    },
+    output: {
+      type: 'object', additionalProperties: false, required: ['logs'],
+      properties: { logs: { type: 'array', items: { type: 'string' } }, result: {} }
+    },
+    run: async function (args) {
+      if (!String(args.description == null ? '' : args.description).trim()) {
+        throw new Error('invalid description: expected a non-empty string');
+      }
+      var sched = createSubCallScheduler(reg, reg.maxParallel, reg.onDispatch, true);
+      var over = false;
+
+      // 绑定调用方可见集合里除 run_code 以外的每个工具。null 原型 + defineProperty：
+      // 一个叫 __proto__ 的工具必须成为普通的 own key，而不是撞上原型 setter。
+      var tools = Object.create(null);
+      reg.sdkSchemas().forEach(function (s) {
+        Object.defineProperty(tools, s.name, { enumerable: true, value: async function (rawArgs) {
+          if (over) throw new Error('run_code run is over; ' + s.name + ' not dispatched');
+          var outcome = await sched.submit(s.name, jsonNormalize(rawArgs, 'tool arguments'));
+          // 失败的工具调用以 ToolCallError 的形态 reject，只带工具名
+          if (outcome.isError) throw new ToolCallError(outcome.message, s.name);
+          return outcome.value;
+        } });
+      });
+
+      var logs = [];
+      var value;
+      try {
+        value = await runProgram(args.code, tools, makeConsoleShim(logs), ToolCallError);
+      } catch (err) {
+        over = true;
+        await sched.drain();
+        throw new CodeRunFailedError('code run failed (exception): ' + err.message, logs);
+      }
+      over = true;
+      await sched.drain();     // 返回之前排空，每条 dispatch 事件都落在打开的 turn 里
+      if (value === undefined) return { logs: logs };
+      try { return { logs: logs, result: jsonNormalize(value, 'the program completion') }; }
+      catch (err) { throw new CodeRunFailedError('code run failed (invalid-output): ' + err.message, logs); }
+    }
+  };
+}
+
+// ===================================================================
+// 共用的输出辅助
+// ===================================================================
+var MODEL_MS = 220;
+
+function padTo(s, n) { s = String(s); while (s.length < n) s += ' '; return s; }
+
+function renderResultText(v) {
+  if (v === undefined) return '';
+  return typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+}
+
+function runCodeChars(value) {
+  var parts = [];
+  if (value.logs && value.logs.length) parts.push(value.logs.join('\n'));
+  var r = renderResultText(value.result);
+  if (r) parts.push(r);
+  return parts.join('\n').length;
+}
+
+function mkTimeline(o, t0ref) {
+  return function (kind, entry, result) {
+    var dt = Date.now() - t0ref();
+    var head = '   ' + (kind === 'start' ? 'start ' : 'settle') + ' #' + entry.call.seq + ' '
+      + padTo(entry.call.name, 9);
+    if (kind === 'start') {
+      o.log(head + padTo(entry.mode, 16) + '+' + dt + 'ms');
+    } else if (result.isError) {
+      o.bad(head + padTo(result.code, 16) + '+' + dt + 'ms');
+    } else {
+      o.ok(head + padTo('ok', 16) + '+' + dt + 'ms');
+    }
+  };
+}
+
+// 窄栏用的紧凑时间线：一次 dispatch 一行，start→settle 的区间直接看出重叠
+function mkCompactTimeline(o, t0ref) {
+  return function (kind, entry, result) {
+    var dt = Date.now() - t0ref();
+    if (kind === 'start') { entry.at = dt; return; }
+    var line = '  #' + entry.call.seq + ' ' + padTo(entry.call.name, 6)
+      + padTo(entry.mode === 'parallel' ? 'par' : 'exc', 5)
+      + entry.at + '→' + dt + 'ms';
+    if (result.isError) o.bad(line + '  ' + result.code); else o.ok(line);
+  };
+}
+
+// 路径太长会在窄栏折行，砍掉 packages/ 前缀
+function shortLabel(args) {
+  var s = String(args.file_path || args.command || '');
+  return s.indexOf('packages/') === 0 ? s.slice(9) : s;
+}
+
+// ===================================================================
+// Demo 8.1 - native / code 并排跑同一个调查任务
+// ===================================================================
+var RACE_PROGRAM = [
+  "const ls = await tools.bash({ command: 'ls packages', description: 'List packages' });",
+  "const names = ls.stdout.text.trim().split('\\n');",
+  "const metas = await Promise.all(names.map(n =>",
+  "  tools.read({ file_path: 'packages/' + n + '/package.json' })));",
+  "const docs = await Promise.all(metas.map(m =>",
+  "  tools.read({ file_path: JSON.parse(m.text).docs })));",
+  "const missing = docs",
+  "  .filter(d => !d.text.includes('## Model Experience'))",
+  "  .map(d => d.path);",
+  "return { checked: docs.length, missing };"
+].join('\n');
+
+// 脚本化的"模型":每一层依赖是一次请求。它对结果的解读是真的解析，不是硬编码答案。
+var NATIVE_PLAN = [
+  { text: '先看看 packages 下面有什么。',
+    calls: function () {
+      return [{ name: 'bash', args: { command: 'ls packages', description: 'List packages' } }];
+    },
+    learn: function (s, results) {
+      s.names = results[0].value.stdout.text.trim().split('\n');
+    } },
+  { text: '三个 package。读它们的 package.json 找文档路径。',
+    calls: function (s) {
+      return s.names.map(function (n) {
+        return { name: 'read', args: { file_path: 'packages/' + n + '/package.json' } };
+      });
+    },
+    learn: function (s, results) {
+      s.docs = results.map(function (r) { return JSON.parse(r.value.text).docs; });
+    } },
+  { text: '文档路径拿到了，逐个读 README。',
+    calls: function (s) {
+      return s.docs.map(function (p) { return { name: 'read', args: { file_path: p } }; });
+    },
+    learn: function (s, results) {
+      s.missing = results
+        .filter(function (r) { return r.value.text.indexOf('## Model Experience') < 0; })
+        .map(function (r) { return r.value.path; });
+    } },
+  { text: function (s) { return '结论：' + s.missing.join('、') + ' 缺少 ## Model Experience 段落。'; },
+    calls: function () { return []; } }
+];
+
+async function runNativeSide(o, meter) {
+  var reg = createRegistry({ mode: 'native' });
+  var wired = reg.wire();
+  o.head('catalog: ' + wired.schemas.map(function (s) { return s.name; }).join(', '));
+  var t0 = Date.now();
+  var state = {};
+
+  for (var i = 0; i < NATIVE_PLAN.length; i++) {
+    var stage = NATIVE_PLAN[i];
+    await DSH.wait(MODEL_MS);                       // 一次模型请求
+    meter.requests++;
+    var text = typeof stage.text === 'function' ? stage.text(state) : stage.text;
+    meter.chars += text.length;
+    o.acc('请求 ' + (i + 1) + ' · assistant: ' + text);
+
+    var calls = stage.calls(state);
+    if (!calls.length) break;
+
+    // 原生调度器：并发安全的调用进池子重叠跑
+    var sched = createSubCallScheduler(reg, reg.maxParallel, function () {}, false);
+    var results = await Promise.all(calls.map(function (c) { return sched.submit(c.name, c.args); }));
+    results.forEach(function (r, k) {
+      meter.calls++;
+      var payload = r.isError ? r.message : JSON.stringify(r.value);
+      meter.chars += payload.length;
+      o.log('  ' + padTo(calls[k].name, 5) + padTo(shortLabel(calls[k].args), 24)
+        + payload.length + '字→ctx');
+    });
+    stage.learn(state, results);
+  }
+  meter.ms = Date.now() - t0;
+  o.rule();
+  o.warn(meter.requests + ' 次模型请求 · ' + meter.calls + ' 份工具结果全文进了 context');
+}
+
+async function runCodeSide(o, meter) {
+  var reg = createRegistry({ mode: 'code' });
+  var wired = reg.wire();
+  o.head('catalog: ' + wired.schemas.map(function (s) { return s.name; }).join(', '));
+  var t0 = Date.now();
+  var tProgram = 0;
+  var timeline = mkCompactTimeline(o, function () { return tProgram; });
+  reg.onDispatch = function (kind, entry, result) {
+    if (kind === 'settle') meter.nested++;      // 真数出来的，不是写死的
+    timeline(kind, entry, result);
+  };
+
+  await DSH.wait(MODEL_MS);                          // 模型请求 1
+  meter.requests++;
+  var assistant = '一次跑完：写个程序。';
+  meter.chars += assistant.length + RACE_PROGRAM.length;
+  o.acc('请求 1 · assistant: ' + assistant);
+  o.dim('  tool_call run_code  program ' + RACE_PROGRAM.length + '字→ctx');
+
+  tProgram = Date.now();
+  var res = await reg.execute({
+    callId: 'call_1', name: 'run_code', nested: false,
+    args: { code: RACE_PROGRAM, description: 'Find docs missing Model Experience' }
+  });
+  meter.calls++;
+
+  if (res.isError) { o.bad('   run_code -> ' + res.code + ' ' + res.message); meter.ms = Date.now() - t0; return; }
+  var resultText = renderResultText(res.value.result);
+  meter.chars += runCodeChars(res.value);
+  o.head('  tool_result run_code · ' + runCodeChars(res.value) + '字→ctx');
+  resultText.split('\n').forEach(function (l) { o.ok('     ' + l); });
+
+  await DSH.wait(MODEL_MS);                          // 模型请求 2
+  meter.requests++;
+  var missing = res.value.result.missing;
+  var final = '结论：' + missing.join('、') + ' 缺少 ## Model Experience 段落。';
+  meter.chars += final.length;
+  o.acc('请求 2 · assistant: ' + final);
+
+  meter.ms = Date.now() - t0;
+  o.rule();
+  o.ok(meter.requests + ' 次模型请求 · 1 份 curated 结果进了 context（程序内 '
+    + meter.nested + ' 次 dispatch 一份都没进）');
+}
+
+function paintScore(nat, cod) {
+  var rows = [
+    ['模型请求次数', nat.requests, cod.requests, true],
+    ['模型可见的工具调用', nat.calls, cod.calls, true],
+    ['程序内嵌套 dispatch', 0, cod.nested, false],
+    ['进入 context 的字符数', nat.chars, cod.chars, true],
+    ['墙上时钟 (ms)', nat.ms, cod.ms, true]
+  ];
+  var html = '<table class="score"><thead><tr><th>指标</th><th>native</th><th>code</th>'
+    + '<th>差</th></tr></thead><tbody>';
+  rows.forEach(function (r) {
+    var win = r[3] && r[2] < r[1];
+    var ratio = r[3] && r[2] > 0 ? (r[1] / r[2]).toFixed(1) + '×' : '—';
+    html += '<tr' + (win ? ' class="win"' : '') + '><td>' + DSH.esc(r[0]) + '</td>'
+      + '<td class="v n">' + r[1] + '</td><td class="v c">' + r[2] + '</td>'
+      + '<td class="v">' + ratio + '</td></tr>';
+  });
+  return html + '</tbody></table>';
+}
+
+DSH.demo('d-race', {
+  reset: function (o, api) {
+    DSH.out('out-native').clear();
+    DSH.out('out-code').clear();
+    api.$('#score-box').innerHTML = '';
+  },
+  run: async function (o, api) {
+    resetFS();
+    var on = DSH.out('out-native'), oc = DSH.out('out-code');
+    on.clear(); oc.clear();
+    api.$('#score-box').innerHTML = '';
+    var nat = { requests: 0, calls: 0, chars: 0, nested: 0, ms: 0 };
+    var cod = { requests: 0, calls: 0, chars: 0, nested: 0, ms: 0 };
+    // 真的同时开跑，右边会明显先收工
+    await Promise.all([runNativeSide(on, nat), runCodeSide(oc, cod)]);
+    api.$('#score-box').innerHTML = paintScore(nat, cod);
+  }
+});
+
+// ===================================================================
+// Demo 8.2 - 宣告的表面 = 可调用的表面
+// ===================================================================
+DSH.demo('d-mode', {
+  init: function (o, api) {
+    function paint() {
+      var reg = createRegistry({ mode: api.$('#mode-pick').value });
+      api.$('#mode-badges').innerHTML = reg.wire().schemas.map(function (s) {
+        return '<span class="pill ' + (s.name === 'run_code' ? 'acc' : '') + '">'
+          + DSH.esc(s.name) + '</span>';
+      }).join('');
+    }
+    paint();
+    api.$('#mode-pick').addEventListener('change', function () { o.clear(); paint(); });
+  },
+  direct: async function (o, api) {
+    o.clear();
+    var mode = api.$('#mode-pick').value;
+    var reg = createRegistry({ mode: mode });
+    o.head('mode = ' + mode + '   模型直呼 read（nested = false）');
+    var r = await reg.execute({
+      callId: 'call_1', name: 'read', nested: false,
+      args: { file_path: 'packages/tools/README.md' }
+    });
+    if (r.isError) o.bad('  -> ' + r.code + '  ' + r.message);
+    else o.ok('  -> ok  ' + r.value.path + '  ' + r.value.lines + ' 行');
+  },
+  run: async function (o, api) {
+    resetFS();
+    var mode = api.$('#mode-pick').value;
+    var reg = createRegistry({ mode: mode });
+    var wired = reg.wire();
+    var announced = wired.schemas.map(function (s) { return s.name; });
+
+    o.head('mode = ' + mode);
+    o.log('宣告的 catalog  (wireSchemas) : ' + announced.join(', '));
+    o.dim('SDK 声明的工具  (sdkSchemas)  : '
+      + (mode === 'native' ? '(native 模式没有 SDK 段)'
+         : reg.sdkSchemas().map(function (s) { return s.name; }).join(', ')));
+    o.dim('knownNames                    : ' + wired.knownNames.join(', '));
+    o.rule();
+
+    // 把四个名字全都试一遍 direct call，外加一次 nested call
+    var probes = [
+      { name: 'bash', args: { command: 'ls packages', description: 'List packages' } },
+      { name: 'read', args: { file_path: 'packages/tools/README.md' } },
+      { name: 'write', args: { file_path: 'packages/tools/TMP.md', content: 'x' } },
+      { name: 'run_code', args: { code: 'return "hi";', description: 'Trivial program' } }
+    ];
+
+    var callable = [];
+    for (var i = 0; i < probes.length; i++) {
+      var p = probes[i];
+      var label = '模型直呼 ' + padTo(p.name, 9) + '(nested=false)';
+      var r = await reg.execute({ callId: 'call_' + i, name: p.name, nested: false, args: p.args });
+      if (r.isError) o.bad(label + '  -> ' + r.code + '  ' + r.message);
+      else { o.ok(label + '  -> ok'); callable.push(p.name); }
+    }
+    var nestedRead = await reg.execute({
+      callId: 'call_n', name: 'read', nested: true,
+      args: { file_path: 'packages/tools/README.md' }
+    });
+    if (nestedRead.isError) o.bad('程序内调用 read      (nested=true)   -> ' + nestedRead.code);
+    else o.ok('程序内调用 read      (nested=true)   -> ok');
+
+    o.rule();
+    var same = announced.slice().sort().join(',') === callable.slice().sort().join(',');
+    var line = '宣告 = {' + announced.join(', ') + '}   可直接调用 = {' + callable.join(', ') + '}';
+    if (same) o.ok(line + '   一致'); else o.bad(line + '   不一致');
+  }
+});
+
+// ===================================================================
+// Demo 8.3 - 从 catalog 生成 SDK
+// ===================================================================
+DSH.demo('d-sdk', {
+  reset: function (o) { o.clear(); },
+  run: function (o) {
+    var reg = createRegistry({ mode: 'code' });
+    var text = renderToolsSdk(reg.sdkSchemas());
+    text.split('\n').forEach(function (l) { o.raw(l ? DSH.hl(l, 'js') : '&nbsp;'); });
+    o.rule();
+    o.dim('3 个工具 · ' + text.split('\n').length + ' 行 · ' + text.length + ' 字符。');
+    o.dim('真实 dsh 的同一段覆盖 19 个工具、403 行。');
+  }
+});
+
+// ===================================================================
+// Demo 8.4 - 可编辑的 run_code
+// ===================================================================
+var DEFAULT_PROGRAM = [
+  "// 一次往返之内跑完整个调查。",
+  "const ls = await tools.bash({ command: 'ls packages', description: 'List packages' });",
+  "const names = ls.stdout.text.trim().split('\\n');",
+  "",
+  "// read 声明了 isConcurrencySafe，所以这三个调用会重叠跑",
+  "const metas = await Promise.all(names.map(n =>",
+  "  tools.read({ file_path: 'packages/' + n + '/package.json' })));",
+  "",
+  "// 每个 package.json 的 docs 字段指向它自己的文档",
+  "const docs = await Promise.all(metas.map(m =>",
+  "  tools.read({ file_path: JSON.parse(m.text).docs })));",
+  "",
+  "const missing = docs",
+  "  .filter(d => !d.text.includes('## Model Experience'))",
+  "  .map(d => d.path);",
+  "",
+  "// 失败的工具调用以 ToolCallError 的形态 reject，catch 住就能继续",
+  "try {",
+  "  await tools.read({ file_path: 'packages/probe/CHANGELOG.md' });",
+  "} catch (err) {",
+  "  if (!(err instanceof ToolCallError)) throw err;",
+  "  console.log('caught ' + err.name + ' from ' + err.toolName + ': ' + err.message);",
+  "}",
+  "",
+  "console.log('checked ' + docs.length + ' docs');",
+  "return { missing };"
+].join('\n');
+
+var SANDBOX_PROGRAM = [
+  "// 沙箱守卫在 pre-execute 阶段拒绝；拒绝在程序里就是一次 ToolCallError",
+  "try {",
+  "  await tools.write({ file_path: '/etc/hosts', content: '127.0.0.1 evil' });",
+  "  return 'wrote it';",
+  "} catch (err) {",
+  "  console.log(err.name + ' from ' + err.toolName);",
+  "  console.log(err.message);",
+  "}",
+  "// 同一个工具，工作区之内照常可用",
+  "return await tools.write({ file_path: 'packages/probe/NOTES.md', content: 'ok' });"
+].join('\n');
+
+var BOOM_PROGRAM = [
+  "// 给每个 package 补一份 NOTES.md，最后一步读一个不存在的文件，而且不 try/catch。",
+  "const names = ['probe', 'session', 'tools'];",
+  "",
+  "for (const n of names) {",
+  "  const path = 'packages/' + n + '/NOTES.md';",
+  "  await tools.write({ file_path: path, content: 'reviewed by the program' });",
+  "  console.log('wrote ' + path);   // ← 把这一行删掉再跑一次",
+  "}",
+  "",
+  "// 这个文件不存在。ToolCallError 没人 catch，整段程序就到这里为止。",
+  "const meta = await tools.read({ file_path: 'packages/probe/manifest.json' });",
+  "return { ok: true, lines: meta.lines };"
+].join('\n');
+
+// 模型真正收到的文本：失败时是那条错误消息（带 Captured output），成功时是 logs 加 result。
+function modelVisibleText(res) {
+  if (res.isError) return res.message;
+  return [(res.value.logs || []).join('\n'), renderResultText(res.value.result)].join('\n');
+}
+
+async function execProgram(o, source, showFs) {
+  resetFS();
+  var before = Object.keys(FS).length;
+
+  var reg = createRegistry({ mode: 'code' });
+  var t0 = Date.now();
+  reg.onDispatch = mkTimeline(o, function () { return t0; });
+  reg.onGuard = function (kind, call, detail) {
+    // 外层那次 run_code 调用没有 seq：它自己也要走一遍同一条流水线
+    o.dim('   guard  ' + padTo(call.seq === undefined ? 'outer' : '#' + call.seq, 3) + '  ' + detail);
+  };
+
+  var res = await reg.execute({
+    callId: 'call_1', name: 'run_code', nested: false,
+    args: { code: source, description: 'Editable program' }
+  });
+
+  o.rule();
+  var seen = modelVisibleText(res);
+  if (res.isError) {
+    o.bad('run_code -> isError  ' + res.code);
+    res.message.split('\n').forEach(function (l) { o.bad('  ' + l); });
+    o.dim('模型看到的就是上面这些。中间那些成功调用的结果它一份都没有。');
+  } else {
+    o.head('模型看到的 run_code 结果（' + runCodeChars(res.value) + ' 字符）：');
+    (res.value.logs || []).forEach(function (l) { o.log('  ' + l); });
+    renderResultText(res.value.result).split('\n').forEach(function (l) {
+      if (l) o.ok('  ' + l);
+    });
+  }
+
+  if (!showFs) return;
+
+  // 副作用对账：每一个新文件，在模型收到的文本里出现过吗？
+  o.rule();
+  var added = Object.keys(FS).filter(function (p) {
+    return !Object.prototype.hasOwnProperty.call(FS0, p);
+  }).sort();
+  o.warn('运行后的文件系统：' + before + ' -> ' + Object.keys(FS).length + ' 个文件');
+  if (!added.length) { o.dim('  （没有新增文件，这一段没什么可对的）'); return; }
+
+  var blind = 0;
+  added.forEach(function (p) {
+    if (seen.indexOf(p) >= 0) o.ok('  + ' + p + '   模型看见了（程序打印过）');
+    else { blind++; o.bad('  + ' + p + '   模型不知道'); }
+  });
+  o.rule();
+  if (blind) {
+    o.bad('副作用 ' + added.length + ' 个，模型视野外 ' + blind + ' 个。'
+      + '它只能猜，或者重新读一遍文件系统。');
+  } else {
+    o.warn('副作用 ' + added.length + ' 个，全都被程序打印过，所以模型接得上。'
+      + '把那行 console.log 删掉再跑，这一行会变红。');
+  }
+}
+
+DSH.demo('d-run', {
+  init: function (o, api) { api.$('#prog').value = DEFAULT_PROGRAM; },
+  reset: function (o, api) {
+    api.$('#prog').value = DEFAULT_PROGRAM;
+    o.clear();
+    o.dim('程序已恢复为默认版本。');
+  },
+  run: function (o, api) { return execProgram(o, api.$('#prog').value, true); },
+  // 预设按钮先把程序填进编辑框再跑，填进去的东西可以接着改
+  sandbox: function (o, api) {
+    api.$('#prog').value = SANDBOX_PROGRAM;
+    o.clear();
+    o.dim('已填入越界写入的那段。');
+    return execProgram(o, SANDBOX_PROGRAM, false);
+  },
+  boom: function (o, api) {
+    api.$('#prog').value = BOOM_PROGRAM;
+    o.clear();
+    o.dim('已填入会炸的那段：三次写入成功，第四步失败，没有 try/catch。');
+    return execProgram(o, BOOM_PROGRAM, true);
+  }
+});
+
+// ===================================================================
+// 本章产物的源码渲染：页面上列的就是页面上跑的
+// ===================================================================
+DSH.showSource('src-sdk', [tsType, renderToolsSdk]);
+DSH.showSource('src-runcode', [runProgram, createRunCodeTool]);
+DSH.showSource('src-sched', createSubCallScheduler);
+DSH.showSource('src-present', [wireSchemaOf, sdkSchemaOf, visibleDefs, wireSchemas, collapses]);
+</script>
+
+</body>
+</html>

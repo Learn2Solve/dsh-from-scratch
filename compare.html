@@ -1,0 +1,1213 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>附录 · 横向对照：Pi、omp、Claude Code、Codex、OpenCode — DeepSeek Harness from Scratch</title>
+<link rel="stylesheet" href="assets/site.css">
+<style>
+/* 六列 harness 挤在一个 70ch 的正文栏里。这页把标识符全挪到表格下面的正文，
+   格子只留结论，字号和内边距也收一档，好让整张表不出横向滚动条。 */
+table.vsgrid { font-size: 12px; }
+table.vsgrid th, table.vsgrid td { padding: 7px 6px; }
+table.vsgrid th:first-child, table.vsgrid td:first-child { width: 19%; }
+</style>
+<script src="assets/site.js"></script>
+</head>
+<body>
+
+<div class="wrap">
+<main>
+
+<header class="masthead">
+  <div class="kicker">附录</div>
+  <h1>横向对照：Pi、omp、Claude Code、Codex、OpenCode</h1>
+  <p class="standfirst">
+    前面九章都在讲 dsh 自己怎么想。这一页把它放回同行里，逐个机制对一遍，
+    看哪些地方它真的换了结构，哪些地方只是换了个名字。最后一节说清这页比的是什么、不比什么。
+  </p>
+  <div class="meta"><span>一张可筛选的对照矩阵</span><span>3 个 demo</span><span>约 25 分钟</span></div>
+</header>
+
+<h2><span class="num">§A.1</span>先说结论</h2>
+
+<p>
+开源当天 HN 那条主线程里，票数最高的一条追问是 <code>rco8786</code> 写的：
+「But like, what is it? Odd that this reached #1 on HN.」他抱怨 README 除了安装步骤
+和一个指向 Cordis 的链接（那个链接后面写着「A Meta-Framework of Spatiotemporal Composability」）
+之外几乎什么都没说。这一页存在的理由就是这个问题。
+</p>
+
+<p>
+我能给出的答案是这样。Claude Code、Codex、OpenCode 三家的扩展都在进程外面：
+MCP 服务器、hooks 脚本、OpenAPI 客户端，你能往旁边挂东西，碰不到循环，也改不了那张内置工具表。
+Pi 和它的下游 fork omp 走另一条路：进程内的 TypeScript 扩展加工具、加命令、加 hooks，不用 fork 主仓。
+dsh 把这条路推到底：循环、工具表、模型层、会话存储在它这里全是插件，
+一棵 YAML 组合树决定这次进程里装什么，每个会话还能挂自己的插件子树。
+</p>
+
+<p>
+所以它的新颖之处是程度，不是种类。同一条 HN 线程里 <code>lxdlam</code> 读了 Cordis 那篇论文之后
+说得很直接：「found it may be useful, but not that useful... it adds hot-reload and dynamic
+enable/dispose capabilities to a plugin system, like the one in Pi agents, though they push
+the boundaries further, to the UI components」。热重载和动态卸载 Pi 已经有了，
+omp 继承了同一套，dsh 把边界推到了 UI 组件那一层。这句评价我认为是准确的，
+它也让「dsh 重新定义了 harness」这类说法站不住。
+这笔复杂度的账划不划算，我读完九章也没有确定答案，只能把账单列清楚给你看。
+</p>
+
+<h2><span class="num">§A.2</span>六个 harness 的一句话画像</h2>
+
+<p>
+下面这六段只写我能指到出处的东西。Pi、Claude Code、Codex、OpenCode 四家我读的是它们的公开介绍，
+以及 dsh 仓库里那两个把它们当子进程驱动的 provider 实测出来的协议细节。
+omp 那一段来自它自己那套第一方文档。
+</p>
+
+<table>
+<thead><tr><th>harness</th><th>一句话</th></tr></thead>
+<tbody>
+<tr>
+  <td><code>Pi</code></td>
+  <td>终端里的极简 harness，MIT 许可，作者 Mario Zechner，2026 年 4 月挪到 Earendil 名下。
+  内置工具只有 read / write / edit / bash 四个，别的能力靠 TypeScript 扩展加进来，不用 fork 主仓。
+  模型层是单独一个包 <code>@earendil-works/pi-ai</code>，统一了 15 家以上的 provider，会话中途能换模型。
+  四种跑法：交互 CLI、print/JSON、RPC、SDK。它以 token 开销低、系统提示短出名。</td>
+</tr>
+<tr>
+  <td><code>omp</code></td>
+  <td>pi-mono 的下游 fork，仓库 <code>can1357/oh-my-pi</code>。同步锚点
+  <code>b21b42d</code>（2026-03-22），之后分岔到 Bun 运行时、Rust natives、
+  bun:sqlite 凭据库。默认界面是差分渲染的 TUI，31 个内置工具，
+  会话是只追加的 JSONL entry 树，默认压缩策略把历史画成 PNG 帧。
+  扩展形态跟 Pi 同一套：一个默认导出函数的 TS 模块。</td>
+</tr>
+<tr>
+  <td><code>Claude Code</code></td>
+  <td>Anthropic 的闭源产品，走 npm 分发，终端 TUI 优先。内置工具是固定的一套，大约 15 个。
+  扩展面有五六种：MCP 服务器、hooks、Agent Skills（一个 <code>SKILL.md</code> 加 YAML frontmatter）、
+  subagents、slash commands、<code>CLAUDE.md</code>。程序化调用走 Claude Agent SDK。</td>
+</tr>
+<tr>
+  <td><code>Codex CLI</code></td>
+  <td>OpenAI 的开源实现，Rust 写的，终端优先。对外开一个 <code>codex app-server --stdio</code>，说 JSON-RPC。
+  支持 MCP、审批模式、沙箱、config profiles、<code>AGENTS.md</code>。</td>
+</tr>
+<tr>
+  <td><code>OpenCode</code></td>
+  <td>开源，客户端和服务端是拆开的。Go 写的服务持有执行生命周期，对外暴露一个 OpenAPI 3.1 端点，
+  所以 CLI、桌面端、网页、脚本能挂到同一个会话上。TUI 用 Bubble Tea 写。跨 provider，模型无关。
+  <code>opencode serve</code> 可以无头跑着，多个客户端同时连。</td>
+</tr>
+<tr>
+  <td><code>dsh</code></td>
+  <td>DeepSeek 在 2026-08-13 开源的那一坨。一个 Cordis 依赖注入内核撑起两百多个包，
+  一棵可以打补丁的 YAML 组合树决定这次进程里装什么，界面是浏览器里的 React 客户端。
+  循环、工具、模型、会话存储在它这里都是插件。</td>
+</tr>
+</tbody>
+</table>
+
+<h2><span class="num">§A.3</span>对照矩阵</h2>
+
+<p>
+这是本页的正题。17 行机制，六列。我给每一行打了一个标签，
+表头上方的按钮按标签筛行：只有 dsh 有的、六家都有的、dsh 反而更弱的。
+剩下那些是结构差异但分不出强弱的，只在「全部」里出现。
+</p>
+
+<p>
+这张表原来只有五列，「dsh 独有」筛出 8 行。omp 那一列一加进来，剩 3 行。
+削掉的五行不是我改了口径，是 omp 的文档里写着它也能：会话是只追加的 entry 树，
+压缩不动原始记录，工具集按会话隔离，活动工具表运行时能改，
+<code>eval</code> 里也能让模型写程序把多次调用串成一次。
+按钮上的数字是筛完之后的真实行数。
+</p>
+
+<div id="p-only"></div>
+<script>
+DSH.predict('p-only', {
+  q: '这 17 行里，「只有 dsh 有、另外五家我查不到对应能力」的行，你猜有几行？',
+  options: [
+    { label: '1 行', why: '比这多两行。' },
+    { label: '3 行', ok: true, why: '而且剩下这三行全都指着同一件事：什么东西能在运行时被换掉。' },
+    { label: '8 行', why: '这是 omp 那一列进来之前的数字。' },
+    { label: '17 行全是', why: 'MCP client、沙箱、被别人当子 agent 调，这几项是行业标配。' }
+  ],
+  explain: '点下面的「dsh 独有」按钮自己数一遍。注意这个标签的意思是「我查不到别人有」，不等于「别人没有」。'
+});
+</script>
+
+<div class="demo" id="d-matrix">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo A.1</span>可筛选的对照矩阵</div>
+    <div class="spacer"></div>
+    <button class="btn primary" data-act="all">全部 17</button>
+    <button class="btn" data-act="only">dsh 独有 3</button>
+    <button class="btn" data-act="common">大家都有</button>
+    <button class="btn" data-act="weak">dsh 反而更弱</button>
+  </div>
+  <div class="demo-body">
+    <div style="overflow-x:auto">
+    <table class="vsgrid" id="vs-table">
+      <thead><tr>
+        <th>机制</th><th>Pi</th><th>omp</th><th>Claude Code</th>
+        <th>Codex</th><th>OpenCode</th><th class="dshcol">dsh</th>
+      </tr></thead>
+      <tbody>
+
+      <tr data-cat="neutral">
+        <td>主进程语言</td>
+        <td>TypeScript</td>
+        <td>TS on Bun</td>
+        <td>Node，闭源</td>
+        <td>Rust</td>
+        <td>Go 服务</td>
+        <td class="dshcol">TypeScript</td>
+      </tr>
+
+      <tr data-cat="weak">
+        <td>默认界面</td>
+        <td>终端 CLI</td>
+        <td>终端 TUI</td>
+        <td>终端 TUI</td>
+        <td>终端 TUI</td>
+        <td>TUI，也能挂桌面和网页</td>
+        <td class="dshcol">浏览器。<span class="n">无 TUI</span></td>
+      </tr>
+
+      <tr data-cat="neutral">
+        <td>内置工具数</td>
+        <td>4 个</td>
+        <td>31 个</td>
+        <td>约 15 个，固定</td>
+        <td><code>?</code></td>
+        <td><code>?</code></td>
+        <td class="dshcol">没有这个数，看配置</td>
+      </tr>
+
+      <tr data-cat="neutral">
+        <td>工具表能否运行时增删</td>
+        <td><code>?</code> 见注</td>
+        <td><span class="y">有</span>，改活动集</td>
+        <td><span class="p">部分</span>：只有 MCP 层</td>
+        <td><span class="p">部分</span>：同左</td>
+        <td><code>?</code></td>
+        <td class="dshcol"><span class="y">有</span>。挂载即注册</td>
+      </tr>
+
+      <tr data-cat="neutral">
+        <td>扩展方式</td>
+        <td>进程内 TS 扩展</td>
+        <td>进程内 TS 扩展，加插件市场</td>
+        <td>MCP、hooks、Skills、subagents</td>
+        <td>MCP、config profiles</td>
+        <td>OpenAPI 客户端接入</td>
+        <td class="dshcol">Cordis 插件 + YAML 组合树</td>
+      </tr>
+
+      <tr data-cat="neutral">
+        <td>插件跑在哪个进程</td>
+        <td>进程内</td>
+        <td>进程内</td>
+        <td>进程外：MCP、hooks</td>
+        <td>进程外：MCP</td>
+        <td>进程外：OpenAPI</td>
+        <td class="dshcol">进程内。<span class="n">宿主权限</span></td>
+      </tr>
+
+      <tr data-cat="only">
+        <td>agent loop 能否替换</td>
+        <td>要改源码</td>
+        <td><span class="n">无</span>。循环在核心包里写死</td>
+        <td><span class="n">无</span>，闭源</td>
+        <td>要改源码</td>
+        <td>要改源码</td>
+        <td class="dshcol"><span class="y">有</span>。loop 自己也是插件</td>
+      </tr>
+
+      <tr data-cat="neutral">
+        <td>会话状态形态</td>
+        <td><code>?</code></td>
+        <td>只追加 JSONL，索引成 entry 树</td>
+        <td>产品自有存储，可关</td>
+        <td>thread，可临时</td>
+        <td>服务端持有</td>
+        <td class="dshcol">只追加事件日志 + 折叠投影</td>
+      </tr>
+
+      <tr data-cat="neutral">
+        <td>压缩是否破坏原始记录</td>
+        <td><code>?</code></td>
+        <td><span class="y">不破坏</span>。追加一条边界指针</td>
+        <td><code>?</code></td>
+        <td><code>?</code></td>
+        <td><code>?</code></td>
+        <td class="dshcol"><span class="y">不破坏</span>。原文原样躺着</td>
+      </tr>
+
+      <tr data-cat="neutral">
+        <td>每会话不同工具集</td>
+        <td><code>?</code></td>
+        <td><span class="y">有</span>。每会话一张私有工具表</td>
+        <td><span class="p">部分</span>：只有子 agent 能限</td>
+        <td><code>?</code></td>
+        <td><code>?</code></td>
+        <td class="dshcol"><span class="y">有</span>。每会话挂自己的插件子树</td>
+      </tr>
+
+      <tr data-cat="common">
+        <td>沙箱</td>
+        <td><code>?</code></td>
+        <td><span class="p">部分</span>：只有审批档位</td>
+        <td><code>?</code> 有权限体系</td>
+        <td><span class="y">有</span></td>
+        <td><code>?</code></td>
+        <td class="dshcol"><span class="y">有</span>。POSIX 和 Windows 两条</td>
+      </tr>
+
+      <tr data-cat="common">
+        <td>MCP client</td>
+        <td><code>?</code></td>
+        <td><span class="y">有</span></td>
+        <td><span class="y">有</span></td>
+        <td><span class="y">有</span></td>
+        <td><code>?</code></td>
+        <td class="dshcol"><span class="y">有</span>。工具名拼法和 CC 一致</td>
+      </tr>
+
+      <tr data-cat="neutral">
+        <td>MCP server</td>
+        <td><code>?</code></td>
+        <td><span class="n">无</span>。也只有 client 那一半</td>
+        <td><code>?</code></td>
+        <td><code>?</code></td>
+        <td><code>?</code> 它对外说的是 OpenAPI</td>
+        <td class="dshcol"><span class="n">无</span>。只有 client 一半</td>
+      </tr>
+
+      <tr data-cat="only">
+        <td>能把别的 harness 当子 agent 驱动</td>
+        <td><code>?</code></td>
+        <td><span class="n">无</span>。子 agent 全走自己的运行时</td>
+        <td><span class="p">部分</span>：只驱动自己的子 agent</td>
+        <td><code>?</code></td>
+        <td><code>?</code></td>
+        <td class="dshcol"><span class="y">有</span>，现成三个：CC、Codex、ACP</td>
+      </tr>
+
+      <tr data-cat="common">
+        <td>能被别的程序当子 agent 驱动</td>
+        <td><span class="y">有</span>：RPC 和 SDK</td>
+        <td><span class="y">有</span>：RPC、ACP、SDK</td>
+        <td><span class="y">有</span>：Agent SDK</td>
+        <td><span class="y">有</span>：app-server</td>
+        <td><span class="y">有</span>：OpenAPI，可无头</td>
+        <td class="dshcol"><span class="y">有</span>：ACP，自动化专用</td>
+      </tr>
+
+      <tr data-cat="neutral">
+        <td>Code Mode</td>
+        <td><code>?</code></td>
+        <td><span class="y">有</span>。eval 是并列的一个工具</td>
+        <td><code>?</code></td>
+        <td><code>?</code></td>
+        <td><code>?</code></td>
+        <td class="dshcol"><span class="y">有</span>。多次调用压成一次</td>
+      </tr>
+
+      <tr data-cat="only">
+        <td>运行时自我改造</td>
+        <td><code>?</code> 见下方注</td>
+        <td><span class="p">部分</span>：能现写 skill，挂不了扩展</td>
+        <td><span class="n">无</span></td>
+        <td><span class="n">无</span></td>
+        <td><span class="n">无</span></td>
+        <td class="dshcol"><span class="y">有</span>。模型现场写插件挂进当前进程</td>
+      </tr>
+
+      </tbody>
+    </table>
+    </div>
+    <div class="pane-label" id="vs-count"></div>
+  </div>
+</div>
+
+<div class="note warn">
+  <span class="tag">关于 ? 这一格</span>
+  <code>?</code> 的意思是「我没有验证过」，不是「没有」。
+  dsh 那一列每一格我都能指到 <code class="srcpath">packages/</code> 底下的具体文件；
+  omp 那一列来自它自己那套 <code>omp://</code> 文档，127 篇，每格我都能指到篇名；
+  Claude Code 和 Codex 那两列，一部分来自官方文档，一部分来自 dsh 仓库里那两个 provider 实测出来的协议；
+  Pi 和 OpenCode 两列我只读了它们的公开介绍。所以「dsh 独有」这个筛选按钮的诚实读法是
+  「另外五家我查不到」。<code>lxdlam</code> 那条评论把 Pi 的一格从 <code>无</code> 改成了 <code>?</code>，
+  omp 那一列一进来又削掉五行，这种修正后面大概还会有。
+  <br><br>
+  两处标着「见下方注」的 Pi 格子：一是工具表能否运行时增删，
+  它的扩展加工具是确定的，热增删我没在公开材料里读到，而 <code>lxdlam</code> 说它的插件系统已经有
+  热重载和动态卸载；二是运行时自我改造，热重载算有，
+  但让模型自己写一个插件挂进当前进程，我没查到。
+  <br><br>
+  dsh 那一列被我从格子里挪出来的路径，按行序：
+  <code class="srcpath">packages/client/</code>（界面）、
+  <code class="srcpath">packages/core/agent-loop/</code>（loop 插件）、
+  <code class="srcpath">packages/core/session/</code>（事件日志与投影）、
+  <code class="srcpath">packages/sandbox/</code>、
+  <code class="srcpath">packages/mcp/mcp-client/</code>（工具名是
+  <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>）、
+  <code class="srcpath">packages/subagent/</code>、
+  <code class="srcpath">packages/acp/acp/</code>、
+  <code class="srcpath">packages/code-runtime/</code>、
+  <code class="srcpath">packages/extensions/tool-cordis/</code>。
+  <br><br>
+  omp 那一列同样挪出来的标识符，按行序：
+  <code>@oh-my-pi/pi-natives</code>（那个 Rust N-API addon）、
+  <code>@oh-my-pi/pi-tui</code>（差分渲染的 TUI）、
+  <code>pi.registerTool()</code> 加 <code>pi.setActiveTools()</code> 加 <code>/mcp reload</code>（工具表那三条路）、
+  <code>SessionEntryIndex</code> 与落盘的
+  <code class="srcpath">~/.omp/agent/sessions/&lt;encoded-cwd&gt;/&lt;ts&gt;_&lt;id&gt;.jsonl</code>（会话树）、
+  <code>CompactionEntry.firstKeptEntryId</code>（压缩边界）、
+  <code>AgentSession</code> 创建时的 <code>toolNames</code> / <code>restrictToolNames</code>（每会话工具集）、
+  审批三档 <code>always-ask</code> / <code>write</code> / <code>yolo</code>（沙箱那格为什么是部分）、
+  <code>omp --mode rpc</code>（被别人驱动）、
+  <code>eval</code>（Code Mode）、
+  <code>manage_skill</code>（自我改造那格为什么也是部分）。
+</div>
+
+<div class="note vs">
+  <span class="tag">换成别的 harness</span>
+  「压缩是否破坏原始记录」这一行还剩四个 <code>?</code>，看着像偷懒，其实是我不敢替它们回答。
+  但有一句关于结构的话是安全的：只要一个 harness 的会话状态就是那个消息数组本身，
+  压缩就必然是重写数组。摘要顶掉原文，原文从状态里消失，除非它另外写了一份完整日志文件。
+  dsh 和 omp 都敢说「不破坏」，前提相同：状态压根就不是那个数组。
+  往下一层机制就分岔了。dsh 的状态是一串只追加的事件，数组每次现算，折叠靠一条
+  <code>surfaceOp</code> 事件；omp 的状态是一行行只追加的 JSONL，压缩往尾巴上追加一条
+  <code>CompactionEntry</code>，靠里面的 <code>firstKeptEntryId</code> 指出边界，
+  指针左边的 entry 不再进 LLM 上下文，但一条都没有从磁盘上消失，重开会话也还在。
+  这也是第 5 章要花那么长篇幅的原因。
+</div>
+
+<div id="p-unique"></div>
+<script>
+DSH.predict('p-unique', {
+  q: '下面哪一项真的是 dsh 独有的？',
+  options: [
+    { label: '非破坏性压缩', why: 'omp 也不破坏。它追加一条带 firstKeptEntryId 的 CompactionEntry，原文全留在 JSONL 里。' },
+    { label: '每会话不同工具集', why: 'omp 的每个 AgentSession 也有一张私有工具注册表。' },
+    { label: '运行时换工具', why: 'omp 的 pi.setActiveTools() 和 /mcp reload 也能改当前活动工具集。' },
+    { label: '换掉 agent loop 本身', ok: true, why: 'omp 的循环写死在 @oh-my-pi/pi-agent-core 里，扩展只能拦事件、改消息、steer。dsh 的 loop 自己也是插件。' }
+  ],
+  explain: '筛「dsh 独有」那三行里，这一项是最干净的。另外两行是「把别的 harness 当子 agent 驱动」和「运行时自我改造」，前者 omp 明确没有，后者 omp 能现写 skill 但挂不了扩展。'
+});
+</script>
+
+<h2><span class="num">§A.4</span>一张家谱</h2>
+
+<p>
+矩阵里有一格我一开始填错了。我以为 dsh 的多 provider 模型层是自己写的，
+毕竟两百多个包了，再写一个 provider 适配器听起来很符合它的作风。
+</p>
+
+<div id="p-piai"></div>
+<script>
+DSH.predict('p-piai', {
+  q: 'dsh 的多 provider 模型层（统一十几家 provider、会话中途换模型）是怎么来的？',
+  options: [
+    { label: '自己从零写了一遍', why: '两百多个包的仓库，这个猜法很合理。' },
+    { label: '把某个开源实现抄进仓库改了改' },
+    { label: '直接 npm 依赖 Pi 的模型层包', ok: true, why: '那个包就是 Pi 的 `@earendil-works/pi-ai`。' }
+  ],
+  explain: '下面是那个适配器包 README 的第一句，和它 package.json 里的依赖行。'
+});
+</script>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">packages/llm/llm-pi-ai/README.md · 第一句，原文</span></div>
+<pre><code data-lang="text">Generic multi-provider adapter for the harness LLM seam backed by
+`@earendil-works/pi-ai`. One plugin instance owns a dict of provider
+profiles keyed by route; every request selects a profile with
+`GenerateOptions.provider` and resolves `GenerateOptions.model`
+against that route's configured catalog.</code></pre>
+</div>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">packages/llm/llm-pi-ai/package.json · dependencies</span></div>
+<pre><code data-lang="json">"@earendil-works/pi-ai": "^0.82.1"</code></pre>
+</div>
+
+<p>
+那个极简 harness 的模型层，被这个最大主义 harness 直接 npm 装进来了。
+dsh 的适配器在它外面套了一圈自己的东西：路由字典、按 route 的 catalog 覆盖、
+凭据引用（<code>apiKeyEnv</code> 只存变量名，密钥不进配置文件）、per-model 的 reasoning 档位映射、
+把 SDK 的 <code>maxRetries</code> 强行按到零好让重试预算归 agent 层管。
+但拨号、流式解析、十几家 provider 的方言差异，是 pi-ai 在做。
+</p>
+
+<p>
+那一格填错之后我把六家的来历都查了一遍。结果不是六个平行的项目，是一棵有分叉的树，
+六家里三家能连到同一个上游。
+</p>
+
+<div class="diagram">                   Mario Zechner · pi-mono
+                 （对外叫 Pi，MIT，2026-04 挪到 Earendil 名下）
+                                  │
+              ┌───────────────────┴────────────────────┐
+          fork 下游                              npm 装一个包
+              │                                        │
+             omp                                      dsh
+       can1357/oh-my-pi                       DeepSeek，219 个包
+   锚点 b21b42d，2026-03-22            @earendil-works/pi-ai@^0.82.1
+   已分岔：Bun 运行时 / Rust natives          只借模型层，别的自己写
+   / 凭据进 bun:sqlite 的 agent.db
+
+     Claude Code        Codex CLI        OpenCode
+       （闭源）          （Rust）        （Go 服务）
+        这三家跟这棵树没有血缘关系，是各自长出来的
+</div>
+
+<p>
+omp 是 pi-mono 的下游 fork，它自己那篇移植文档把同步锚点写得很死：
+commit <code>b21b42d032919de2f2e6920a76fa9a37c3920c0a</code>，2026-03-22，
+包 scope 从 <code>@mariozechner/pi-*</code> 和 <code>@earendil-works/pi-*</code>
+映射成 <code>@oh-my-pi/pi-*</code>。同一篇文档还列着它主动分岔的地方：
+运行时换成 Bun，主 CLI 不留 Node 入口；<code>jiti</code> 换成 Bun 原生的 <code>import()</code>；
+凭据从 <code>auth.json</code> 挪进 <code>agent.db</code>（bun:sqlite）并且支持多凭据轮询；
+性能路径整体下沉到 Rust。fork 之后它没有停在原地，这是同一份代码分头往下走出来的两个东西。
+</p>
+
+<p>
+这棵树解释了矩阵里几个看着巧合的格子。omp 和 Pi 的扩展形态是同一套：
+一个默认导出函数的 TS 模块，进程内跑，加工具加命令加 hook。
+dsh 借的只是模型层那一个包，它的插件内核跟 Pi 没有关系，是 Cordis 自己一套。
+所以三家同源，同的地方各不相同：omp 继承的是整个进程模型，dsh 继承的是拨号那一层。
+</p>
+
+<p>
+插件内核那一半，官方文档没写来路。开源第一天 X 上有几个中文开发者顺着代码的味道往回找，
+落点是同一个地方：聊天机器人框架 Koishi。<code>@heipiao233</code> 说得最直白，
+「这篇论文几乎可以说是给 Cordis 写的…它是给聊天机器人框架 Koishi.js 写的」。
+<code>@lihaoze24141442</code> 是从 RAII 和 IoC 的味道认出来的，
+「找到了 Cordis 原作者在 koishi 文档中对相关思想的介绍」，他贴的是 koishi.chat 上那篇 disposable。
+<code>@Daiiors</code> 是老用户：「这个 koishi 框架就是 cordis 框架。
+去年我做的量化交易系统也是基于这个框架。」同在 X 上的 <code>@teortaxesTex</code> 反应是懵的：
+「not once does it mention DeepSeek or the DS harness. No evals, no nothing.」
+这四条都是社交媒体上的个人说法，我按原话引，没替他们担保。
+</p>
+
+<p>
+能核的那一半我核了：<code>cordiverse/paper</code> 的 README 自陈是 preprint，
+全文一次都没有出现 DeepSeek，也没有附任何 eval。一篇不提 dsh 的论文被当成 dsh 的架构说明挂在 README 上，
+§A.1 里 <code>rco8786</code> 那句「what is it」有一半是这么来的。
+</p>
+
+<div class="diagram">            Koishi · 聊天机器人框架（koishi.chat）
+            插件引擎：可撤销的副作用 + 声明式依赖
+                              │
+                        抽出来单独成包
+                              │
+                            Cordis
+          cordiverse/cordis · 论文 cordiverse/paper
+          论文是 preprint，不提 DeepSeek，也没有 eval
+                              │
+                              dsh
+          插件内核直接用它，连 agent loop 都做成插件
+
+         这条线来自社区指认；论文那一条是我自己核过的
+</div>
+
+<p>
+所以这棵家谱朝下有两条边：模型层是从 Pi 家 npm 装进来的，
+插件内核是一个跑了几年的聊天机器人框架换了个场合。dsh 自己写的，是夹在中间的那一层。
+</p>
+
+<p>
+另一个方向也通。dsh 仓库里躺着 <code>subagent-claude-code</code> 和 <code>subagent-codex</code>：
+前者调官方 Claude Agent SDK（钉在 <code>@anthropic-ai/claude-agent-sdk@0.3.220</code>），
+解析 <code>claude</code> 可执行文件的真实路径，起一个 <code>persistSession: false</code> 的 query；
+后者 spawn <code>codex app-server --stdio</code>，走 <code>initialize</code> 到 <code>initialized</code> 到
+<code>thread/start { cwd, ephemeral: true }</code> 的握手，等那条权威的 <code>turn/completed</code>。
+两个 provider 都只把最终答案捞回来，子 agent 的推理、中间消息、工具流水、stderr、
+工作区 diff 一概不进父会话的上下文。
+omp 这一头没有对应的东西：它的子 agent 全是进程内的子 <code>AgentSession</code>，
+内置七种 agent 类型，但文档里明说它不 spawn 外部的 <code>claude</code> 或 <code>codex</code> 二进制。
+所以「把别的 harness 当工人使唤」这一轴上，六家里还是只有 dsh 一个。
+</p>
+
+<p>
+把这两个方向摆在一起看，dsh 在争的位置就清楚了：它在这些工具的上面一层。
+下面借 Pi 的模型层，上面把 Claude Code 和 Codex 当工人使唤。
+这个位置的名字叫<strong>编排层</strong>，它跟另外五家不在同一个格子里竞争，
+所以「dsh 比 Claude Code 好用吗」这个问题本身问得不对。
+</p>
+
+<div class="note vs">
+  <span class="tag">换成别的 harness</span>
+  反过来问：Claude Code 能不能把 dsh 当子 agent 调？能，dsh 那个 ACP 服务端就是给这个用的。
+  Codex 能不能？也能，同一个口。omp 也有 RPC 和 ACP 两个口，别人调它没问题，
+  它调别人没有现成的路。互相当子 agent 这件事在协议层早就通了，
+  没通的是「谁来当那个总调度」。dsh 是目前唯一一个把这件事写进包结构里的。
+  它值不值这个位置，取决于它的调度到底比人手工串一串脚本好多少。这一点没有数据，见 §A.7。
+</div>
+
+<h2><span class="num">§A.5</span>同一个任务，六种走法</h2>
+
+<p>
+矩阵是静态的，看不出代价。下面这个 demo 换个角度：给一个具体任务，
+把六家各自要走的路排在一起，数往返次数，数进上下文的东西，数人要动手做的事。
+</p>
+
+<p>
+先把话说清楚。dsh 那一栏是我在仓库里读到并跑过的。omp 那一栏来自它自己那套文档，
+机制我读到了，东西我没装过。剩下四栏是<strong>架构推演</strong>：
+按它们公开描述的结构，这个任务只能这么走。每一栏都标着来源。
+</p>
+
+<div id="p-restart"></div>
+<script>
+DSH.predict('p-restart', {
+  q: '「给 agent 加一个新工具」这一项，六家里有几家能在进程不重启的前提下做到？',
+  options: [
+    { label: '一家都不行' },
+    { label: '至少 dsh 能，而且它有两条路', ok: true, why: '写插件包走 HMR 热挂，或者让模型自己 cordis_define 加 cordis_run。omp 能在运行时改活动工具集，但装一个全新的扩展模块，它的文档说要重开会话。' },
+    { label: '六家都行，热重载早就是标配了', why: '把工具注册做成可撤销的副作用，是要在内核里付代价的。' }
+  ],
+  explain: '选下面第三个任务跑一遍，dsh 那一栏会打出两行。'
+});
+</script>
+
+<div class="demo" id="d-walk">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo A.2</span>六种走法并排</div>
+    <div class="spacer"></div>
+    <select class="btn" id="walk-task">
+      <option value="rename">把三个文件里的一个常量改名</option>
+      <option value="compact">压缩一段超长会话</option>
+      <option value="addtool">给 agent 加一个新工具</option>
+    </select>
+    <button class="btn primary" data-act="run">走一遍</button>
+  </div>
+  <div class="demo-body">
+    <div class="out" id="out-walk"></div>
+  </div>
+</div>
+
+<p>
+第一个任务跑完，dsh 那一栏的往返次数最少，进上下文的东西也最少。
+这不是它聪明，是 Code Mode 把五次工具调用塞进了一段程序里。
+omp 的 <code>eval</code> 能走同一条路，它默认那条路走的是原生 <code>ast_edit</code>，
+先出预览再落盘，多一次往返。第二个任务是三个里最有意思的：
+五家都要为压缩付一次模型请求，omp 付零次。
+</p>
+
+<p>
+下面两个按钮把 dsh 的两个机制拆掉，然后再走一遍。目的是看清这两个机制到底买到了什么。
+拆掉之后 dsh 那一栏会退化成跟另外几家一样的形状。
+</p>
+
+<div class="demo" id="d-break">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo A.3</span>把 dsh 弄坏，再走一遍</div>
+    <div class="spacer"></div>
+    <button class="btn" data-act="nocode">把 Code Mode 拆掉</button>
+    <button class="btn" data-act="nosurface">把 surfaceOp 关掉</button>
+    <button class="btn primary" data-act="run">只走 dsh 这一栏</button>
+  </div>
+  <div class="demo-body">
+    <div class="out" id="out-break"></div>
+  </div>
+</div>
+
+<div class="note">
+  <span class="tag">这两个开关的含义</span>
+  「拆掉 Code Mode」等于取消 <code>run_code</code>，让模型回到一次工具调用一次往返。
+  「关掉 surfaceOp」等于让压缩直接重写消息数组，也就是矩阵里那四个 <code>?</code>
+  和 omp 之外几家最可能的样子。
+  两个开关都拆掉之后，dsh 剩下的还有插件化的工具表和运行时自我改造，
+  但它在前两个任务上的优势就没有了。
+</div>
+
+<h2><span class="num">§A.6</span>dsh 输在哪里</h2>
+
+<p>
+上面那张表把 dsh 那一列涂成了高亮色，读起来像一份推荐。这一节把力气花在反面。
+分四组：第一组是我自己在源码里查到的；第二组是开源当天 HN 主线程上别人说的；
+第三组是 omp 具体压过 dsh 的地方，来自它自己那套文档；
+第四组是两份独立的插件安全审计，它们钉的 commit 跟本书对照的是同一个。
+第二组里有几条比第一组更值得你花时间想。第四组最要紧的是它把这个项目切成了两半，
+一半评价很高，一半还没开始做。
+</p>
+
+<h3>§A.6.1 源码里能查到的</h3>
+
+<ul>
+  <li><code>没有 TUI</code>。<code class="srcpath">packages/client/</code> 底下四十来个 <code>ui-*</code> 包全是 React，
+  界面只有浏览器一条路。你 ssh 进一台服务器想跑 agent，得先起 web 服务再做端口转发。
+  另外五家都是终端优先，Claude Code 和 Codex 干脆只有终端。omp 的 TUI 还是差分渲染的。</li>
+
+  <li><code>SESSION_FORMAT_VERSION = 0</code>，而且它明说不做迁移。
+  <code class="srcpath">packages/core/session/src/types.ts</code> 里那行常量就是 0，
+  注释里的规则是：写入端的语义一变就 bump，读取端遇到别的版本号直接抛。
+  完整的 upgrade-step 链条只存在于一篇 Agent Note 里。现阶段你今天存下的会话，明天可能读不回来。</li>
+
+  <li><code>两百多个包</code>。<code>find packages -name package.json</code> 数出来 219 个。
+  想改一个行为，你得先知道它属于哪个 seam、由哪个 provider 实现、在哪一层 patch 里被挂上。
+  Pi 的卖点之一是心智负担轻，dsh 在这一项上是反面典型。</li>
+
+  <li><code>配置文件里能写代码</code>。YAML 里的 <code>!!js</code> 标签会被求值，
+  官方例子就长这样：<code>ANTHROPIC_API_KEY: !!js process.env.ANTHROPIC_API_KEY</code>。
+  它确实好用，条件挂载、读注入服务、拼字符串都靠它。它同时意味着，
+  任何能写你 <code>cordis.yml</code> 的人都能在你的进程里执行任意代码。
+  一份从网上抄来的 profile 是一段没人审过的脚本。</li>
+
+  <li><code>插件没有安全沙箱</code>。沙箱那几个包管的是工具执行（bash、文件写），不管插件本身。
+  一个 Cordis 插件跑在主进程里，拿得到 <code>ctx</code>，也就拿得到所有服务。
+  <code>cordis_run</code> 让模型现场挂插件这条路更直接：第 9 章那个 demo 好玩，
+  代价是模型写的代码和你的 harness 同进程同权限。</li>
+
+  <li><code>它 64 天大</code>。第一个 commit 是 2026-06-10，最后一个是 2026-08-13，中间 12293 个 commit。
+  这个密度说明它是高强度冲出来的，也说明没人在生产环境里用它跑过一天。
+  开源当天 43437 个 star、3404 个 fork，而 <code>origin/master</code> 从那天起一个 commit 都没动，
+  npm 上还是 <code>0.1.0-rc.6</code>。动的全是读者。</li>
+
+  <li><code>它自己的文档在漂</code>。<code>tool-cordis</code> 实际注册 7 个工具，
+  它的 README 写 5 个，仓库里还有一篇 Agent Note 按旧名字描述 3 个。
+  两百多个包各带一份中英 README 是很壮观的工程，维护它们是另一回事。</li>
+</ul>
+
+<h3>§A.6.2 HN 上的批评</h3>
+
+<div class="note">
+  <span class="tag">出处</span>
+  以下全部来自 Hacker News 主线程 <code>item 49285244</code>，2026-08-13，545 分 234 条评论。
+  引号里是原文，用户名是 HN 用户名。我没有替任何人转述观点。
+</div>
+
+<ul>
+  <li><code>rco8786</code>（高票）问的是定位：「But like, what is it? Odd that this reached #1 on HN.
+  The README is pretty bare outside of installation instructions and a link to "Cordis",
+  which is "A Meta-Framework of Spatiotemporal Composability."」
+  一个 43000 star 的项目，README 说不清它是什么，指过去的链接是一句更抽象的话。
+  这不是排版问题。能力都藏在配置树里的东西，天然缺一个「它是什么」的入口。</li>
+
+  <li><code>invaliduser</code> 讲插件疲劳：「I have developped over the year a plugin fatigue.
+  Every product relying on community plugins works fine the 6 first months, then it's a
+  nightmare of incompatible, deprecated plugins, with no consistency and no governance.」
+  dsh 的每一项优势都建在插件系统上，所以这条批评打的是它的根。
+  它现在还在头六个月里，第七个月的样子没人见过。</li>
+
+  <li><code>bdcravens</code> 讲的是同一件事的另一半：「Most vendors that create a plugin-based
+  system end up creating a large library of plugins to kickstart the ecosystem, which many
+  users end up trusting more because they're "official", so they essentially created a
+  mono-vendor ecosystem with extra steps.」
+  219 个包里绝大多数都是官方的。你要真去换掉哪个 provider，换进来的东西没有官方那份的测试和文档。
+  「一切皆插件」到目前为止的实际效果，可能就是他说的那句：带额外步骤的单厂商生态。</li>
+
+  <li><code>lxdlam</code> 读了 Cordis 论文，结论是新颖性有限：「found it may be useful, but not
+  that useful... it adds hot-reload and dynamic enable/dispose capabilities to a plugin
+  system, like the one in Pi agents, though they push the boundaries further, to the UI
+  components」。这条已经写进 §A.1 和上面那张矩阵的 Pi 那一列。
+  它的杀伤力在于：如果热重载和动态卸载 Pi 已经有，dsh 那几行「独有」里至少有一部分要打折。
+  omp 那一列一进来，这个折扣已经兑现了。</li>
+
+  <li><code>OutOfHere</code> 一句话点在 effect 模型上：「Using memory to track inverses does not
+  scale.」dsh 的每次注册都返回 disposer，卸载时反序回收，这些逆操作全在内存里挂着。
+  长时间跑、插件反复挂载卸载之后会怎样，我没有做过这个测量，仓库里也没找到相关的压测。
+  第 3 章正面处理这个问题。</li>
+
+  <li><code>syntaxing</code> 问：「Is there a reason why so many of these agent harness are
+  written in node.js?」这个问题在这张矩阵里有一半答案：六家里三家是 TypeScript / Node 一系
+  （Pi、dsh、加上跑在 Bun 上的 omp），只有 Codex 是 Rust、OpenCode 服务端是 Go。dsh 选 Node 让它能直接 npm 装 pi-ai、
+  直接跑 Claude Agent SDK、让模型写 TypeScript 在 worker thread 里执行。同一个选择也带来下一条。</li>
+
+  <li><code>WhereIsTheTruth</code> 说的是供应链：「pushing npm slop, with all the cargo culting
+  and security pwn issues it brings」。把这条和上面 <code>!!js</code>、
+  以及插件没有安全沙箱那两条放一起看，dsh 的攻击面是：一棵会求值 JS 的配置树，
+  219 个包的依赖闭包，加上一个能让模型现场挂插件的工具。</li>
+
+  <li><code>217</code>（置顶）：「if it's not better than omp im not trying it」。
+  一句话，但它问的是这整页回答不了的东西，见 §A.7。</li>
+
+  <li><code>yipinwong</code>：「Good idea, ugly landing page」。
+  这条放在最后不是因为它不重要。一个只有 web 界面、没有 TUI 的 harness，
+  第一印象全压在那个页面上。</li>
+</ul>
+
+<p>
+同一条线程里也有好评，集中在两个点上。<code>kamranjon</code> 说 landing page 上最打动他的是
+Every Run is Traceable：只追加的会话日志把系统提示、推理、工具调用、子 agent 调度、
+每一次上下文注入全记下来，resume / fork / search / replay 都在同一条事件流上。
+<code>bmurphy1976</code> 更短：「Tracing what it actually did. Who would have thought that's
+a good idea, instead of trying to obfuscate everything.」
+<code>JonChesterfield</code> 夸的是另一处：「I really like the json schemas around the tool
+calls. Much stricter validation than in codex.」他同一条评论里紧接着提了个具体缺点：
+「git is behind bash and that means hope or sandboxing」，他认为 git 该是顶层工具。
+这三条分别是第 5 章和第 6 章的正题，那两章会连代价一起说。
+</p>
+
+<h3>§A.6.3 omp 具体压过 dsh 的地方</h3>
+
+<p>
+§A.6.1 写的是 dsh 自己的软肋。这一小节换个角度：同一轴上 omp 已经做得更彻底的几项。
+出处都在它自己的文档里，我没有跑过。
+</p>
+
+<ul>
+  <li><code>snapcompact</code>。默认压缩策略不调模型：把要丢掉的历史序列化，用像素字体画成 PNG 帧，
+  交给视觉模型当图像读。字形和帧尺寸按各家图像计费公式挑（Claude 用 <code>11on16-bw</code>，
+  Gemini / GPT 用 <code>8on22-bw</code>，Kimi / GLM 用 <code>8on16-bw</code>），
+  不需要 API key，也不联网。dsh 的压缩要跑一次摘要模型。</li>
+
+  <li><code>Rust natives</code>。grep / fd / glob / AST 改写 / 结构化 diff / token 计数 / 文本排版
+  全走 <code>@oh-my-pi/pi-natives</code>。dsh 是纯 TypeScript。</li>
+
+  <li><code>会话树 + rewind / checkpoint</code>。会话是一棵只追加的 entry 树，
+  <code>checkpoint</code> 打内存标记，<code>rewind</code> 在检查点处 append 一条
+  <code>branch_summary</code> 并把 leaf 移回去，被放弃的探索分支还躺在 JSONL 里。
+  dsh 有 fork，没有树内导航和探索分支回滚。</li>
+
+  <li><code>30 多家 provider + 多凭据轮询</code>。外加 11 种 toolconv 方言转换器，
+  其中有专门处理 DeepSeek 全角 token 泄漏的那一套。dsh 的多 provider 层借的是 pi-ai，
+  凭据轮询和 toolconv 这两层它没有对等的东西。</li>
+
+  <li><code>持久跨会话记忆</code>。四种后端可选，默认关；打开之后有本地 SQLite 加向量召回
+  （<code>mnemopi</code>）和远程向量服务（<code>hindsight</code>）。
+  dsh 只有 <code>session_search</code> 一类的日志检索。</li>
+
+  <li><code>skills 发现根目录覆盖六个生态</code>。
+  <code>.omp</code>、<code>.claude/skills</code>、<code>.agent/skills</code>、
+  <code>.codex/skills</code>、<code>.config/opencode/skills</code>、<code>.github/skills</code>
+  都会扫。dsh 只扫两个。</li>
+
+  <li><code>有真正的 TUI</code>。差分渲染，append-only 原生 scrollback，支持 Kitty / iTerm2 / Sixel。
+  这一条 §A.6.1 已经写过，放在这里是为了把账单凑齐。</li>
+</ul>
+
+<h3>§A.6.4 插件信任模型（两份独立审计）</h3>
+
+<p>
+前面三小节是我自己读出来的，这一小节不是。开源当天和第二天，
+有两个人各自把插件这条路走了一遍，出了两份审计，彼此独立，落点重合。
+对本书来说要紧的是它们钉的版本：第一份钉在 commit <code>47f9438</code>，
+活体验证跑的是 npm 上的 <code>0.1.0-rc.6</code>，跟这本书从头到尾对照的是同一个东西。
+</p>
+
+<p>
+第一份出自 <code>Fz0x00</code>（Discussion <code>#454</code>），
+规模是 40 条攻击路径、96 条带 file:line 的源码证据、13 个可复现 demo。
+它把这个项目切成两条轴，这个切法比「有没有沙箱」那种问法准确得多。
+</p>
+
+<ul>
+  <li><strong>轴 A，面向模型和 agent 行为</strong>：审计给的定性是 production-grade。
+  工具执行管线、fail-closed 的审批、进程沙箱、文件观察策略、凭据引用模型、
+  只追加的审计日志，还有浏览器那道 confusion-deputy 围栏（403/415 是对活实例验的）。
+  第 5 章和第 6 章写的就是这一半，审计没有推翻其中任何一条。</li>
+
+  <li><strong>轴 B，面向插件代码</strong>：审计的原话是「目前没有安全设计」。
+  插件在宿主进程里跑，拿宿主权限；install、update、篡改、持久化、热重载这几条路上，
+  签名、完整性、来源、确认闸门一个都没有。</li>
+</ul>
+
+<p>
+轴 B 具体长什么样，两份审计各自给了可复现的路径。下面几条按它们的原文列，
+括号里是审计仓库那些 demo 目录的真名。
+</p>
+
+<ul>
+  <li>YAML 里的 <code>!!js</code> 就是加载期的宿主级 RCE
+  （<code class="srcpath">demo-01-js-config-rce</code>，活体标记文件 <code>PWNED-BY-LIVE-JS</code>）。
+  §A.6.1 那条只说了它「意味着」什么，审计做的是把它跑出来。</li>
+
+  <li><code>dsh plugin add &lt;pkg&gt;</code> 字面上就是 <code>pnpm add &lt;pkg&gt;</code>，
+  这是第二份审计（<code>xiejin77</code>，Discussion <code>#587</code>）的原话。
+  恶意 bundle 在 install 那一刻就在宿主进程里执行，审计给的证据是 payload 的 pid 等于 host 的 pid。</li>
+
+  <li>插件能在 boot 期改写整棵配置树，时点在任何运行时防护激活之前：
+  <code>approval.policy</code> 改成 <code>never</code>，
+  <code>sandbox-policy.mode</code> 改成 <code>danger-full-access</code>。
+  换句话说，轴 A 那一整套的参数，是由轴 B 在它启动之前决定的。</li>
+
+  <li><code>dsh plugin remove</code> 不会移除已经持久化的 <code>!!js</code> 后门。
+  装完之后再改文件也是零校验加载，用户 patch 的热重载大约 15 秒生效，不用重启进程。
+  热重载在第 3 章是这个内核最漂亮的地方，在这里它是攻击面的一段。</li>
+</ul>
+
+<div class="note warn">
+  <span class="tag">这几条要跟上面一起读</span>
+  这条路要受害者自己敲 <code>dsh plugin add</code>，第二份审计的作者把边界写在最前面：
+  不是零点击的远程 RCE。出厂的 web 界面里，agent-instructions 那一路默认关着。
+  两份审计也都列了 dsh 已经做对的地方：pnpm 的 registry integrity、
+  <code>0600</code> / <code>0700</code> 的文件权限、<code>.env</code> 的 bootstrap guard、
+  特权 RPC 只绑 loopback，第一份审计给这些的定性是 real mitigations。
+  它的立场也写得很明白：防御性披露，「插件即可信」是这个项目的设计取舍，报告只陈述事实和风险。
+</div>
+
+<p>
+所以这一小节的标题不叫「dsh 不安全」。审计自己的二分比那句话准得多：
+同一个仓库里，面向模型的那半边被一份外部审计评为 production-grade，
+面向插件的那半边还没开始做。这两半在架构上本来就是分开的，
+<code class="srcpath">packages/sandbox/</code> 管的是 bash 和文件写，
+管不到加载它自己的那棵配置树。
+</p>
+
+<p>
+第二份审计还留了一句横向的话，我把它加成了 §A.3 矩阵里的一行：
+Codex、Claude Code、Gemini CLI 这一路的共识是让核心进程只吃声明式或者纯文本的指令，
+可执行的扩展一律放到进程外面去跑。六家在这一轴上三比三分开，
+dsh 这一边的另外两个是 Pi 和 omp。这一行是前面九章那些能力的前提，
+也是这一小节所有问题的前提。
+</p>
+
+<div class="note src">
+  <span class="tag">两份审计</span>
+  <code>Fz0x00</code> · <code>deepseek-ai/deepseek-harness</code> 的 Discussion <code>#454</code>，
+  完整报告在 <code class="srcpath">Fz0x00/deepseek-harness-plugin-security-audit</code>，
+  钉在 commit <code>47f9438</code>，活体验证针对 <code>@deepseek-ai/dsh@0.1.0-rc.6</code><br>
+  <code>xiejin77</code> · 同一个仓库的 Discussion <code>#587</code>，晚一天，结论是独立得出的<br>
+  <code class="srcpath">docs/cordis-tutorial/05-config.md</code> — 官方教程教 <code>!!js</code> 的那一篇，
+  原话是「The loader used in this repo supports a <code>!!js</code> tag for config values that
+  must be computed at load time」
+</div>
+
+<h2><span class="num">§A.7</span>这里比的是架构，不是效果</h2>
+
+<p>
+读到这里你手上有一张 17 行的矩阵、三个任务的六种走法、一份带出处的批评清单。
+有一样东西这页给不了你：这六个东西干活谁干得好。
+</p>
+
+<p>
+HN 上 <code>flaburgan</code> 要的正是这个。他想看 harness 之间的横向质量评测，
+并且指出目前根本没有人做同模型、同 prompt 的对比。他说得对。
+</p>
+
+<p>
+把话说完整。本附录比的是结构：谁的什么东西能在运行时换掉，会话状态长什么形状，
+压缩之后原文还在不在，谁能把谁当子 agent 调。能指到源码的地方我指了，指不到的留了 <code>?</code>。
+它一个字都没有说 dsh 改代码改得比 Claude Code 好，也没有说 Codex 的补丁质量高于 Pi。
+那种对比要固定模型、固定任务集、固定 prompt，跑足够多次数看方差，
+还要公开评分口径好让别人复现。这项工作我没有做，据我所知也没有别人做过。
+</p>
+
+<p>
+所以 <code>217</code> 那句置顶短评是有道理的。他要的是效果证据，
+这页只有结构证据。两者不能互相顶替。
+</p>
+
+<h2><span class="num">§A.8</span>怎么选</h2>
+
+<p>
+不排名。按你实际想干什么对：
+</p>
+
+<table>
+<thead><tr><th>你想要的</th><th>去看</th></tr></thead>
+<tbody>
+<tr>
+  <td>今天就要一个能干活的编码 agent，装完就用</td>
+  <td>Claude Code 或 Codex CLI。dsh 的第一步是读那棵 YAML 组合树。</td>
+</tr>
+<tr>
+  <td>想在终端里跑，token 账单要压得住，系统提示要看得懂</td>
+  <td>Pi。四个内置工具，扩展是 TypeScript 文件。</td>
+</tr>
+<tr>
+  <td>想在终端里跑，但要 30 多家 provider、会话树、压缩不调模型</td>
+  <td>omp。Pi 的下游 fork，TUI 是默认界面，默认压缩是 snapcompact。</td>
+</tr>
+<tr>
+  <td>要多个前端（CLI、桌面、网页）连同一个会话</td>
+  <td>OpenCode。它的服务端本来就是为这个拆出来的；dsh 的 ACP 是自动化专用，不做 UI。</td>
+</tr>
+<tr>
+  <td>要把 Claude Code 和 Codex 当工人，上面套一层自己的调度</td>
+  <td>dsh。六家里这一项只有它写进了包结构。omp 不 spawn 外部 harness 二进制。</td>
+</tr>
+<tr>
+  <td>压缩之后还要能查到原文，或者要做审计</td>
+  <td>dsh 的只追加事件日志，或者 omp 的 JSONL entry 树。别的方案要么自己另存一份，要么接受原文丢失。</td>
+</tr>
+<tr>
+  <td>同一个进程里跑多个会话，每个会话工具集不同</td>
+  <td>dsh 的插件子树，或者 omp 的每会话私有工具注册表。</td>
+</tr>
+<tr>
+  <td>想读一份架构，把里面的想法搬到自己的项目里</td>
+  <td>dsh，读第 5 章和第 6 章就够了。事件日志加表面投影、能力接缝这两招，
+  在一个只有五千行的 harness 里也能用。</td>
+</tr>
+<tr>
+  <td>怕插件生态半年后烂掉，或者不接受配置文件能执行代码</td>
+  <td>别选 dsh。<code>invaliduser</code> 和 <code>bdcravens</code> 那两条批评现在没有反驳材料。</td>
+</tr>
+<tr>
+  <td>要在生产环境跑，要向别人保证不出事</td>
+  <td>这六个里没有一个我敢推荐。dsh 尤其不行，理由在 §A.6.1。</td>
+</tr>
+<tr>
+  <td>想知道哪个改代码改得最好</td>
+  <td>这页答不了，见 §A.7。目前谁都答不了。</td>
+</tr>
+</tbody>
+</table>
+
+<div class="note src">
+  <span class="tag">自己去读</span>
+  <code class="srcpath">packages/llm/llm-pi-ai/README.md</code> — 它借 pi-ai 借到了什么程度<br>
+  <code class="srcpath">packages/subagent/subagent-claude-code/README.md</code> — 起一个 Claude Code 子进程的全过程<br>
+  <code class="srcpath">packages/subagent/subagent-codex/README.md</code> — app-server 握手和 <code>turn/completed</code><br>
+  <code class="srcpath">packages/hooks/hooks-claude-code/README.md</code> — 把 CC 的 hooks.json 跑在 dsh 的拦截点上，
+  README 自己承认这只是兼容路径，原生插件更强<br>
+  <code class="srcpath">packages/acp/acp/README.md</code> — dsh 被别人当子 agent 调的那个口<br>
+  Hacker News <code>item 49285244</code> — §A.6.2 和 §A.7 的全部出处<br>
+  omp 的第一方文档（本页 omp 那一列的出处）
+</div>
+
+<div class="footernote">
+  本页所有 dsh 侧的说法都对着 <code>47f9438</code> 这个 commit 核过。
+  omp 那一列对着它自己的第一方文档核过。
+  另外四家的格子，凡是我指不到出处的都留了 <code>?</code>。
+  如果你手上装着其中任何一个，欢迎把那些 <code>?</code> 换成真话。
+</div>
+
+</main>
+<aside id="dsh-toc"></aside>
+</div>
+
+<script>
+// ===================================================================
+// Demo A.1 - filterable comparison matrix.
+// ===================================================================
+var CAT_LABEL = {
+  all: '全部 17 行机制。没打标签的行是结构差异，分不出强弱。',
+  only: '另外五家我查不到对应能力的行。读作「我查不到」，不是「它们没有」。omp 那一列进来之前这里是 8 行。',
+  common: 'dsh 在这里没有新东西的行：这几项大体是行业标配，omp 的沙箱那格是部分。',
+  weak: 'dsh 明确比别人弱的行。表上只剩这一行，§A.6 里还有更多，那些不在这张表上。'
+};
+
+function filterMatrix(cat) {
+  var rows = document.querySelectorAll('#vs-table tbody tr');
+  var shown = 0;
+  rows.forEach(function (tr) {
+    var hit = cat === 'all' || tr.dataset.cat === cat;
+    tr.style.display = hit ? '' : 'none';
+    if (hit) shown++;
+  });
+  document.querySelectorAll('#d-matrix [data-act]').forEach(function (b) {
+    b.classList.toggle('primary', b.dataset.act === cat);
+  });
+  document.getElementById('vs-count').textContent =
+    '显示 ' + shown + ' / 17 行 · ' + CAT_LABEL[cat];
+}
+
+DSH.demo('d-matrix', {
+  all: function () { filterMatrix('all'); },
+  only: function () { filterMatrix('only'); },
+  common: function () { filterMatrix('common'); },
+  weak: function () { filterMatrix('weak'); },
+  init: function () { filterMatrix('all'); }
+});
+
+// ===================================================================
+// Demo A.2 / A.3 - the same task walked through six harnesses.
+//
+// Every non-dsh lane is an ARCHITECTURAL path derived from the public
+// description of that harness, never a claim that it was run. The `src`
+// field on each lane says which one it is. omp's lane is grounded in its
+// own first-party docs (omp://), still not a claim that it was run.
+// ===================================================================
+var LANES = ['pi', 'omp', 'cc', 'codex', 'oc', 'dsh'];
+
+var LANE_NAME = {
+  pi: 'Pi · 极简终端 harness',
+  omp: 'omp · pi-mono 下游 fork',
+  cc: 'Claude Code · 闭源终端产品',
+  codex: 'Codex CLI · Rust，终端优先',
+  oc: 'OpenCode · Go 服务 + 多客户端',
+  dsh: 'dsh · 本书的主角'
+};
+
+var SRC_DOC = '来源：公开描述的架构推演，我没有跑过';
+var SRC_OMP = '来源：omp 第一方文档，机制读到了，东西没装过';
+var SRC_RUN = '来源：仓库源码，跑过';
+
+var TASKS = {
+  rename: {
+    title: '任务一 · 把三个文件里的一个常量改名',
+    lanes: {
+      pi: { src: SRC_DOC, trips: '3 次模型请求',
+            ctx: 'grep 输出 + 3 个文件的相关片段 + 3 条 edit 结果，逐条进消息列表',
+            hand: '无',
+            note: '内置只有 read / write / edit / bash，找引用得用 bash 跑 grep' },
+      omp: { src: SRC_OMP, trips: '2 次模型请求',
+             ctx: 'ast_edit 预览 diff + 落盘确认；中间文件内容不进上下文',
+             hand: '无',
+             note: '默认走原生 ast_edit：一次预览三个文件的结构化改写，再 write xd://resolve 落盘。eval 也能把两步串成一次，那是另一条路' },
+      cc: { src: SRC_DOC, trips: '3 次模型请求',
+            ctx: '同上，只是找引用用的是它自己的检索工具',
+            hand: '无',
+            note: '固定的十几个内置工具里有专门的检索工具，省掉一次 bash' },
+      codex: { src: SRC_DOC, trips: '3 次模型请求',
+            ctx: '同上，工具执行在沙箱里，输出照样逐条进上下文',
+            hand: '按审批模式，可能要点 3 次确认',
+            note: '有沙箱和审批模式，写操作可能需要人点头' },
+      oc: { src: SRC_DOC, trips: '3 次模型请求',
+            ctx: '同上。执行发生在 Go 服务端，客户端看到的是事件流',
+            hand: '无',
+            note: '往返次数和上下文增量跟前三家一样，差别在谁执行' },
+      dsh: { src: SRC_RUN, trips: '1 次模型请求',
+             ctx: '只有那段 TypeScript 的源码，和它 return 回来的东西',
+             hand: '无',
+             note: 'run_code：模型写一段程序，在 code runtime 里跑完检索加三次替换。中间读到的文件内容留在 runtime 里，不进上下文' }
+    },
+    broken: {
+      nocode: { trips: '3 次模型请求',
+                ctx: 'grep 输出 + 3 个文件的片段 + 3 条 edit 结果，逐条进上下文',
+                hand: '无',
+                note: '拆掉 run_code 之后，跟另外几家一样。1 次变 3 次' }
+    },
+    tail: 'dsh 少掉的是模型请求次数。五次工具调用还在，它们发生在一段程序里，没有变成五轮对话。omp 的默认路是两次：预览加落盘。'
+  },
+
+  compact: {
+    title: '任务二 · 压缩一段超长会话（假设当前 340 条事件，要折叠前 328 条）',
+    lanes: {
+      pi: { src: SRC_DOC, trips: '1 次摘要请求',
+            ctx: '摘要顶替被折叠的 328 条',
+            hand: '触发一次压缩，或者到阈值自动',
+            note: '具体实现我标了 ?。但只要状态就是那个消息数组，压缩就得重写数组' },
+      omp: { src: SRC_OMP, trips: '0 次模型请求',
+             ctx: '模型看到几帧 PNG 加两端保留的原文；JSONL 里 328 条一条没少',
+             hand: '触发一次 /compact，或者到阈值自动',
+             note: '默认策略 snapcompact：把丢掉的历史序列化，用像素字体画成 PNG 帧。字形按当前模型挑（Claude 11on16-bw，Gemini/GPT 8on22-bw，Kimi/GLM 8on16-bw），帧高贴着实际行数。不调 LLM，不需要 API key，不联网。磁盘上追加一条 CompactionEntry，带着 firstKeptEntryId。TUI 在压缩点画一条分隔线，ctrl+o 展开摘要' },
+      cc: { src: SRC_DOC, trips: '1 次摘要请求',
+            ctx: '摘要顶替原文',
+            hand: '同上',
+            note: '同上，实现我没验证' },
+      codex: { src: SRC_DOC, trips: '1 次摘要请求',
+               ctx: '摘要顶替原文',
+               hand: '同上',
+               note: '同上' },
+      oc: { src: SRC_DOC, trips: '1 次摘要请求',
+            ctx: '摘要顶替原文',
+            hand: '同上',
+            note: '状态在服务端，压缩也在服务端；重写与否我没验证' },
+      dsh: { src: SRC_RUN, trips: '1 次摘要请求',
+             ctx: '模型看到的是摘要。日志里 328 条一条没少',
+             hand: '同上',
+             note: '压缩往日志尾巴追加一条 surface 事件：第 12 条到第 340 条折叠成这段摘要。事件总数从 340 变成 341' }
+    },
+    broken: {
+      nosurface: { trips: '1 次摘要请求',
+                   ctx: '摘要顶替原文，原文从状态里消失',
+                   hand: '同上',
+                   note: '关掉 surfaceOp 之后，压缩变成重写数组。事件总数从 340 掉到 13。想查原文只能靠外部日志文件' }
+    },
+    tail: '六家里五家都付一次摘要请求。omp 付零次：它把历史画成图交给视觉模型。dsh 和 omp 跑完之后原文都还在，机制不同：dsh 靠 surfaceOp 事件，omp 靠 firstKeptEntryId 边界指针。'
+  },
+
+  addtool: {
+    title: '任务三 · 给 agent 加一个新工具（比如一个查内部 API 的工具）',
+    lanes: {
+      pi: { src: SRC_DOC, trips: '不涉及模型往返',
+            ctx: '下次请求的工具清单里多一项',
+            hand: '写一个 TypeScript 扩展文件，装载它',
+            note: '扩展加工具不用 fork 主仓。要不要重启我标 ?，HN 上 lxdlam 说它的插件系统已经有热重载和动态卸载' },
+      omp: { src: SRC_OMP, trips: '不涉及模型往返',
+             ctx: '下次请求的工具清单里多一项',
+             hand: '写一个默认导出函数的 TS 扩展，放进 .omp/extensions 或 ~/.omp/agent/extensions，重开会话',
+             note: '扩展加工具不用 fork。运行中可 pi.setActiveTools 改活动集，/mcp reload 热重绑 MCP；但装一个全新扩展模块，文档说要重开会话。扩展和主进程同进程，没有隔离' },
+      cc: { src: SRC_DOC, trips: '不涉及模型往返',
+            ctx: '下次请求里多一个 mcp__ 前缀的工具',
+            hand: '写一个 MCP 服务器（另一个进程），在配置里登记，重开会话',
+            note: '内置那十几个动不了，新工具只能从 MCP 那一侧进来' },
+      codex: { src: SRC_DOC, trips: '不涉及模型往返',
+               ctx: '同上',
+               hand: '同上：写 MCP 服务器，改 config，重开',
+               note: '同上' },
+      oc: { src: SRC_DOC, trips: '不涉及模型往返',
+            ctx: '?',
+            hand: '?。工具执行在 Go 服务端，所以新工具要么进服务端要么挂 MCP',
+            note: '它的扩展形态我没读到足够材料，整格留 ?' },
+      dsh: { src: SRC_RUN, trips: '走法一：不涉及模型往返',
+             ctx: '下次请求的工具表里多一项，和内置工具没有区别',
+             hand: '写一个 Cordis 插件包，YAML 里加一行。HMR 热挂，进程不重启',
+             note: '工具注册是可撤销的副作用，卸载时 disposer 反序回收。OutOfHere 在 HN 上质疑的就是这套逆操作能不能 scale' }
+    },
+    dshSecond: { src: '来源：仓库源码，第 9 章跑的是这条',
+                 trips: '走法二：2 到 3 次模型请求',
+                 ctx: '模型自己写的插件源码，加上 cordis_run 的结果',
+                 hand: '零。你只说了一句「给自己加个查 API 的工具」',
+                 note: 'cordis_define 收下代码并语法检查，cordis_run 挂进当前进程。下一个 step 的工具表里就有了' },
+    tail: '前五家都得动手写文件，其中至少三家要重开会话。dsh 的第二条走法里人一步都不用做。代价见 §A.6.1 第五条：模型写的代码和你的 harness 同进程同权限。'
+  }
+};
+
+function walkLane(o, key, lane, tag) {
+  o.head((tag || '') + LANE_NAME[key]);
+  o.dim('  ' + lane.src);
+  o.log('  往返    ' + lane.trips);
+  o.log('  上下文  ' + lane.ctx);
+  o.log('  人工    ' + lane.hand);
+  o.dim('  备注    ' + lane.note);
+}
+
+DSH.demo('d-walk', {
+  run: function (o, api) {
+    var task = TASKS[api.$('#walk-task').value];
+    o.acc(task.title);
+    o.rule();
+    LANES.forEach(function (k) { walkLane(o, k, task.lanes[k]); });
+    if (task.dshSecond) walkLane(o, 'dsh', task.dshSecond, '同上 · ');
+    o.rule();
+    o.warn(task.tail);
+  }
+});
+
+// Demo A.3: two toggles that remove a dsh mechanism, then rerun the dsh lane
+// alone so the reader can see what the mechanism was actually buying.
+var BROKEN = { nocode: false, nosurface: false };
+
+function syncBreakBtns(api) {
+  api.$$('[data-act]').forEach(function (b) {
+    if (b.dataset.act === 'run') return;
+    var isCode = b.dataset.act === 'nocode';
+    var on = BROKEN[b.dataset.act];
+    b.classList.toggle('primary', on);
+    b.textContent = on
+      ? (isCode ? '已拆掉 Code Mode' : '已关掉 surfaceOp')
+      : (isCode ? '把 Code Mode 拆掉' : '把 surfaceOp 关掉');
+  });
+}
+
+DSH.demo('d-break', {
+  init: function (o, api) { syncBreakBtns(api); },
+  nocode: function (o, api) { BROKEN.nocode = !BROKEN.nocode; syncBreakBtns(api); },
+  nosurface: function (o, api) { BROKEN.nosurface = !BROKEN.nosurface; syncBreakBtns(api); },
+  run: function (o) {
+    if (!BROKEN.nocode && !BROKEN.nosurface) {
+      o.dim('两个机制都还在，dsh 是完好的。先点一个按钮把它弄坏，再回来跑。');
+    }
+    ['rename', 'compact'].forEach(function (id) {
+      var task = TASKS[id];
+      var key = id === 'rename' ? 'nocode' : 'nosurface';
+      o.acc(task.title);
+      walkLane(o, 'dsh', task.lanes.dsh, '完好 · ');
+      if (BROKEN[key]) {
+        var lane = Object.assign({ src: '同一份代码，去掉这个机制之后的推演' }, task.broken[key]);
+        walkLane(o, 'dsh', lane, '弄坏 · ');
+        o.bad('  退化成和另外几家同一个形状。');
+      } else {
+        o.dim('  （这个机制还在，没有对照可看）');
+      }
+      o.rule();
+    });
+    if (BROKEN.nocode && BROKEN.nosurface) {
+      o.warn('两个都拆掉之后，dsh 在前两个任务上跟别人没差别了。剩下的差异只有插件化的工具表和运行时自我改造，也就是任务三那一栏。');
+    }
+  }
+});
+</script>
+
+</body>
+</html>

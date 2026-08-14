@@ -1,0 +1,1275 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · 事件的五种模式 — DeepSeek Harness from Scratch</title>
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/site.js"></script>
+<style>
+/* 本章私有：checkbox 控制条。site.css 里没有 checkbox 样式，所以在这里补。 */
+.wf-ctl { margin-bottom: 14px; }
+.wf-ctl label {
+  display: flex; align-items: baseline; gap: 8px; cursor: pointer;
+  padding: 5px 0; font-size: 14px; line-height: 1.5;
+}
+.wf-ctl input { margin: 0; flex: none; position: relative; top: 2px; accent-color: var(--accent); }
+.wf-ctl b { font-family: var(--mono); font-size: 12.5px; font-weight: 600; min-width: 92px; }
+.wf-ctl span { color: var(--ink-3); font-size: 13px; }
+/* 外部命令那一组和上面的 next() 开关不是一回事，用一条虚线隔开。 */
+.wf-ctl .ccsep { border-top: 1px dashed var(--rule); margin: 11px 0 3px; }
+.wf-ctl input[type="number"] {
+  width: 64px; top: 0; padding: 2px 6px; font: inherit;
+  font-family: var(--mono); font-size: 12.5px; cursor: text;
+  border: 1px solid var(--rule); border-radius: 6px;
+  background: var(--paper); color: var(--ink);
+}
+.modelegend { display: flex; flex-wrap: wrap; gap: 8px; margin: 18px 0 6px; }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+<main>
+
+<header class="masthead">
+  <div class="kicker">第 04 章</div>
+  <h1>事件的五种模式</h1>
+  <p class="standfirst">
+    第 3 章的 fiber 已经能把插件挂上来、再干净地卸下去。可是插件之间只有一个方向的能力：加东西。
+    permission 插件没法拦住一次 <code>write</code>，因为工具注册表根本不知道 permission 存在。
+    本章补上这一刀：五种派发模式，以及其中真正当扩展点用的那一种，<strong>waterfall</strong>。
+  </p>
+  <div class="meta"><span>本章造出 MiniEvents（五模式 dispatcher）</span><span>3 个 demo</span><span>约 26 分钟</span></div>
+</header>
+
+<h2><span class="num">§4.1</span>一个 dispatcher，五种语义</h2>
+
+<p>
+第 3 章结束时我们有了 <code>ctx.effect()</code>：每次注册都返回 disposer，插件卸载时反序回收。
+问题是注册这个动作只能<em>往里加东西</em>。工具注册表跑一次工具调用的时候，
+没有任何机制让别人插进这个过程的中间。
+唯一的土办法是让 <code>ctx.tools</code> 自己去认识每一个可能想干预它的插件：
+</p>
+
+<div class="diagram">没有事件总线：干预方必须被写进被干预方
+
+  ctx.tools.execute(call)
+    ├── if (!permissions.check(call)) return deny     &lt;- tools 要 import permissions
+    ├── call = sandbox.rewrite(call)                  &lt;- tools 要 import sandbox
+    ├── audit.record(call)                            &lt;- tools 要 import audit
+    └── dispatchToolBody(call)
+
+有 waterfall 之后：被干预方只留一个缝
+
+  ctx.tools.execute(call)
+    └── ctx.waterfall('tools/pre-execute', exec, () =&gt; dispatchToolBody(exec))
+                       ▲
+        permission / sandbox / audit 各自 ctx.on() 挂进来。
+        tools 不知道它们存在，它们之间也不知道彼此存在。</div>
+
+<p>
+Cordis 的事件总线一共五种派发模式。它们的差别在于谁能否决谁，跟性能没关系。
+这五种是封闭的一组，源码里就是一个联合类型：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">vendor/cordis/src/events.ts:32 · 原文</span></div>
+<pre><code data-lang="js">export type DispatchMode = 'emit' | 'parallel' | 'serial' | 'bail' | 'waterfall'</code></pre>
+</div>
+
+<table>
+<thead><tr><th>模式</th><th>调用</th><th>是否 await</th><th>返回值</th><th>否决能力</th></tr></thead>
+<tbody>
+<tr><td><code>emit</code></td><td><code>ctx.emit(name, ...args)</code></td><td>不等</td><td>无</td><td>没有。返回值和返回的 promise 一律丢弃</td></tr>
+<tr><td><code>parallel</code></td><td><code>await ctx.parallel(...)</code></td><td>等全部 settle</td><td>无</td><td>没有。失败聚合成 <code>AggregateError</code></td></tr>
+<tr><td><code>serial</code></td><td><code>await ctx.serial(...)</code></td><td>逐个 await</td><td>第一个 bail 值</td><td>先注册的能截断后面的</td></tr>
+<tr><td><code>bail</code></td><td><code>ctx.bail(...)</code></td><td>不等（listener 必须同步）</td><td>第一个 bail 值</td><td>同上，同步版</td></tr>
+<tr><td><code>waterfall</code></td><td><code>ctx.waterfall(..., next)</code></td><td>不等（返回值通常是 promise）</td><td>最外层 listener 的返回值</td><td>不调 <code>next()</code> 就短路整条链，连内建默认行为一起</td></tr>
+</tbody>
+</table>
+
+<p>
+整张表里只有 "bail 值" 这一个词需要记住，而它比直觉宽得多：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">vendor/cordis/src/events.ts:13-15 · 原文</span></div>
+<pre><code data-lang="js">export function isBailed(value: any) {
+  return value !== null &amp;&amp; value !== false &amp;&amp; value !== undefined
+}</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="tag">两个立刻会咬人的推论</span>
+  <code>0</code> 和 <code>''</code> 都是 bail 值：一个返回 <code>0</code> 的计数 listener 会把整条 serial 链掐掉。<br>
+  更隐蔽的是 <code>async function</code>。它返回的是 <code>Promise</code>，而 <code>Promise</code> 也是 bail 值。
+  把一个 async listener 挂到 <code>bail</code> 事件上，它在第一个人身上就 bail 了，
+  bail 出去的还是个 promise。Demo 4.1 里能看到这一幕。
+</div>
+
+<p>
+下面是我们自己的实现。<code>emit</code> / <code>parallel</code> / <code>serial</code> / <code>bail</code> 四个先看，
+<code>waterfall</code> 留到下一节单独拆：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh v0.4 · 页面上运行的就是这段代码</span></div>
+  <pre><code id="src-modes" data-lang="js"></code></pre>
+</div>
+
+<p>
+<code>resolve()</code> 做两件事：先把这次派发上报给 <code>internal/dispatch</code>（诊断钩子），
+然后返回 listener 的<strong>快照</strong>。快照的意思是，派发进行中新注册或被卸载的 listener 不影响本次派发。
+另外有个怪癖我照抄了 cordis：<code>parallel</code> 上报的 mode 字符串是 <code>'emit'</code> 而不是
+<code>'parallel'</code>（<code class="srcpath">events.ts:184</code>），所以从 <code>internal/dispatch</code>
+是分不出这两者的。
+</p>
+
+<p>
+<code>on()</code> 那一行是第 3 章和本章的接缝。listener 并没有躺在某个全局数组里，
+它是通过 <code>fiber.effect()</code> 注册的一个副作用。插件卸载，listener 自己就消失了，
+没有任何 <code>removeListener</code> 的记账。
+</p>
+
+<p>
+Demo 4.1 把同一组三个 listener 依次丢进五种模式。三个 listener 分别是：
+<code>L1 audit</code>（async，90ms，只观察）、<code>L2 policy</code>（同步，看到 <code>rm</code> 就给出决定）、
+<code>L3 metrics</code>（async，40ms，只计数）。看 L3 在几种模式下的命运。
+</p>
+
+<div class="demo" id="d-modes">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 4.1</span>同一组 listener，五种派发</div>
+    <div class="spacer"></div>
+    <button class="btn primary" data-act="run">运行五种模式</button>
+    <button class="btn" data-act="reset">清空</button>
+  </div>
+  <div class="demo-body">
+    <div class="out" id="out-modes"></div>
+  </div>
+</div>
+
+<p>
+读一遍输出，四个事实：
+</p>
+
+<ul>
+  <li><code>emit</code> 在 async listener 还没跑完就返回了。它们的日志落在 <code>emit() 已返回</code> 之后。
+    L2 给出的决定被无声丢弃。</li>
+  <li><code>parallel</code> 等到所有人 settle 才返回，一个 listener 抛异常不影响其他人跑完
+    （<code>Promise.allSettled</code>），最后聚合成 <code>AggregateError</code>。</li>
+  <li><code>serial</code> 里 L2 一 bail，L3 从来没有被调用。这是设计好的语义：
+    "第一个非 null/false/undefined 的返回值胜出并终止其余"。</li>
+  <li><code>bail</code> 里 L1 那个 async listener 直接把 promise 当 bail 值返回了。
+    换成同步三人组再跑一次才是正常语义。</li>
+</ul>
+
+<div class="note">
+  <span class="tag">模式是契约</span>
+  Demo 里三个 listener 写成 <code>(payload, next)</code> 的形状，只为了让同一份代码在五种模式下都能跑，
+  这是教学取巧。真实 dsh 里一个事件的模式是它公开契约的一部分，用 <code>@mode</code> JSDoc 标签声明，
+  生成器会拿它去校验派发点（<code class="srcpath">docs/cordis-primer.md:26</code>）。
+  listener 只按一种模式来写。
+</div>
+
+<h2><span class="num">§4.2</span>waterfall 才是扩展点的本体</h2>
+
+<p>
+前四种模式里，listener 之间的关系是排队。waterfall 换成了套娃：
+每个 listener 拿到的最后一个实参是 <code>next</code>，它包住的是<em>剩下的整条链</em>，
+链的最底部是调用方传进来的内建默认行为。八行代码：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh v0.4 · MiniEvents.prototype.waterfall</span></div>
+  <pre><code id="src-waterfall" data-lang="js"></code></pre>
+</div>
+
+<p>
+这八行里有三个容易看漏的设计：
+</p>
+
+<ul>
+  <li><code>inner</code> 是从 args 尾部 <code>pop()</code> 出来的。内建默认行为只是链条最后一环，
+    在派发器眼里它跟 listener 没有区别。</li>
+  <li><code>next</code> 是一个被所有 listener <strong>共享</strong>的闭包，靠 <code>queue.shift()</code> 推进。
+    所以一个 listener 调两次 <code>next()</code>，第二次会跑到<em>再下一个</em> listener，而不是重跑同一个。
+    这条我每次重读都还得在纸上画一遍才敢确认。</li>
+  <li><code>args.push(next)</code> 之后 args 数组不再变。payload 对象是同一个引用被一路传下去，
+    这就是"协作型 listener 通常直接改这个共享对象然后 delegate"的物理基础
+    （<code class="srcpath">docs/cordis-primer.md:32</code>）。</li>
+</ul>
+
+<p>
+关键结论只有一句，它同时是本仓库的一条硬规则：
+</p>
+
+<blockquote>
+Waterfall listeners MUST call <code>next()</code> to delegate; returning without it short-circuits the chain.
+<br><span class="pill">AGENTS.md:106</span>
+</blockquote>
+
+<p>
+"短路整条链"里的"整条"把内建默认行为也算了进去。permission 插件能工作，全部原因就在这里：
+它 <code>return</code> 一个 deny 决定而不调 <code>next()</code>，于是 <code>ctx.tools</code> 自己那句
+"默认放行"根本不会执行，工具也就没有跑。<code>ctx.tools</code> 里没有一行代码提到权限。
+</p>
+
+<p>
+Demo 4.2 是本章的中心。三个 listener 按注册顺序从外到内套着：
+<code>logging</code>（最外）、<code>permission</code>、<code>sandbox</code>（最内），
+最底下是 <code>ctx.tools</code> 的内建默认行为。
+每个 listener 前面有一个 checkbox 控制它是否调用 <code>next()</code>。
+把任意一个取消勾选，它下游的一切会整片消失，工具真正的执行也在里面。
+</p>
+
+<div id="p-veto"></div>
+
+<div class="demo" id="d-chain">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 4.2</span>tools/pre-execute 中间件链</div>
+    <div class="spacer"></div>
+    <select class="btn" id="chain-call">
+      <option value="read">read src/agent.ts （工作区内）</option>
+      <option value="write">write /etc/hosts （工作区外）</option>
+    </select>
+    <button class="btn primary" data-act="run">派发</button>
+    <button class="btn" data-act="reset">清空</button>
+  </div>
+  <div class="demo-body">
+    <div class="wf-ctl">
+      <div class="pane-label">每个 listener 是否调用 next()</div>
+      <label><input type="checkbox" id="wf-log" checked><b>logging</b><span>取消勾选 = 只观察却不 delegate，返回 undefined。这是 bug。</span></label>
+      <label><input type="checkbox" id="wf-perm" checked><b>permission</b><span>取消勾选 = 主动给出 deny 决定。这是设计。</span></label>
+      <label><input type="checkbox" id="wf-box" checked><b>sandbox</b><span>取消勾选 = 沙箱不可用，给出 deny。这也是设计。</span></label>
+      <div class="ccsep"></div>
+      <label><input type="checkbox" id="wf-cc"><b>外部命令</b><span>模拟 Claude Code 风格的 hook：同一条链改成三个进程，stdin 收 JSON，exit code 回话。</span></label>
+      <label><b>spawn 成本</b><input type="number" id="cc-spawn" value="25" min="0" max="300" step="5"><span>ms 每次。这个数字是假设的，换成你机器上实测的值。</span></label>
+    </div>
+    <div class="out" id="out-chain"></div>
+  </div>
+</div>
+
+<p>
+按这个顺序跑几次，差别最说明问题：
+</p>
+
+<ol>
+  <li>三个全勾，选 <code>read src/agent.ts</code>：链一路走到底，内建默认给出
+    <code>{ kind: 'allow' }</code>，然后在回程上被 sandbox 加了标记、被 permission 透传、被 logging 记录。
+    工具真的执行了。这是 around-middleware 完整的一圈。</li>
+  <li>三个全勾，选 <code>write /etc/hosts</code>：permission 靠<em>数据</em>判断出这是工作区外的写，
+    不调 <code>next()</code>，直接返回 deny。sandbox 和内建默认都没跑，工具没执行。
+    权限插件否决一次工具调用，全过程就是这样，而工具注册表对此一无所知。</li>
+  <li>取消 logging 的勾选：一个只想记个日志的 listener 忘了 delegate。
+    waterfall 返回 <code>undefined</code>，调用方拿到一个非法的 decision，工具静默地没有执行。
+    那条仓库规则就是为这个存在的：忘记 <code>next()</code> 不会报错，它会无声地吞掉所有人的默认行为。</li>
+  <li>勾上"外部命令"，把上面三种再跑一遍。忘记 delegate 这个 bug 消失了，因为根本没有 <code>next()</code> 可以忘。
+    同时消失的还有整条回程，以及每次调用多出来的那几十毫秒。</li>
+</ol>
+
+<div class="note warn">
+  <span class="tag">真实实现里的一条额外约束</span>
+  Demo 里 sandbox 只在<em>回程</em>给决定加标记，没有改 <code>exec.args</code>。这是刻意的：
+  真实 <code>tools/pre-execute</code> 明确禁止改写参数，原话是
+  "Arguments cannot be rewritten because history, audit, UI, and execution must agree."
+  （<code class="srcpath">docs/subsystems/tools.md:402</code>）。
+  一个允许在这里改参数的 harness，日志里记的调用和实际执行的调用会对不上。
+</div>
+
+<div class="note vs">
+  <span class="tag">换成别的 harness</span>
+  Claude Code 的扩展点是一张固定的事件名单（<code>PreToolUse</code>、<code>PostToolUse</code>、
+  <code>SessionStart</code>、<code>Stop</code> 等等），在 JSON 配置里把事件名接到一条 shell 命令上。
+  这条命令从 stdin 收一份 JSON，用 exit code 和 stdout 回话：exit 2 算 block，stderr 当理由；
+  exit 0 的时候可以在 stdout 里放一段结构化 JSON，里面的 <code>permissionDecision</code> 才是 allow / deny / ask。
+  它确实能让一次工具调用被拒绝，但它拒绝的方式是把一个决定<em>交回给调用点</em>，
+  而不像 waterfall 那样自己站在调用点和内建行为中间。于是它包不住注册表自己的默认行为，
+  也没有回程可以用来改下游的产出。另外它每被调用一次就要起一个进程。
+  <br><br>
+  dsh 里有一个包专门吃这份配置：<code class="srcpath">packages/hooks/hooks-claude-code</code>。
+  它把 <code>type: 'command'</code> 的 hook 映射到本章这些 waterfall 上，
+  <code>PreToolUse</code> 落在 <code>tools/pre-execute</code>，<code>UserPromptSubmit</code> 落在
+  <code>agent/pre-step</code>，<code>Stop</code> 落在 <code>agent/turn-stopping</code>。
+  一份现成的 <code>hooks.json</code> 大体上能原样跑起来。桥自己的 README 把边界写得很坦白：
+  Claude Code 当前 30 个 hook 事件里有 23 个不支持；<code>PreToolUse</code> 的
+  <code>deny</code> 和 <code>ask</code> 生效，<code>allow</code> 不做预批准，<code>updatedInput</code>
+  只会被记一条 warning 然后丢掉；只有 shell 形态的 command hook 会跑，
+  <code>http</code> / <code>mcp_tool</code> / <code>prompt</code> / <code>agent</code> 一律跳过；
+  配置在加载时读一次，Claude Code 那套项目／用户／插件／策略的分层发现和热重载都没有。
+</div>
+
+<table class="vsgrid">
+<thead><tr>
+  <th>维度</th>
+  <th class="dshcol">dsh 的 waterfall</th>
+  <th>Claude Code 的 command hook</th>
+  <th>同一份 hooks.json 走 dsh 的桥</th>
+</tr></thead>
+<tbody>
+<tr>
+  <td>执行位置</td>
+  <td class="dshcol">进程内，同一个 JS 调用栈</td>
+  <td>进程外，每个 hook 一条 shell 命令</td>
+  <td>进程外，走 <code>ctx.shell</code>，spawn 一次都省不掉</td>
+</tr>
+<tr>
+  <td>能否否决内建行为</td>
+  <td class="dshcol"><span class="y">有</span>。不调 <code>next()</code>，内建那一环就不会执行</td>
+  <td><span class="p">部分</span>。只能把 deny 交回调用点，包不住注册表自己的默认</td>
+  <td><span class="p">部分</span>。deny / ask 映射成 <code>PreToolDecision</code>，<code>allow</code> 不预批准</td>
+</tr>
+<tr>
+  <td>是否有回程</td>
+  <td class="dshcol"><span class="y">有</span>。<code>await next()</code> 之后还能替换下游的产出</td>
+  <td><span class="n">无</span>。一次请求一次应答，协议里没有这一半</td>
+  <td><span class="n">无</span>。桥也变不出来，<code>updatedInput</code> 只记 warning</td>
+</tr>
+<tr>
+  <td>每次调用成本</td>
+  <td class="dshcol">一次函数调用</td>
+  <td>一次进程 spawn，加两次 JSON 编解码</td>
+  <td>同左。没写 <code>timeout</code> 的 hook 按 600 秒兜底</td>
+</tr>
+<tr>
+  <td>类型化程度</td>
+  <td class="dshcol"><span class="y">有</span>。事件契约是 TS 类型，<code>@mode</code> 由生成器校验派发点</td>
+  <td><span class="n">无</span>。stdin JSON 加 exit code 加 stdout JSON，全靠约定</td>
+  <td><span class="p">部分</span>。在边界上解码成类型化 Decision，越界之前还是字符串</td>
+</tr>
+<tr>
+  <td>同一个点上挂多个</td>
+  <td class="dshcol">套娃。外层在回程上看得到内层的结果</td>
+  <td>并行跑，相同的 handler 会去重</td>
+  <td>按配置顺序串行、不去重，再按 deny &gt; ask &gt; allow 合成</td>
+</tr>
+</tbody>
+</table>
+
+<p>
+桥这条路我到现在也没想清楚该怎么评价。它自己的 README 第 7 行就写着，
+一个原生 cordis 插件能把它做的事全做了，返回值还是类型化的，中间也没有序列化这道墙，
+所以桥"只作为已映射的那个 command hook 子集的兼容路径存在"。这话说得很实在。
+那么剩下的理由就只有一条：你不用重写手上那份 <code>hooks.json</code>。
+够不够，取决于那份文件有多长。
+</p>
+
+<div class="note warn">
+  <span class="tag">HN 上的一条质疑</span>
+  开源当天的 HN 主线程里（item 49285244，2026-08-13），用户 <code>lxdlam</code> 读完 Cordis 那篇论文之后写道：
+  "found it may be useful, but not that useful... it adds hot-reload and dynamic enable/dispose capabilities
+  to a plugin system, like the one in Pi agents, though they push the boundaries further, to the UI components"。
+  这条值得对着本章看。热重载和动态 enable/dispose 是第 3 章的东西，
+  Pi 的 TypeScript extension 也能在不 fork 的前提下加工具、加命令、加 hook，
+  所以"进程内、类型化的扩展点"本身算不上 dsh 的新东西。
+  本章这套机制里真正走得更远的是两点：派发语义被收成一个封闭的五元联合，
+  每个事件用 <code>@mode</code> 声明模式并由生成器校验派发点；waterfall 这种带回程、
+  能连内建默认行为一起否决的形状被当成了全仓库的默认扩展方式，六十多个事件里要干预的一律走它。
+  <code>lxdlam</code> 说的 UI 那一头也确有其事，扩展点一直铺到客户端，
+  跑起来的 Web UI 会去取 37 个客户端插件 bundle。
+  另一个方向上 dsh 没有推进：它的多 provider 适配层
+  <code class="srcpath">packages/llm/llm-pi-ai</code> 直接依赖
+  <code>@earendil-works/pi-ai@^0.82.1</code>，模型层是从 Pi 拿来的。
+  至于"更远"值不值这份复杂度，<code>lxdlam</code> 给的答案是 not that useful，我手上没有反驳他的材料。
+</div>
+
+<h3>拦截的另一半：改写</h3>
+
+<p>
+否决是 waterfall 的一半，另一半是<strong>改写</strong>，而且它有两个方向。
+去程上改的是<em>输入</em>（payload 是共享对象，直接改），
+回程上改的是<em>下游的产出</em>（<code>await next()</code> 拿到结果，返回一个替换值）。
+真实 <code>agent/request</code> 的 JSDoc 把回程这一半写得很清楚：
+"<code>await next()</code> yields the config the machine would use"
+（<code class="srcpath">packages/core/agent/src/runtime-types.ts:233-234</code>）。
+</p>
+
+<p>
+Demo 4.3 用一个和 <code>agent/request</code> 同形的事件演示这一圈。三个 listener：
+<code>trace</code> 两侧都动（去程打标记，回程加 header）、
+<code>pin-model</code> 只在回程动（整体替换掉下游给的 config）、
+<code>redact</code> 只在回程动（把 config 里的密钥抹掉）。
+</p>
+
+<div class="demo" id="d-rewrite">
+  <div class="demo-head">
+    <div class="demo-title"><span class="lbl">Demo 4.3</span>去程改输入，回程改产出</div>
+    <div class="spacer"></div>
+    <select class="btn" id="rw-drop">
+      <option value="none">三个 listener 都挂上</option>
+      <option value="pin">去掉 pin-model（看 next() 的原样返回值）</option>
+    </select>
+    <button class="btn primary" data-act="run">派发</button>
+    <button class="btn" data-act="reset">清空</button>
+  </div>
+  <div class="demo-body">
+    <div class="split">
+      <div>
+        <div class="pane-label">洋葱时序</div>
+        <div class="out" id="out-rw"></div>
+      </div>
+      <div>
+        <div class="pane-label">种子 config vs 最终 config</div>
+        <div class="out" id="out-rw2"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<p>
+切到"去掉 pin-model"再跑一次：<code>trace</code> 回程上看到的 <code>model</code> 变回了
+<code>deepseek-chat</code>。这就是"外层 listener 在回程上看到的是内层<em>替换之后</em>的结果"，
+顺序决定了谁的替换最终生效。
+</p>
+
+<h2><span class="num">§4.3</span>dsh 真实用到的事件</h2>
+
+<p>
+下面这张表是从 clone 里逐条读 <code>@mode</code> JSDoc 标签抄出来的，
+行末给出声明位置，可以直接跳过去核对。
+</p>
+
+<table>
+<thead><tr><th>事件</th><th>模式</th><th>它能干什么</th><th>声明位置</th></tr></thead>
+<tbody>
+<tr><td><code>agent/pre-step</code></td><td><span class="pill acc">waterfall</span></td><td>改写或拒绝被认领的消息，返回 <code>PreStepDecision</code></td><td><code class="srcpath">core/agent/src/runtime-types.ts:231</code></td></tr>
+<tr><td><code>agent/request</code></td><td><span class="pill acc">waterfall</span></td><td>替换那份冻结的 <code>LlmCallConfig</code></td><td><code class="srcpath">core/agent/src/runtime-types.ts:244</code></td></tr>
+<tr><td><code>agent/request-error</code></td><td><span class="pill acc">waterfall</span></td><td>接管一次失败的模型请求；返回 <code>{ kind: 'retry' }</code> 而不调 <code>next()</code></td><td><code class="srcpath">core/agent/src/runtime-types.ts:260</code></td></tr>
+<tr><td><code>agent/turn-stopping</code></td><td><span class="pill warn">serial</span></td><td>回合关闭前被 await；反对者调 <code>agent.steer()</code>，靠数据而不是返回值说话</td><td><code class="srcpath">core/agent/src/runtime-types.ts:278</code></td></tr>
+<tr><td><code>agent/created</code> <code>agent/disposed</code> <code>agent/status</code> <code>agent/error</code></td><td><span class="pill">emit</span></td><td>生命周期广播，只观察</td><td><code class="srcpath">core/agent/src/runtime-types.ts:159 / 168 / 178 / 290</code></td></tr>
+<tr><td><code>tools/pre-execute</code></td><td><span class="pill acc">waterfall</span></td><td>allow / deny / ask。不能改参数</td><td><code class="srcpath">core/tools/src/index.ts:152</code></td></tr>
+<tr><td><code>tools/execute</code></td><td><span class="pill acc">waterfall</span></td><td>包住真正的 dispatch：超时、重试、指标。只允许改 <code>exec.signal</code></td><td><code class="srcpath">core/tools/src/index.ts:163</code></td></tr>
+<tr><td><code>tools/post-execute</code></td><td><span class="pill acc">waterfall</span></td><td>接受 / 替换 / 拦下结果；抛异常的工具也走这条瀑布</td><td><code class="srcpath">core/tools/src/index.ts:175</code></td></tr>
+<tr><td><code>tools/code-dispatch-log</code></td><td><span class="pill acc">waterfall</span></td><td>改写 <code>run_code</code> 子调用写进<em>持久日志</em>的那一份内容</td><td><code class="srcpath">core/tools/src/index.ts:189</code></td></tr>
+<tr><td><code>tools/result</code> <code>tools/change</code></td><td><span class="pill">emit</span></td><td>观察冻结的最终结果 / 可用工具集变了</td><td><code class="srcpath">core/tools/src/index.ts:197 / 207</code></td></tr>
+<tr><td><code>system-prompt/assemble</code></td><td><span class="pill acc">waterfall</span></td><td>对组装好的 sections / contexts / tools / variables 做最终裁决</td><td><code class="srcpath">core/system-prompt/src/index.ts:31</code></td></tr>
+<tr><td><code>session/event</code></td><td><span class="pill">emit</span></td><td>已提交的 append 事实广播，fire-and-forget，listener 失败被吞并记日志</td><td><code class="srcpath">core/session/src/index.ts:76</code></td></tr>
+<tr><td><code>session/flush</code></td><td><span class="pill ok">parallel</span></td><td>被 await 的持久化 checkpoint：所有人都跑，没有否决权</td><td><code class="srcpath">core/session/src/index.ts:85</code></td></tr>
+<tr><td><code>llm/stream</code></td><td><span class="pill acc">waterfall</span></td><td>包住每一次流式模型调用；<code>next()</code> 返回的是 <code>AsyncIterable</code>，不是 promise</td><td><code class="srcpath">llm/llm/src/index.ts:64</code></td></tr>
+<tr><td><code>approval/request</code></td><td><span class="pill acc">waterfall</span></td><td>策略可以代替人类回答；失败则 fail-closed</td><td><code class="srcpath">interaction/user-approval/src/index.ts:30</code></td></tr>
+<tr><td><code>fs/write-intent</code> <code>fs/edit-intent</code></td><td><span class="pill acc">waterfall</span></td><td>单槽决定：第一个返回 intent 的人拥有这个决定，不与同伴合成</td><td><code class="srcpath">fs/fs/src/index.ts:58 / 66</code></td></tr>
+<tr><td><code>fs/observed</code></td><td><span class="pill">emit</span></td><td>记录一次权威观测；listener 必须同步</td><td><code class="srcpath">fs/fs/src/index.ts:76</code></td></tr>
+</tbody>
+</table>
+
+<p>
+把整个仓库的 <code>@mode</code> 标签数一遍（排除 tests、fixtures 和生成产物），分布是这样的：
+</p>
+
+<div class="modelegend">
+  <span class="pill">emit · 47</span>
+  <span class="pill acc">waterfall · 15</span>
+  <span class="pill ok">parallel · 2</span>
+  <span class="pill warn">serial · 1</span>
+  <span class="pill bad">bail · 4</span>
+</div>
+
+<p>
+这个分布本身就是一句设计陈述。<code>serial</code> 全仓库只有一个事件：<code>agent/turn-stopping</code>。
+<code>parallel</code> 只有两个：<code>session/flush</code> 和
+<code>hmr/config-update-failed</code>（<code class="srcpath">vendor/hmr/src/index.ts:29</code>）。
+<code>bail</code> 四个全在客户端输入层（<code>slash/input-*</code>，
+<code class="srcpath">packages/client/ui-input-trigger/src/types.ts:231-253</code>）。
+剩下的六十来个事件里，只观察的用 <code>emit</code>，要干预的一律 <code>waterfall</code>。
+</p>
+
+<div class="note">
+  <span class="tag">为什么 serial 这么少</span>
+  <code>agent/turn-stopping</code> 的 JSDoc 解释了原因。它是 serial，但它的 listener
+  不靠返回值否决：反对关闭回合的人去调 <code>agent.steer(...)</code>，
+  然后 loop 重读信箱，有新的 steering 就再跑一个 step，没有就关掉回合。
+  原话是 "Data decides, so listener order cannot change the outcome."
+  （<code class="srcpath">docs/subsystems/core.md:996</code>）。
+  Claude Code 的 <code>Stop</code> hook 被桥接过来时走的就是这条 serial：
+  一个 blocking 的 Stop hook 自己够不着 <code>agent</code> 对象，
+  桥读出它的 reason，代它喂进 <code>steer()</code>
+  （<code class="srcpath">packages/hooks/hooks-claude-code/README.md:43</code>）。
+</div>
+
+<h2><span class="num">§4.4</span>三个事件域：加一个事件之前先选域</h2>
+
+<p>
+上面那张表混着三类完全不同的东西。要把它们分清楚，是因为选错域会丢数据。
+</p>
+
+<div class="diagram">┌─ session 事件 ────────────────────────────────────────────┐
+│  turn/start · user/message · assistant/message           │
+│  tool/call · tool/result · step/start · compaction/*     │
+│  载体：只追加的会话日志，可持久化、可重放、可 fork          │
+│  判据：会改变模型看到的内容 -> 必须在这里留痕              │
+└──────────────────────────────────────────────────────────┘
+┌─ agent 事件 ──────────────────────────────────────────────┐
+│  agent/pre-step · agent/request · agent/turn-stopping    │
+│  agent/status · agent/inbox/*                            │
+│  载体：进程内活着的 Agent handle，不持久化                 │
+│  判据：只影响"这一次运行"的调度与策略                      │
+└──────────────────────────────────────────────────────────┘
+┌─ capability 事件 ─────────────────────────────────────────┐
+│  tools/* · fs/* · llm/stream · approval/request          │
+│  载体：拥有这个能力的那个 service                          │
+│  判据：属于某条能力流水线，换 provider 就换一整套行为        │
+└──────────────────────────────────────────────────────────┘</div>
+
+<h3>session 事件：持久事实</h3>
+
+<p>
+session 事件跟 cordis 事件是两码事。它们的载体是日志里的一行。
+这个 build 认识的全部类型是一个生成出来的集合，44 个，从
+<code>turn/start</code> 到 <code>compaction/summary</code>
+（<code class="srcpath">packages/core/session/src/known-event-types.ts:19</code>）。
+它们被 append 之后，cordis 侧才用一个 <code>emit</code> 事件
+<code>session/event</code> 把"日志长了一行"这件事广播出去。
+</p>
+
+<p>
+选这个域的判据是仓库里另一条硬规则：
+</p>
+
+<blockquote>
+Model-visible ⟺ logged: anything that reaches a model request must be reconstructable from the session log;
+a new model-visible input requires a session event.
+<br><span class="pill">AGENTS.md:107</span>
+</blockquote>
+
+<p>
+反过来说：如果你的新行为会往模型请求里加任何东西，那就没得选，
+必须先有一个 session 事件。否则会话重放出来的历史和当时模型真正看到的对不上，
+而这正是第 5 章那套压缩机制能成立的前提。
+</p>
+
+<h3>agent 事件：活的句柄</h3>
+
+<p>
+<code>agent/*</code> 的 payload 里带着一个活的 <code>Agent</code> 对象，
+你能在 listener 里直接调 <code>agent.steer()</code>、<code>agent.inject()</code>、<code>agent.cancel()</code>
+（<code class="srcpath">packages/core/agent/src/runtime-types.ts:64-144</code>）。
+这类事件<strong>不持久</strong>，进程重启就没了。所以它适合放调度和策略，
+不适合放"这次交互发生了什么"。<code>agent/pre-step</code> 拒绝一次输入是 agent 事件，
+但"这次输入被拒绝了"这件事得进日志，就是第 1 章那个零 step 的 turn。
+</p>
+
+<div class="note vs">
+  <span class="tag">换成别的 harness</span>
+  payload 里带一个活对象这件事，只有进程内的扩展点做得到。
+  一个从进程外接上来的扩展点，无论它是读 stdin 的 shell hook，
+  还是通过 JSON-RPC 或 HTTP 连过来的客户端（Codex 的 <code>codex app-server --stdio</code>、
+  OpenCode 那个拥有执行生命周期、对外开 OpenAPI 端点的 Go server，都属于这一类），
+  收到的只能是序列化过的数据，能回的也只能是序列化过的数据。
+  想让它调 <code>steer()</code>，就得有人在进程内代它调，上一节 <code>Stop</code> hook 那个例子就是这么处理的。
+  这里没有高下之分，只有边界画在哪里之后的必然结果：
+  跨进程换来的是语言无关和崩溃隔离，代价是句柄传不过去。
+</div>
+
+<h3>capability 事件：挂在拥有它的那个 service 上</h3>
+
+<p>
+第三类的归属规则很直白，primer 里一句话给完了：
+"a tool pipeline event belongs to <code>ctx.tools</code>, model streaming belongs to <code>ctx.llm</code>,
+and live agent coordination belongs to <code>ctx.agents</code>"
+（<code class="srcpath">docs/cordis-primer.md:42</code>）。
+同一句话的后半段还给了事件和方法的分工：
+"Prefer events for interception and policy; prefer service methods for direct capability calls."
+</p>
+
+<p>要加一个新的干预点，按这个顺序问：</p>
+
+<div class="diagram">你要加的行为 ...
+├─ 会改变模型看到的内容？ ───► 必须先有 session 事件（durable），再谈拦截
+├─ 只影响这一次运行的调度／策略？ ───► agent/* 事件，payload 带活的 Agent
+└─ 属于某条能力流水线？ ───► 那个 service 自己的 capability 事件
+                              需要否决或改写 -> waterfall
+                              只是观察      -> emit</div>
+
+<h2><span class="num">§4.5</span>本章的产物</h2>
+
+<p>
+<code>MiniEvents</code>：一个类，七个方法，把五种派发语义和"注册即副作用"接在一起。
+它是 <code>ctx.on()</code> 和 <code>ctx.waterfall()</code> 的最小可用版本，
+下面这份就是本页三个 demo 真正跑的代码。
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">mini-dsh v0.4 · isBailed + MiniEvents</span></div>
+  <pre><code id="src-artifact" data-lang="js"></code></pre>
+</div>
+
+<p>
+第 3 章的 fiber 在这里以最小桩的形式出现，只为把 <code>effect()</code> 的形状说清楚：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">第 3 章产物的最小桩</span></div>
+  <pre><code id="src-fiber" data-lang="js"></code></pre>
+</div>
+
+<div class="note good">
+  <span class="tag">下一章预告</span>
+  Demo 4.2 里 permission 否决了一次 <code>write /etc/hosts</code>，然后这件事就没了。
+  派发结束，决定蒸发，UI 查不到，重放不出来，模型下一步也不知道自己刚被拦了一次。
+  第 5 章引入全书的核心机制：只追加的会话日志，加上 <code>surfaceOp</code> 折叠出的模型视图。
+  有了它，一次拦截才从一个函数返回值变成一条可查的历史。
+</div>
+
+<h2><span class="num">§4.6</span>回到真实的 dsh</h2>
+
+<p>
+真实实现是 <code class="srcpath">vendor/cordis/src/events.ts</code> 里的
+<code>EventsService</code>，它作为 <code>ctx.events</code> 装上去，并把五个派发方法混入每一个 context。
+waterfall 的原文只有十行，和我们写的几乎一样：
+</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">vendor/cordis/src/events.ts:234-243 · 原文</span></div>
+<pre><code data-lang="js">waterfall(...args: any[]) {
+  const cbs = this.dispatch('waterfall', args)
+  const inner = args.pop()
+  const next = () =&gt; {
+    const cb = cbs.shift() ?? inner
+    return cb(...args)
+  }
+  args.push(next)
+  return next()
+}</code></pre>
+</div>
+
+<p>派发点长这样。注意内建默认行为就是最后那个箭头函数：</p>
+
+<div class="codewrap">
+  <div class="codecap"><span class="dot"></span><span class="grow">真实派发点（节选）</span></div>
+<pre><code data-lang="js">// packages/core/agent-loop/src/agent.ts:234
+const decision = await this.dispatch.waterfall(
+  'agent/pre-step', { messages: claimed, ...position, signal },
+  (): Promise&lt;PreStepDecision&gt; =&gt; Promise.resolve&lt;PreStepDecision&gt;({ kind: 'enter', /* ... */ }),
+)
+
+// packages/core/agent-loop/src/agent.ts:296
+await this.dispatch.serial('agent/turn-stopping', { turn, signal })
+
+// packages/core/agent-loop/src/agent.ts:438
+const proposedConfig = await this.dispatch.waterfall(
+  'agent/request', { turn, step, signal },
+  () =&gt; Promise.resolve(seedConfig),
+)
+
+// packages/core/tools/src/index.ts:1475
+const carrier = scopeTarget(this, exec.agent)
+const gate = await this.ctx.waterfall(
+  carrier, 'tools/pre-execute', exec,
+  () =&gt; Promise.resolve&lt;PreToolDecision&gt;({ kind: 'allow' }),
+)</code></pre>
+</div>
+
+<p>几个真实细节，我们的 mini 版本刻意省掉了：</p>
+
+<ul>
+  <li><code>thisArg</code> 与 context filter。真实 <code>dispatch()</code>
+    （<code class="srcpath">events.ts:165-175</code>）先判断第一个实参是不是对象，是就把它当 <code>thisArg</code>
+    取出来，然后用 <code>thisArg[Context.filter]</code> 过滤 hook，只有 <code>global: true</code> 的
+    listener 无条件收到。上面 <code>tools/pre-execute</code> 那个 <code>carrier</code> 就是这么用的，
+    它是 dsh scope 过滤（agent-scoped listener 只收到自己那个 agent 的事件）的底座。</li>
+  <li>listener 会被服务反射重新绑定：<code>on()</code> 里有一句
+    <code>listener = this.ctx.reflect.bind(listener)</code>（<code class="srcpath">events.ts:295</code>），
+    让 listener 体内的 <code>this.someService</code> 走第 2 章那套 Proxy 反射。</li>
+  <li><code>internal/listener</code> 是个 bail 事件，而且能改道注册。
+    <code>on()</code> 会先 <code>bail()</code> 一次它，非空结果<em>直接替代</em>整个注册流程
+    （<code class="srcpath">events.ts:296-297</code>）。cordis 自己就用这一招把
+    <code>internal/update</code> 的 listener 挪进 fiber 私有列表（<code class="srcpath">events.ts:140-146</code>）。</li>
+  <li><code>session/flush</code> 并不真的走 <code>ctx.parallel</code>。SessionStore
+    自己用 <code>Promise.allSettled</code> 实现（<code class="srcpath">packages/core/session/src/index.ts:1022-1039</code>），
+    抛的是<em>第一个</em>失败而不是 <code>AggregateError</code>，并且注释明确写了必须走这个入口、
+    不许裸调 <code>ctx.parallel('session/flush', …)</code>。SessionStore 是这条路唯一的入口。</li>
+  <li>waterfall 不一定是异步的。<code>ctx.waterfall</code> 本身是同步函数，
+    返回值类型完全由事件契约决定：<code>session-telemetry/record</code> 是同步瀑布
+    （<code class="srcpath">packages/session/session-telemetry/src/index.ts:43</code>），
+    <code>llm/stream</code> 的 <code>next()</code> 返回 <code>AsyncIterable</code>
+    （<code class="srcpath">packages/llm/llm/src/index.ts:64</code>）。</li>
+</ul>
+
+<div class="note src">
+  <span class="tag">自己去读</span>
+  <code class="srcpath">vendor/cordis/src/events.ts</code> · 五种派发的全部实现，以及 <code>isBailed</code>（13 行）<br>
+  <code class="srcpath">docs/cordis-primer.md</code> 的 "Dispatch Modes" 与 "Cordis Waterfall Semantics" 两节<br>
+  <code class="srcpath">docs/cordis-tutorial/04-events.md</code> · 手把手版本，含可运行的 veto 例子<br>
+  <code class="srcpath">packages/core/agent/src/runtime-types.ts</code> · <code>agent/*</code> 的声明与 <code>@mode</code><br>
+  <code class="srcpath">packages/core/tools/src/index.ts</code> · <code>tools/*</code> 的声明（149-207）与派发点（1475 / 1573 / 1743）<br>
+  <code class="srcpath">packages/hooks/hooks-claude-code/README.md</code> · 映射表在 "Hook points → typed Decisions"，边界在 "Known Limitations"<br>
+  <code class="srcpath">packages/hooks/hook-protocol/src/codec.ts</code> · exit code 和 stdout JSON 怎么解码成中立的 outcome<br>
+  <code class="srcpath">AGENTS.md</code> 第 106、107 行 · 那两条硬规则的原文
+</div>
+
+</main>
+<aside id="dsh-toc"></aside>
+</div>
+
+<script>
+// ===================================================================
+// 第 3 章产物的最小桩：fiber 只负责把每个注册记成可回收的 effect。
+// ===================================================================
+function stubFiber() {
+  const entries = [];
+  return {
+    /** 跑一次 setup，把它返回的 disposer 记在 fiber 上。 */
+    effect(setup, label) {
+      const off = setup();
+      const entry = { label, dispose() {
+        const i = entries.indexOf(entry);
+        if (i < 0) return false;
+        entries.splice(i, 1);
+        off();
+        return true;
+      } };
+      entries.push(entry);
+      return entry.dispose;
+    },
+    /** 插件卸载：反序回收所有 effect。 */
+    unload() { while (entries.length) entries[entries.length - 1].dispose(); },
+    size() { return entries.length; }
+  };
+}
+
+// ===================================================================
+// 本章的产物：mini-dsh v0.4
+// ===================================================================
+
+/**
+ * bail 语义：只有 null / false / undefined 不算 bail。
+ * 于是 0、''、以及 async function 返回的 Promise 全都是 bail 值。
+ */
+function isBailed(value) {
+  return value !== null && value !== false && value !== undefined;
+}
+
+class MiniEvents {
+  /** @param fiber 第 3 章的 fiber，负责把每个注册记成可回收的 effect。 */
+  constructor(fiber) {
+    this.fiber = fiber;
+    this._hooks = Object.create(null);
+  }
+
+  /**
+   * 取出这一次派发要跑的 listener 快照，并把派发上报给诊断钩子。
+   * 快照意味着：派发中途新注册或被卸载的 listener 不影响本次。
+   */
+  resolve(mode, name) {
+    if (name.slice(0, 9) !== 'internal/') this.emit('internal/dispatch', mode, name);
+    return (this._hooks[name] || []).map(hook => hook.callback);
+  }
+
+  /** 注册即副作用：listener 挂在 fiber 上，插件卸载时自动摘掉。 */
+  on(name, listener, options) {
+    const opts = (options && typeof options === 'object') ? options : { prepend: !!options };
+    const hooks = this._hooks[name] || (this._hooks[name] = []);
+    return this.fiber.effect(() => {
+      hooks[opts.prepend ? 'unshift' : 'push']({ callback: listener, ...opts });
+      return () => {
+        const i = hooks.findIndex(hook => hook.callback === listener);
+        if (i >= 0) hooks.splice(i, 1);
+      };
+    }, 'ctx.on(' + JSON.stringify(name) + ')');
+  }
+
+  /** 只跑一次，跑完自己摘掉。 */
+  once(name, listener, options) {
+    const dispose = this.on(name, (...args) => { dispose(); return listener(...args); }, options);
+    return dispose;
+  }
+
+  /** emit：同步广播。返回值一律丢弃，返回的 promise 也不等。 */
+  emit(name, ...args) {
+    for (const cb of this.resolve('emit', name)) cb(...args);
+  }
+
+  /** parallel：全部并发起跑，等所有人 settle；失败聚合成 AggregateError。 */
+  async parallel(name, ...args) {
+    // 注意 'emit'：cordis 的 parallel 上报的就是 emit，不是 parallel。
+    const settled = await Promise.allSettled(this.resolve('emit', name).map(async cb => cb(...args)));
+    const failed = settled.filter(r => r.status === 'rejected');
+    if (failed.length) throw new AggregateError(failed.map(r => r.reason));
+  }
+
+  /** serial：按注册顺序逐个 await，第一个 bail 值胜出并终止后面所有人。 */
+  async serial(name, ...args) {
+    for (const cb of this.resolve('serial', name)) {
+      const result = await cb(...args);
+      if (isBailed(result)) return result;
+    }
+  }
+
+  /** bail：serial 的同步版。listener 必须是同步的，否则第一个人就 bail 出一个 promise。 */
+  bail(name, ...args) {
+    for (const cb of this.resolve('bail', name)) {
+      const result = cb(...args);
+      if (isBailed(result)) return result;
+    }
+  }
+
+  /**
+   * waterfall：around-middleware。最后一个实参是内建默认行为。
+   * next 是被所有 listener 共享的一个闭包，每调一次就从队列头弹一个人，
+   * 队列空了就落到内建默认行为。不调 next 就短路整条链，连默认行为一起。
+   */
+  waterfall(name, ...args) {
+    const queue = this.resolve('waterfall', name);
+    const inner = args.pop();
+    const next = () => (queue.shift() || inner)(...args);
+    args.push(next);
+    return next();
+  }
+}
+
+DSH.showSource('src-modes', [
+  isBailed,
+  MiniEvents.prototype.resolve,
+  MiniEvents.prototype.on,
+  MiniEvents.prototype.emit,
+  MiniEvents.prototype.parallel,
+  MiniEvents.prototype.serial,
+  MiniEvents.prototype.bail
+]);
+DSH.showSource('src-waterfall', MiniEvents.prototype.waterfall);
+DSH.showSource('src-artifact', [isBailed, MiniEvents]);
+DSH.showSource('src-fiber', stubFiber);
+
+// ===================================================================
+// Demo 4.1 - the same three listeners under all five dispatch modes.
+// ===================================================================
+(function () {
+  const EV = 'mini/pre-execute';
+
+  /** 三个 listener，写成 (payload, next) 让同一份代码在五种模式下都能跑。 */
+  function register(ev, o) {
+    ev.on(EV, async function L1_audit(p, next) {
+      await DSH.wait(90);
+      p.trail.push('L1');
+      o.log('     L1 audit    观察完毕 (async, 90ms)');
+      return next ? next() : undefined;
+    });
+    ev.on(EV, function L2_policy(p, next) {
+      if (p.name === 'rm') {
+        o.warn('     L2 policy   返回 { deny: "rm" }   <- 这是一个 bail 值');
+        return { deny: 'rm' };
+      }
+      o.log('     L2 policy   放行');
+      return next ? next() : undefined;
+    });
+    ev.on(EV, async function L3_metrics(p, next) {
+      await DSH.wait(40);
+      p.trail.push('L3');
+      o.log('     L3 metrics  计数 +1 (async, 40ms)');
+      return next ? next() : undefined;
+    });
+  }
+
+  function fresh(o) {
+    const ev = new MiniEvents(stubFiber());
+    register(ev, o);
+    return ev;
+  }
+
+  function payload() { return { name: 'rm', trail: [] }; }
+
+  DSH.demo('d-modes', {
+    reset: function (o) { o.clear(); },
+    run: async function (o) {
+      // ---------------- emit ----------------
+      o.head('emit  ·  同步广播，不等 promise，返回值全丢');
+      let ev = fresh(o), p = payload();
+      ev.emit(EV, p);
+      o.acc('     emit() 已经返回了。L1 / L3 的日志还没出现。');
+      await DSH.wait(200);
+      o.dim('     200ms 后 async listener 的日志才落下来。trail = ' + JSON.stringify(p.trail));
+      o.dim('     L2 给出的 { deny: "rm" } 被无声丢弃：emit 没有返回值。');
+
+      // ---------------- parallel ----------------
+      o.head('parallel  ·  并发起跑，await 全部 settle，返回值全丢');
+      ev = fresh(o); p = payload();
+      ev.on('internal/dispatch', function (mode, name) {
+        o.dim('     [internal/dispatch] mode=' + mode + '  name=' + name +
+              '   <- parallel 上报的是 "emit"，cordis 原样如此');
+      });
+      await ev.parallel(EV, p);
+      o.acc('     parallel() 返回。trail = ' + JSON.stringify(p.trail) + '（两个 async 都跑完了）');
+
+      o.log('');
+      o.log('     再来一次，这次加一个会抛异常的 L4：');
+      ev.on(EV, async function L4_boom() { throw new Error('L4 炸了'); });
+      try {
+        await ev.parallel(EV, payload());
+        o.bad('     不该走到这里');
+      } catch (err) {
+        o.bad('     parallel 抛出 ' + err.constructor.name + ' · ' +
+              err.errors.length + ' 个失败: ' + err.errors.map(e => e.message).join(', '));
+      }
+      o.dim('     L4 抛异常不影响其他三个：allSettled 让所有人都跑完了才聚合失败。');
+
+      // ---------------- serial ----------------
+      o.head('serial  ·  逐个 await，第一个 bail 值胜出');
+      ev = fresh(o); p = payload();
+      const sr = await ev.serial(EV, p);
+      o.acc('     serial() 返回 ' + JSON.stringify(sr));
+      o.dim('     trail = ' + JSON.stringify(p.trail) + '  ->  L3 从来没有被调用。');
+
+      // ---------------- bail ----------------
+      o.head('bail  ·  serial 的同步版');
+      ev = fresh(o); p = payload();
+      const br = ev.bail(EV, p);
+      o.bad('     bail() 立刻返回了一个 ' + (br instanceof Promise ? 'Promise' : typeof br) +
+            '。L1 是 async function，');
+      o.bad('     它返回的 Promise 不是 null/false/undefined，isBailed() 判定为 bail。');
+      o.dim('     L2 / L3 一个都没跑。bail 事件的 listener 必须是同步的。');
+      await DSH.wait(120);
+      o.dim('     ^ L1 那行日志是 90ms 后才补上的：bail 早就返回了，L1 还在后台跑完。');
+
+      o.log('');
+      o.log('     换成同步三人组再来一次：');
+      const ev2 = new MiniEvents(stubFiber());
+      ev2.on(EV, function L1s() { o.log('     L1 audit    观察完毕 (sync)'); });
+      ev2.on(EV, function L2s(q) {
+        if (q.name === 'rm') { o.warn('     L2 policy   返回 { deny: "rm" }'); return { deny: 'rm' }; }
+      });
+      ev2.on(EV, function L3s() { o.log('     L3 metrics  计数 +1'); });
+      o.acc('     bail() 返回 ' + JSON.stringify(ev2.bail(EV, payload())) + '   L3 依然没被调用。');
+      o.dim('     顺带一句：isBailed(0) = ' + isBailed(0) +
+            '，isBailed("") = ' + isBailed('') + '。返回 0 也会掐断派发。');
+
+      // ---------------- waterfall ----------------
+      o.head('waterfall  ·  around-middleware，最后一个实参是内建默认行为');
+      ev = fresh(o); p = payload();
+      let innerRan = false;
+      const wr = await ev.waterfall(EV, p, async function builtin() {
+        innerRan = true;
+        o.ok('     [内建默认]  { allow: true }');
+        return { allow: true };
+      });
+      o.acc('     waterfall() 返回 ' + JSON.stringify(wr));
+      o.dim('     trail = ' + JSON.stringify(p.trail) +
+            '   内建默认是否执行: ' + innerRan + '  <- L2 不调 next()，把它一起短路了');
+      o.rule();
+      o.dim('同一组 listener，五种结果。派发模式属于事件的公开契约，调用方不能临时换一种。');
+    }
+  });
+})();
+
+// ===================================================================
+// 先猜再跑：忘记 next() 的那一刻，调用方到底拿到什么。
+// ===================================================================
+DSH.predict('p-veto', {
+  q: '把 Demo 4.2 里 logging 的勾去掉，它打完一行日志就 return，没有调 next()。这时候 ctx.tools 那边的 await ctx.waterfall(...) 会拿到什么？',
+  options: [
+    { label: '内建默认的 { kind: "allow" }', why: '内建默认那一环压根没被执行过，它排在链的最后。' },
+    { label: 'undefined', ok: true, why: 'waterfall 原样返回最外层 listener 的返回值，而 logging 什么都没 return。' },
+    { label: '一个 "listener 没有 delegate" 的报错', why: 'cordis 不检查这件事，那十行代码里没有任何校验。' },
+    { label: '跳过 logging，从 permission 接着跑', why: '没有人推 next()，队列就停在那儿不动了。' }
+  ],
+  explain: '下面把勾去掉再点"派发"，最后一行会把这个非法的 decision 打出来。'
+});
+
+// ===================================================================
+// Demo 4.2 - the tools/pre-execute middleware chain. The centerpiece.
+// 两种跑法：进程内的 waterfall，和 Claude Code 风格的外部 command hook。
+// ===================================================================
+(function () {
+  const EV = 'tools/pre-execute';
+
+  const TOOL_BODY = {
+    read: a => a.path + ' -> 214 行, 7.8 KB',
+    write: a => '已写入 ' + a.path + ' (' + a.content.length + ' 字节)'
+  };
+
+  /** 两种跑法共用的判断：这次调用是不是工作区之外的写。 */
+  function isOutside(exec) {
+    return exec.name === 'write' && exec.args.path.slice(0, 4) !== 'src/';
+  }
+
+  function readExec(api) {
+    return api.$('#chain-call').value === 'read'
+      ? { name: 'read', args: { path: 'src/agent.ts' } }
+      : { name: 'write', args: { path: '/etc/hosts', content: '127.0.0.1 evil' } };
+  }
+
+  // -----------------------------------------------------------------
+  // 跑法一：进程内的 waterfall。三个 listener 从外到内套着。
+  // -----------------------------------------------------------------
+  async function runInProcess(o, gate, exec) {
+    const ev = new MiniEvents(stubFiber());
+    let veto = null;
+
+    // ---- 最外层：只想记日志。它是最容易忘记 next() 的那种 listener。 ----
+    ev.on(EV, async function logging(x, next) {
+      o.log('  -> logging      看到 ' + x.name + ' ' + JSON.stringify(x.args));
+      if (!gate.log) {
+        veto = 'logging';
+        o.bad('  ▲ logging 没有调用 next()。链在这里断掉，它自己也没有返回决定。');
+        return;
+      }
+      const d = await next();
+      o.log('  <- logging      下游给出 ' + JSON.stringify(d));
+      return d;
+    });
+
+    // ---- 中间层：权限。它拥有这个决定，所以短路是设计而不是 bug。 ----
+    ev.on(EV, async function permission(x, next) {
+      o.log('     -> permission   检查 ' + x.name + ' 对 ' + x.args.path + ' 的权限');
+      const outside = isOutside(x);
+      if (!gate.perm || outside) {
+        veto = 'permission';
+        o.warn('     ▲ permission 不调 next()，直接给出 { kind: "deny" }');
+        return { kind: 'deny', reason: outside ? x.args.path + ' 在工作区之外' : 'permission 被手动关掉了' };
+      }
+      const d = await next();
+      o.log('     <- permission   回程：不改动，原样透传 ' + (d && d.kind));
+      return d;
+    });
+
+    // ---- 最内层：沙箱。回程上给决定加标记，不改 exec.args。 ----
+    ev.on(EV, async function sandbox(x, next) {
+      o.log('        -> sandbox      准备把执行放进沙箱');
+      if (!gate.box) {
+        veto = 'sandbox';
+        o.warn('        ▲ sandbox 不调 next()，返回 { kind: "deny" }');
+        return { kind: 'deny', reason: '沙箱不可用' };
+      }
+      const d = await next();
+      o.log('        <- sandbox      决定不变，附加 sandboxed 标记');
+      return { ...d, sandboxed: true };
+    });
+
+    o.dim('ctx.tools 里的那一行：ctx.waterfall(\'tools/pre-execute\', exec, () => 默认放行)');
+    o.log('');
+
+    // ---- 内建默认行为：ctx.tools 自己的语义。链走到底才会执行。 ----
+    let builtinRan = false;
+    const decision = await ev.waterfall(EV, exec, async function builtin() {
+      builtinRan = true;
+      o.ok('           [内建默认]   ctx.tools 自己的行为: { kind: "allow" }');
+      return { kind: 'allow' };
+    });
+
+    o.rule();
+    o.acc('waterfall 返回: ' + JSON.stringify(decision));
+    o.log('内建默认行为是否执行: ' + builtinRan);
+    if (veto) {
+      o.warn('否决点: ' + veto + '。它下游的 listener 和内建默认行为全部没有执行。');
+    }
+
+    // ---- 调用方拿着 decision 决定要不要真的跑工具 ----
+    o.log('');
+    if (decision && decision.kind === 'allow') {
+      o.ok('tool body 执行 -> ' + TOOL_BODY[exec.name](exec.args));
+    } else if (decision && decision.kind === 'deny') {
+      o.bad('工具没有执行。模型会收到: ' + decision.reason);
+      o.dim('注意 ctx.tools 里没有一行代码提到权限或沙箱。');
+    } else {
+      o.bad('工具没有执行，而且 decision = ' + String(decision) + '，这是个非法值。');
+      o.bad('一个只想记日志的 listener 忘了 next()，就把所有人的默认行为吞掉了。');
+      o.dim('这就是那条仓库规则的理由 (AGENTS.md:106)：忘记 next() 不会报错，只会静默失效。');
+    }
+  }
+
+  // -----------------------------------------------------------------
+  // 跑法二：Claude Code 风格的 command hook。同样三个人，改成三个进程。
+  // 参照 packages/hooks/hooks-claude-code 与 hook-protocol/src/codec.ts。
+  // -----------------------------------------------------------------
+  async function runExternal(o, gate, exec, spawnMs) {
+    o.dim('hooks.json 里 PreToolUse 的三条命令，由 dsh-hooks-claude-code 挂到同一个');
+    o.dim('tools/pre-execute 上。桥这边按配置顺序串行跑、不去重（Claude Code 自己是并行 + 去重）。');
+    o.log('');
+
+    const stdin = {
+      hook_event_name: 'PreToolUse',
+      session_id: 's-7f21c0',
+      transcript_path: '',
+      cwd: '/w/proj',
+      tool_name: exec.name,
+      tool_input: exec.args
+    };
+    o.head('每个 hook 进程从 stdin 收到的那份 JSON（同一份，发三遍）');
+    o.json(stdin);
+    o.log('');
+
+    const outside = isOutside(exec);
+    const hooks = [
+      { file: '.claude/hooks/log.sh', act: function () {
+        return { code: 0, out: '',
+          note: gate.log
+            ? 'exit 0，什么都不返回。它本来就没有 next() 可以调。'
+            : '你取消了它的 next() 勾选，但这里没有 next() 这个动作，所以什么也没变。' };
+      } },
+      { file: '.claude/hooks/permission.sh', act: function () {
+        if (!gate.perm || outside) {
+          return { code: 2, err: outside ? exec.args.path + ' 在工作区之外' : 'permission 被手动关掉了',
+            note: 'exit 2 = block，stderr 当 reason。桥把它映射成 PreToolDecision.deny。' };
+        }
+        return { code: 0, out: '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}',
+          note: '这个 allow 只表示"我不拦"。桥不会拿它去预批准，后面的检查照跑。' };
+      } },
+      { file: '.claude/hooks/sandbox.sh', act: function () {
+        if (!gate.box) {
+          return { code: 2, err: '沙箱不可用', note: 'exit 2 = block。' };
+        }
+        return { code: 0, out: '{"hookSpecificOutput":{"hookEventName":"PreToolUse","updatedInput":{"sandboxed":true}}}',
+          note: 'updatedInput 会被桥 log 一条 warning 然后丢掉。参数在这个点上不许改。' };
+      } }
+    ];
+
+    let spent = 0, verdict = 'allow', reason = null;
+    for (const h of hooks) {
+      o.log('  spawn  ' + h.file);
+      await DSH.wait(spawnMs);
+      spent += spawnMs;
+      const r = h.act();
+      if (r.code === 2) {
+        o.bad('    exit 2   stderr: ' + r.err);
+        if (verdict !== 'deny') { verdict = 'deny'; reason = r.err; }
+      } else {
+        o.ok('    exit 0   stdout: ' + (r.out || '(空)'));
+      }
+      o.dim('    ' + r.note);
+      o.log('    进程退出，到此为止。这个 hook 再也没有机会看到后面发生了什么。');
+    }
+
+    o.rule();
+    o.acc('三个 hook 跑完，按 deny > ask > allow 合成 -> ' + verdict);
+    o.log('进程 spawn 累计 ' + spent + 'ms。同一条链在进程内跑，是三次函数调用。');
+    o.dim('这个 ' + spawnMs + 'ms 是假设值，上面的输入框可以改。真实数字取决于你的 shell 和脚本。');
+    o.log('');
+
+    let builtinRan = false;
+    if (verdict === 'allow') {
+      builtinRan = true;
+      o.ok('  [内建默认]   没有人 block，ctx.tools 自己的 { kind: "allow" } 照常执行。');
+    } else {
+      o.warn('  调用点收到 deny，于是它自己跳过了内建默认这一环。');
+    }
+    o.log('内建默认行为是否执行: ' + builtinRan);
+    o.dim('区别在这里：进程内的 listener 是"不调 next()，所以内建那一环没被执行"；');
+    o.dim('外部 hook 是"把 deny 交回调用点，由调用点决定不执行内建"。它包不住内建，只能上报。');
+
+    o.log('');
+    if (verdict === 'allow') {
+      o.ok('tool body 执行 -> ' + TOOL_BODY[exec.name](exec.args));
+      o.bad('决定上没有 sandboxed 标记。加标记要在回程上做，而这个协议只有去程。');
+    } else {
+      o.bad('工具没有执行。模型会收到: ' + reason);
+    }
+  }
+
+  DSH.demo('d-chain', {
+    reset: function (o) { o.clear(); },
+    run: async function (o, api) {
+      const gate = {
+        log: api.$('#wf-log').checked,
+        perm: api.$('#wf-perm').checked,
+        box: api.$('#wf-box').checked
+      };
+      const exec = readExec(api);
+      if (api.$('#wf-cc').checked) {
+        const raw = Number(api.$('#cc-spawn').value);
+        const spawnMs = Math.min(300, Math.max(0, isFinite(raw) ? raw : 25));
+        o.head('外部命令模式  ·  三个 hook，三个进程，没有 next()');
+        await runExternal(o, gate, exec, spawnMs);
+      } else {
+        o.head('进程内模式  ·  三个 listener 套在一条 waterfall 上');
+        await runInProcess(o, gate, exec);
+      }
+    }
+  });
+})();
+
+// ===================================================================
+// Demo 4.3 - rewrite on the way in, replace on the way out.
+// ===================================================================
+(function () {
+  const EV = 'mini/request';
+
+  /** loop 本来要用的那份 config：waterfall 的内建默认行为返回它。 */
+  function seedConfig() {
+    return {
+      model: 'deepseek-chat',
+      temperature: 0.6,
+      headers: {},
+      messages: [
+        { role: 'user', content: '把这个 token 存到 .env: sk-live-9f3a2b7c' }
+      ]
+    };
+  }
+
+  DSH.demo('d-rewrite', {
+    reset: function (o, api) { o.clear(); DSH.out(api.$('#out-rw2')).clear(); },
+    run: async function (o, api) {
+      const o2 = DSH.out(api.$('#out-rw2'));
+      o2.clear();
+      const dropPin = api.$('#rw-drop').value === 'pin';
+      const ev = new MiniEvents(stubFiber());
+
+      // ---- 最外层 trace：去程改 payload，回程改产出。两侧都动。 ----
+      ev.on(EV, async function trace(p, next) {
+        p.tags.push('trace');
+        o.log('  -> trace        去程：往共享 payload 上打标记 tags=' + JSON.stringify(p.tags));
+        const cfg = await next();
+        o.log('  <- trace        回程：下游给的 model = ' + cfg.model);
+        cfg.headers['x-trace-id'] = 't-' + p.turn + '-' + p.step;
+        o.log('  <- trace        回程：加上 x-trace-id = ' + cfg.headers['x-trace-id']);
+        return cfg;
+      });
+
+      // ---- pin-model：只在回程动，而且是整体替换。 ----
+      if (!dropPin) {
+        ev.on(EV, async function pinModel(p, next) {
+          o.log('     -> pin-model    去程：什么都不做，直接 delegate');
+          const cfg = await next();
+          o.warn('     <- pin-model    回程：整体替换，' + cfg.model + ' -> deepseek-reasoner');
+          return { ...cfg, model: 'deepseek-reasoner' };
+        });
+      } else {
+        o.dim('(pin-model 这次没有挂上，只剩 trace 和 redact)');
+      }
+
+      // ---- 最内层 redact：只在回程动，抹掉密钥。 ----
+      ev.on(EV, async function redact(p, next) {
+        o.log('        -> redact       去程：什么都不做，直接 delegate');
+        const cfg = await next();
+        let hits = 0;
+        cfg.messages = cfg.messages.map(m => {
+          const masked = m.content.replace(/sk-live-[a-z0-9]+/g, function (s) {
+            hits++; return 'sk-live-' + '*'.repeat(s.length - 8);
+          });
+          return masked === m.content ? m : { ...m, content: masked };
+        });
+        o.warn('        <- redact       回程：抹掉 ' + hits + ' 处密钥');
+        return cfg;
+      });
+
+      const seed = seedConfig();
+      const payload = { turn: 3, step: 1, tags: [] };
+
+      o.dim('await ev.waterfall(\'mini/request\', payload, () => seedConfig())');
+      o.log('');
+      const final = await ev.waterfall(EV, payload, async function builtin() {
+        o.ok('           [内建默认]    loop 本来要用的 config: model=' + seed.model);
+        return seedConfig();
+      });
+
+      o.rule();
+      o.acc('最终 config 的 model = ' + final.model);
+      o.dim('payload 上的 tags = ' + JSON.stringify(payload.tags) + '（去程改的是这个共享对象）');
+
+      o2.head('种子 config（内建默认返回的）');
+      o2.json(seed);
+      o2.head('最终 config（最外层 listener 返回的）');
+      o2.json(final);
+      o2.rule();
+      const changes = [];
+      if (final.model !== seed.model) changes.push('model: ' + seed.model + ' -> ' + final.model);
+      if (Object.keys(final.headers).length) changes.push('headers: + x-trace-id');
+      if (final.messages[0].content !== seed.messages[0].content) changes.push('messages[0]: 密钥已抹');
+      changes.forEach(c => o2.warn('改动  ' + c));
+      o2.dim(changes.length + ' 处改动来自 ' + (dropPin ? 2 : 3) + ' 个互不知情的 listener。');
+    }
+  });
+})();
+</script>
+
+</body>
+</html>
