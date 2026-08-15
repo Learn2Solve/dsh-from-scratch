@@ -99,7 +99,7 @@ isolate realm 那一段我每次读都要想三遍。所以下一节先把发布
 
 <p>
 HN 上的主贴（<a href="https://news.ycombinator.com/item?id=49285244">item 49285244</a>）
-545 分，234 条评论。整体基调是怀疑，不是叫好。票数最高的那条只有一行：
+开源当天 545 分、234 条评论，两天后变成 720 分、298 条。整体基调是怀疑，不是叫好。票数最高的那条只有一行：
 </p>
 
 <blockquote>
@@ -171,7 +171,16 @@ resume、fork、search、replay 都在这条流上跑。
 HN 只是这件事的一小半。按一份覆盖发布后 48 小时的舆情检索，中文这边知乎单个问题就有
 215 万浏览、366 条回答，B 站一条讲解视频接近 19.4 万播放；英文这边能对上的，是
 r/LocalLLaMA 一条 258 赞的主帖，加 <a href="https://thenewstack.io/deepseek-harness-open-source-plugins/">The New Stack</a>
-一篇记者稿。同一个仓库，两边讨论的量级不在同一个刻度上。
+一篇记者稿。同一个仓库，两边讨论的量级不在同一个刻度上，两边重复的词也不一样。
+</p>
+
+<p>
+官方自己卖的是 Everything is a plugin。官推、落地页、README 都没有把「自进化」写进标题句。
+这个词是中文舆论二次包装出来的，源头是
+<a href="https://x.com/jiayuan_jy/status/2087911060154314963">@jiayuan_jy</a>
+（31.3 万浏览）：一句已演示（同会话里检查 runtime、写、挂上），两句「想象一下」。
+他自己下一句就写「动态生成的插件只存在于内存里，重启就没了，也还不能自动沉淀成一个永久插件」。
+全天候和量子位把「想象」抄成了「野心」。第 9 章写的是那句已演示的部分，附录把「想象」和反方一起记下。
 </p>
 
 <p>
@@ -180,6 +189,8 @@ r/LocalLLaMA 一条 258 赞的主帖，加 <a href="https://thenewstack.io/deeps
 600-700K tokens project in OMP or Reasonix"，几个小时后又补了一条，说它在长项目里 "slows to a crawl"，
 token 流慢到他只能杀掉窗口重开。知乎那条置顶实测同一天写的是另一头：源码装了 27 分钟，
 让 DeepSeek Flash 写一个小插件，"洗个澡回来发现死循环了"，收尾是 "没有特别让我眼前一亮的地方"。
+48 小时里能找到的现场挂插件报告，全是同会话玩具：抛硬币、改皮、用完就扔。没有 sourced 的痕迹表明
+模型写出来的插件活过了一次重启。
 </p>
 
 <p>
@@ -193,7 +204,10 @@ benchmark"。这本书也给不出，附录 §A.7 把这件事写进了标题：
 <span class="pill">Fz0x00</span> 的 #454 和 <span class="pill">xiejin77</span> 的 #587，钉的正是本书对照的
 <code>0.1.0-rc.6</code> 和同一个提交。两份的结论都分成两半：面向模型那一半被评为 production-grade，
 面向插件那一半按审计自己的说法目前没有安全设计；两份也都写明这条路要用户自己去
-<code>dsh plugin add</code>，不是零点击远程 RCE。附录 §A.6.4 逐条展开。
+<code>dsh plugin add</code>，不是零点击远程 RCE。第二天又多了一份
+<span class="pill">OracleNep</span> 的 #853：<code>dsh web</code> 的控制面是裸 <code>node:http</code>，
+无 token、无 cookie、无 TLS，PoC 是未认证创建会话再把权限拨到 <code>danger-full-access</code>。
+三份维护者都还没回。附录 §A.6.4 逐条展开。
 </p>
 
 <h2><span class="num">§0.4</span>你会亲手造出什么</h2>
@@ -240,12 +254,13 @@ demo 可以反复跑，很多里面的代码框能直接改了再跑。改坏它
 <tr><td>目标模型</td><td><code>deepseek-v4-flash</code>，也支持 OpenAI、Anthropic、任意兼容网关</td></tr>
 <tr><td>覆盖率门槛</td><td>per-file 100%，CI 强制</td></tr>
 <tr><td>开源 24 小时后</td><td>43,437 star，3,404 fork，master 零新提交</td></tr>
+<tr><td>开源约 48 小时后</td><td>约 97,000 star，约 9,100 fork，master 仍零新提交，npm 仍是 <code>0.1.0-rc.6</code></td></tr>
 </tbody>
 </table>
 
 <p>
-最后一行是我写这本书期间反复刷新看到的。代码一行没动，star 涨了四万三。
-但同一天 HN 主贴下面 234 条评论里，问得最多的是"这到底是个啥"。
+最后两行是我写这本书期间反复刷新看到的。代码一行没动，star 从四万三涨到九万七。
+但同一条 HN 主贴下面，问得最多的还是"这到底是个啥"。
 star 数衡量的是好奇心，不是口碑，这两件事在这个项目上分得很开。
 </p>
 

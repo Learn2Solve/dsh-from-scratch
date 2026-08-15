@@ -499,7 +499,7 @@ Agent Note 里那段自辩说得更直白：trap 和 façade 的目的是把 API
 </p>
 
 <div class="note warn">
-  <span class="tag">两份独立审计的分法</span>
+  <span class="tag">审计把这件事切成两条轴</span>
   Fz0x00 的披露报告（GitHub Discussion #454）把 dsh 切成两条轴分开评。
   面向模型那一条它给的词是 production-grade：工具执行管线、fail-closed 审批、进程沙箱、凭据引用模型、
   append-only 审计，还有浏览器那道 confusion-deputy 围栏（对活实例验到 403/415）。
@@ -518,7 +518,12 @@ Agent Note 里那段自辩说得更直白：trap 和 façade 的目的是把 API
 边界两位作者自己都划了。模型写的插件要能跑起来，会话先得挂在 <code>cordis</code> 这个 preset 上，
 而那份 yml 开头的 TRUST 注释已经把话说在前面：挂在这个 preset 上的会话，请当 shell 权限对待，
 和上面那句"bash 级别的信任"是同一个意思。动态 package 只活在这个进程的内存里，不落盘也不改配置，
-重启就没了。要触发插件这条轴上的事，还得受害者自己去跑 <code>dsh plugin add</code>，
+重启就没了。官方落地页写的是「在内存中试验」，工具目录写明额外工具活到 stop、undefine 或重启。
+内测用户 <a href="https://x.com/jiayuan_jy/status/2087911060154314963">@jiayuan_jy</a>
+把这件事叫「自进化软件的雏形」，下一句立刻补上「也还不能自动沉淀成一个永久插件」。
+宝玉 <a href="https://x.com/dotey/status/2087963724577435813">@dotey</a> 的反驳更短：
+插件要么一次性扔掉，要么要设计、验证、维护，不是现在模型能力可以自进化的。
+要触发插件这条轴上的事，还得受害者自己去跑 <code>dsh plugin add</code>，
 它不是零点击的远程 RCE。Fz0x00 另外专门列了 dsh 已经做对的几项，
 pnpm 的 registry integrity、0600/0700 的文件权限、特权 RPC 的 loopback pinning，
 报告称它们是 real mitigations。
@@ -537,6 +542,7 @@ pnpm 的 registry integrity、0600/0700 的文件权限、特权 RPC 的 loopbac
   <a href="https://github.com/deepseek-ai/deepseek-harness/discussions/454">deepseek-harness · Discussion #454</a> — Fz0x00 的披露帖，上面两条轴的分法出自这里<br>
   <a href="https://github.com/Fz0x00/deepseek-harness-plugin-security-audit">Fz0x00/deepseek-harness-plugin-security-audit</a> — 完整报告：40 条攻击路径、96 条带 file:line 的源码证据、13 个可复现 demo、8 次对已发布版本的活体验证。仓库钉在 commit <code>47f9438</code>，活体验证针对 npm <code>@deepseek-ai/dsh@0.1.0-rc.6</code>，也就是这本书对照的同一份代码<br>
   <a href="https://github.com/deepseek-ai/deepseek-harness/discussions/587">deepseek-harness · Discussion #587</a> — xiejin77 的独立复核，boot 期改写配置树那一条<br>
+  <a href="https://github.com/deepseek-ai/deepseek-harness/discussions/853">deepseek-harness · Discussion #853</a> — OracleNep，<code>dsh web</code> 控制面无认证，钉在同一份 rc.6<br>
   <code class="srcpath">apps/cli/config/agent-presets/cordis/agent.cordis.yml</code> — 开头那段 TRUST 注释，preset 自己写的信任等级
 </div>
 
@@ -745,7 +751,7 @@ omp 是我自己每天在用的 harness，也是这本书唯一被人拿来当�
 mini-dsh 写完、两边的源码和文档都翻过一遍之后，我能落到纸上的差别是这些。
 dsh 有而 omp 没有的：agent loop 可以整个换掉（omp 的循环由 <code>@oh-my-pi/pi-agent-core</code> 硬编码持有，
 扩展只能拦事件、改消息、steer）；命令执行底下有一层 OS 内核沙箱（只覆盖这一条轴，
-插件那条轴上的两份审计见 §9.6，全文在 <a href="compare.html">横向对照</a> 的 §A.6）；子 agent 可以是外面的
+插件那条轴上的审计见 §9.6，全文在 <a href="compare.html">横向对照</a> 的 §A.6）；子 agent 可以是外面的
 <code>claude</code> 或 <code>codex</code> 进程；还有第 8 章那个 presentation 折叠，一行 preset 把整张工具面收成一条代码入口，
 而 omp 的 <code>eval</code> 是与另外 30 个并列的一个工具，不动工具面。
 omp 有而 dsh 没有的：snapcompact 把要丢的历史用像素字体画成 PNG 位图交给视觉模型，不调 LLM，也不联网；
@@ -766,9 +772,10 @@ omp 有而 dsh 没有的：snapcompact 把要丢的历史用像素字体画成 P
 
 <p class="footernote">
 最后说一下这份代码此刻的状态。DeepSeek 在 2026-08-13 把它开源，仓库创建于当天 11:56 UTC，
-接下来 24 小时里收到 43,437 个 star 和 3,404 个 fork，而 <code>master</code> 上一个新 commit 都没有，
-npm 上仍然是 <code>0.1.0-rc.6</code>。热度和口碑不是一回事：同一天那条 545 分、234 条评论的 HN 帖子里
-（item 49285244），票数最高的一条是 rco8786 的
+接下来 24 小时里收到 43,437 个 star 和 3,404 个 fork，两天后大约 97,000 个 star、9,100 个 fork，
+而 <code>master</code> 上一个新 commit 都没有，npm 上仍然是 <code>0.1.0-rc.6</code>。
+热度和口碑不是一回事：同一条 HN 帖子（item 49285244）从当天的 545 分、234 条评论涨到 720 分、298 条，
+票数最高的一条仍是 rco8786 的
 「But like, what is it? Odd that this reached #1 on HN. The README is pretty bare outside of
 installation instructions and a link to "Cordis"」，
 另一条被顶起来的就是上面那句 217 的 omp。

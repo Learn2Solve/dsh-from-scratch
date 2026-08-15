@@ -632,7 +632,7 @@ omp 的 <code>eval</code> 能走同一条路，它默认那条路走的是原生
 上面那张表把 dsh 那一列涂成了高亮色，读起来像一份推荐。这一节把力气花在反面。
 分四组：第一组是我自己在源码里查到的；第二组是开源当天 HN 主线程上别人说的；
 第三组是 omp 具体压过 dsh 的地方，来自它自己那套文档；
-第四组是两份独立的插件安全审计，它们钉的 commit 跟本书对照的是同一个。
+第四组是三份独立的安全披露，它们钉的 commit 跟本书对照的是同一个。
 第二组里有几条比第一组更值得你花时间想。第四组最要紧的是它把这个项目切成了两半，
 一半评价很高，一半还没开始做。
 </p>
@@ -666,7 +666,7 @@ omp 的 <code>eval</code> 能走同一条路，它默认那条路走的是原生
 
   <li><code>它 64 天大</code>。第一个 commit 是 2026-06-10，最后一个是 2026-08-13，中间 12293 个 commit。
   这个密度说明它是高强度冲出来的，也说明没人在生产环境里用它跑过一天。
-  开源当天 43437 个 star、3404 个 fork，而 <code>origin/master</code> 从那天起一个 commit 都没动，
+  开源当天 43437 个 star、3404 个 fork，两天后大约 97000 个 star、9100 个 fork，而 <code>origin/master</code> 从那天起一个 commit 都没动，
   npm 上还是 <code>0.1.0-rc.6</code>。动的全是读者。</li>
 
   <li><code>它自己的文档在漂</code>。<code>tool-cordis</code> 实际注册 7 个工具，
@@ -678,7 +678,7 @@ omp 的 <code>eval</code> 能走同一条路，它默认那条路走的是原生
 
 <div class="note">
   <span class="tag">出处</span>
-  以下全部来自 Hacker News 主线程 <code>item 49285244</code>，2026-08-13，545 分 234 条评论。
+  以下全部来自 Hacker News 主线程 <code>item 49285244</code>，2026-08-13 起，当天 545 分 234 条评论，两天后 720 分 298 条。
   引号里是原文，用户名是 HN 用户名。我没有替任何人转述观点。
 </div>
 
@@ -782,11 +782,12 @@ calls. Much stricter validation than in codex.」他同一条评论里紧接着�
   这一条 §A.6.1 已经写过，放在这里是为了把账单凑齐。</li>
 </ul>
 
-<h3>§A.6.4 插件信任模型（两份独立审计）</h3>
+<h3>§A.6.4 插件信任模型（三份独立审计）</h3>
 
 <p>
 前面三小节是我自己读出来的，这一小节不是。开源当天和第二天，
 有两个人各自把插件这条路走了一遍，出了两份审计，彼此独立，落点重合。
+第三天又多了一份，钉的是 web 控制面。
 对本书来说要紧的是它们钉的版本：第一份钉在 commit <code>47f9438</code>，
 活体验证跑的是 npm 上的 <code>0.1.0-rc.6</code>，跟这本书从头到尾对照的是同一个东西。
 </p>
@@ -830,13 +831,21 @@ calls. Much stricter validation than in codex.」他同一条评论里紧接着�
   <li><code>dsh plugin remove</code> 不会移除已经持久化的 <code>!!js</code> 后门。
   装完之后再改文件也是零校验加载，用户 patch 的热重载大约 15 秒生效，不用重启进程。
   热重载在第 3 章是这个内核最漂亮的地方，在这里它是攻击面的一段。</li>
+
+  <li>第三份（<code>OracleNep</code>，Discussion <code>#853</code>）钉的是另一条面：
+  <code>dsh web</code> 的控制面是裸 <code>node:http</code>，无 token、无 cookie、无 TLS。
+  Host / Origin 围栏源码自己写明「不是认证层」。PoC 是未认证
+  <code>session.create</code>，再执行 <code>/permission danger-full-access</code>，再
+  <code>session.prompt</code> 驱动 bash。作者给的分级是默认 loopback 为 High，
+  绑到非回环为 Critical。这不是轴 B 的插件安装，是 web 面把轴 A 的审批拨盘露了出来。</li>
 </ul>
 
 <div class="note warn">
   <span class="tag">这几条要跟上面一起读</span>
-  这条路要受害者自己敲 <code>dsh plugin add</code>，第二份审计的作者把边界写在最前面：
+  插件那条路要受害者自己敲 <code>dsh plugin add</code>，第二份审计的作者把边界写在最前面：
   不是零点击的远程 RCE。出厂的 web 界面里，agent-instructions 那一路默认关着。
-  两份审计也都列了 dsh 已经做对的地方：pnpm 的 registry integrity、
+  #853 另起一条：只要 <code>dsh web</code> 在跑，本机任意进程就能走未认证控制面，
+  不必先 <code>plugin add</code>。两份插件审计也都列了 dsh 已经做对的地方：pnpm 的 registry integrity、
   <code>0600</code> / <code>0700</code> 的文件权限、<code>.env</code> 的 bootstrap guard、
   特权 RPC 只绑 loopback，第一份审计给这些的定性是 real mitigations。
   它的立场也写得很明白：防御性披露，「插件即可信」是这个项目的设计取舍，报告只陈述事实和风险。
@@ -859,11 +868,12 @@ dsh 这一边的另外两个是 Pi 和 omp。这一行是前面九章那些能�
 </p>
 
 <div class="note src">
-  <span class="tag">两份审计</span>
+  <span class="tag">三份审计</span>
   <code>Fz0x00</code> · <code>deepseek-ai/deepseek-harness</code> 的 Discussion <code>#454</code>，
   完整报告在 <code class="srcpath">Fz0x00/deepseek-harness-plugin-security-audit</code>，
   钉在 commit <code>47f9438</code>，活体验证针对 <code>@deepseek-ai/dsh@0.1.0-rc.6</code><br>
   <code>xiejin77</code> · 同一个仓库的 Discussion <code>#587</code>，晚一天，结论是独立得出的<br>
+  <code>OracleNep</code> · 同一个仓库的 Discussion <code>#853</code>，再晚一天，钉 web 控制面无认证<br>
   <code class="srcpath">docs/cordis-tutorial/05-config.md</code> — 官方教程教 <code>!!js</code> 的那一篇，
   原话是「The loader used in this repo supports a <code>!!js</code> tag for config values that
   must be computed at load time」
