@@ -733,15 +733,18 @@ omp 的 <code>eval</code> 能走同一条路，它默认那条路走的是原生
 </ul>
 
 <p>
-同一条线程里也有好评，集中在两个点上。<code>kamranjon</code> 说 landing page 上最打动他的是
-Every Run is Traceable：只追加的会话日志把系统提示、推理、工具调用、子 agent 调度、
-每一次上下文注入全记下来，resume / fork / search / replay 都在同一条事件流上。
+同一条线程里也有好评，几乎全砸在落地页第二句 slogan 上：Every run is traceable。
+<code>kamranjon</code> 说最打动他的就是 Trajectory：只追加的会话日志把系统提示、推理、工具调用、
+子 agent 调度、每一次上下文注入全记下来，resume / fork / search / replay 都在同一条事件流上。
 <code>bmurphy1976</code> 更短：「Tracing what it actually did. Who would have thought that's
 a good idea, instead of trying to obfuscate everything.」
+<code>SwellJoe</code> 把它叫 killer feature：美国模型把 traces 加密、打码，dsh 把模型看见的东西明文留下。
+同一条下面立刻有人问这跟 Pi 已经在做的有何不同。日志契约不是独家；
+Web 里按来源拆开的 Trajectory 视图，加上 reasoning 明文落盘，才是他们看见的差别。
 <code>JonChesterfield</code> 夸的是另一处：「I really like the json schemas around the tool
 calls. Much stricter validation than in codex.」他同一条评论里紧接着提了个具体缺点：
 「git is behind bash and that means hope or sandboxing」，他认为 git 该是顶层工具。
-这三条分别是第 5 章和第 6 章的正题，那两章会连代价一起说。
+前三条是第 5 章的正题，后一条是第 6 章的正题，那两章会连代价一起说。
 </p>
 
 <h3>§A.6.3 omp 具体压过 dsh 的地方</h3>

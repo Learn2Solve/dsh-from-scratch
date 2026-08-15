@@ -137,7 +137,10 @@ so they essentially created a mono-vendor ecosystem with extra steps.
 </blockquote>
 
 <p>
-还有一条来自读过 Cordis 论文的人，分量最重：
+还有一条来自读过当天一起挂出来的那篇论文的人，分量最重。他读的是
+<a href="https://github.com/cordiverse/paper">cordiverse/paper</a>
+（标题 <em>A Programming Paradigm for Spatiotemporal Composability</em>），
+不是 DeepSeek 自己写的 harness 论文。那篇 preprint 全文一次都没有出现 DeepSeek，也没有附 eval。
 </p>
 
 <blockquote>
@@ -153,12 +156,25 @@ dsh 的区别是推得更远，一直推到 UI 组件。
 </p>
 
 <p>
-好评也有，而且集中在同一个点上。<span class="pill">kamranjon</span> 和
-<span class="pill">bmurphy1976</span> 都是冲着 Every Run is Traceable 去的：
-系统提示、推理、工具调用、子 agent 调度、每一次上下文注入，全部落进一条只追加的事件流，
-resume、fork、search、replay 都在这条流上跑。
+好评也有，而且几乎全砸在落地页的第二句 slogan 上：Everything is a plugin. Every run is traceable.
+<span class="pill">kamranjon</span> 说最打动他的就是 Trajectory：只追加的日志把系统提示、推理、工具调用、
+子 agent 调度、每一次上下文注入全部记下来，resume、fork、search、replay 都在同一条事件流上。
+<span class="pill">bmurphy1976</span> 更短：「Tracing what it actually did. Who would have thought
+that's a good idea, instead of trying to obfuscate everything.」
+</p>
+
+<blockquote>
+That's a killer feature, IMHO, and one that US models won't allow you to do, as their traces
+are encrypted, obfuscated, etc. […] If you want to be able to improve your tools that work
+with models, you have to be able to assess what the models think is happening.
+<br><span class="pill">SwellJoe</span>
+</blockquote>
+
+<p>
 <span class="pill">JonChesterfield</span> 则说它的工具调用 JSON schema 比 codex 严格得多，
 同时抱怨 git 藏在 bash 后面，只能靠 hope 或者沙箱兜着。
+同一条线程里立刻有人问 Trajectory 跟 Pi 已经在做的有何不同，答案是：日志契约不是独家，
+Web 里按来源拆开的 Trajectory 视图，加上 reasoning 明文落盘，才是他们看见的差别。
 </p>
 
 <p>
